@@ -134,24 +134,19 @@ class GLC_Aggregation(nn.Module):
         return x
 
 class Regressor(nn.Module):
-    def __init__(self, input_nc, num_enc_sab=1, use_efficient_attention=False, dim_feedforward=256, output='normal'):
-        super(Regressor, self).__init__()     
+    def __init__(self, input_nc, num_enc_sab=1, use_efficient_attention=False, dim_feedforward=256):
+        super(Regressor, self).__init__()
         # Communication among different samples (Pixel-Sampling Transformer)
-        self.comm = transformer.CommunicationBlock(input_nc, num_enc_sab = num_enc_sab, dim_hidden=input_nc, ln=True, dim_feedforward = dim_feedforward, use_efficient_attention=use_efficient_attention)   
+        self.comm = transformer.CommunicationBlock(input_nc, num_enc_sab = num_enc_sab, dim_hidden=input_nc, ln=True, dim_feedforward = dim_feedforward, use_efficient_attention=use_efficient_attention)
         self.prediction_normal = PredictionHead(input_nc, 3)
-        self.target = output
-        if output == 'brdf':   
-            self.prediction_base = PredictionHead(input_nc, 3) # No urcainty
-            self.prediction_rough = PredictionHead(input_nc, 1)
-            self.prediction_metal = PredictionHead(input_nc, 1)
 
     def forward(self, x, num_sample_set):
         """Standard forward
         INPUT: img [Num_Pix, F]
-        OUTPUT: [Num_Pix, 3]"""  
+        OUTPUT: [Num_Pix, 3]"""
         if x.shape[0] % num_sample_set == 0:
             x_ = x.reshape(-1, num_sample_set, x.shape[1])
-            x_ = self.comm(x_)            
+            x_ = self.comm(x_)
             x = x_.reshape(-1, x.shape[1])
         else:
             ids = list(range(x.shape[0]))
@@ -162,12 +157,7 @@ class Regressor(nn.Module):
             x_2 = self.comm(x_2).reshape(-1, x.shape[1])
             x = torch.cat([x_1, x_2], dim=0)
 
-        x_n = self.prediction_normal(x)        
-        if self.target == 'brdf':
-            x_brdf = (self.prediction_base(x), self.prediction_rough(x), self.prediction_metal(x))
-        else:
-            x_brdf = []
-        return x_n, x_brdf
+        return self.prediction_normal(x)
     
 class PredictionHead(nn.Module):
     def __init__(self, dim_input, dim_output):
@@ -182,33 +172,54 @@ class PredictionHead(nn.Module):
         return self.regression(x)
 
 class Net(nn.Module):
-    def __init__(self, pixel_samples, output, device):
+    def __init__(self, pixel_samples, device):
         super().__init__()
         self.device = device
-        self.target = output
         self.pixel_samples = pixel_samples
         self.glc_smoothing = True
 
-   
-        self.input_dim = 4 # RGB + mask   
+
+        self.input_dim = 4 # RGB + mask
         self.image_encoder = ScaleInvariantSpatialLightImageEncoder(self.input_dim, use_efficient_attention=False).to(self.device)
 
         self.input_dim = 3 # RGB only
         self.glc_upsample = GLC_Upsample(256+self.input_dim, num_enc_sab=1, dim_hidden=256, dim_feedforward=1024, use_efficient_attention=True).to(self.device)
         self.glc_aggregation = GLC_Aggregation(256+self.input_dim, num_agg_transformer=2, dim_aggout=384, dim_feedforward=1024, use_efficient_attention=False).to(self.device)
-        
 
-        self.regressor = Regressor(384, num_enc_sab=1, use_efficient_attention=True, dim_feedforward=1024, output=self.target).to(self.device) 
+
+        self.regressor = Regressor(384, num_enc_sab=1, use_efficient_attention=True, dim_feedforward=1024).to(self.device)
         
     def no_grad(self):
         mode_change(self.image_encoder, False)
         mode_change(self.glc_upsample, False)
         mode_change(self.glc_aggregation, False)
         mode_change(self.regressor, False)
-    
 
-    def forward(self, I, M, nImgArray, decoder_resolution, canonical_resolution):     
-        
+    def with_grad(self):
+        mode_change(self.image_encoder, True)
+        mode_change(self.glc_upsample, True)
+        mode_change(self.glc_aggregation, True)
+        mode_change(self.regressor, True)
+
+
+    def _decode_pixels(self, glc, I_dec, target, ids, num_imgs, H, W, C):
+        """Decode predictions for the given pixel indices `ids` of one batch element."""
+        o_ = I_dec[target, :, :, :].reshape(num_imgs, C, H * W).permute(2, 0, 1)  # [HW, N, C]
+        o_ids = o_[ids, :, :]                                                    # [m, N, C]
+        coords = ind2coords(np.array((H, W)), ids).expand(num_imgs, -1, -1, -1).to(self.device)
+        glc_ids = F.grid_sample(glc[target, :, :, :], coords, mode='bilinear', align_corners=False)
+        glc_ids = glc_ids.reshape(num_imgs, -1, len(ids)).permute(2, 0, 1)       # [m, N, F]
+
+        x = torch.cat([o_ids, glc_ids], dim=2)
+        glc_ids = self.glc_upsample(x)
+        x = torch.cat([o_ids, glc_ids], dim=2)
+        x = self.glc_aggregation(x)
+        x_n = self.regressor(x, len(ids))
+        return F.normalize(x_n, dim=1, p=2)
+
+
+    def forward(self, I, M, nImgArray, decoder_resolution, canonical_resolution, training=False):
+
         decoder_resolution = decoder_resolution[0,0].cpu().numpy().astype(np.int32).item()
         canonical_resolution = canonical_resolution[0,0].cpu().numpy().astype(np.int32).item()
 
@@ -216,83 +227,95 @@ class Net(nn.Module):
         B, C, H, W, Nmax = I.shape
 
         """ Image Encoder at Canonical Resolution """
-        I_enc = I.permute(0, 4, 1, 2, 3)# B Nmax C H W       
-        M_enc = M # B 1 H W               
+        I_enc = I.permute(0, 4, 1, 2, 3)# B Nmax C H W
+        M_enc = M # B 1 H W
         img_index = make_index_list(Nmax, nImgArray) # Extract objects > 0
-        I_enc = I_enc.reshape(-1, I_enc.shape[2], I_enc.shape[3], I_enc.shape[4]) 
+        I_enc = I_enc.reshape(-1, I_enc.shape[2], I_enc.shape[3], I_enc.shape[4])
         M_enc = M_enc.unsqueeze(1).expand(-1, Nmax, -1, -1, -1).reshape(-1, 1, H, W)
-        data = torch.cat([I_enc * M_enc, M_enc], dim=1)     
+        data = torch.cat([I_enc * M_enc, M_enc], dim=1)
         data = data[img_index==1,:,:,:] # torch.size([B, N, 4, H, W])d
         glc = self.image_encoder(data, nImgArray, canonical_resolution) # torch.Size([B, N, 256, H/4, W/4]) [img, mask]
 
-        """ Sample Decoder at Original Resokution"""
-        I_dec = []
-        M_dec = []
-        N_dec = []
-
+        """ Sample Decoder at Original Resolution"""
         img = I.permute(0, 4, 1, 2, 3).to(self.device)
-        mask = M 
-         
+        mask = M
+
         decoder_imgsize = (decoder_resolution, decoder_resolution)
         img = img.reshape(-1, img.shape[2], img.shape[3], img.shape[4])
         img = img[img_index==1, :, :, :]
-        I_dec = F.interpolate(img, size=decoder_imgsize, mode='bilinear', align_corners=False)  
-        M_dec = F.interpolate(mask, size=decoder_imgsize, mode='nearest')  
-       
+        I_dec = F.interpolate(img, size=decoder_imgsize, mode='bilinear', align_corners=False)
+        M_dec = F.interpolate(mask, size=decoder_imgsize, mode='nearest')
+
         C = img.shape[1]
         H = decoder_imgsize[0]
-        W = decoder_imgsize[1]            
-    
-        nout = torch.zeros(B, H * W, 3).to(self.device)
-        bout = torch.zeros(B, H * W, 3).to(self.device)
-        rout = torch.zeros(B, H * W, 1).to(self.device)
-        mout = torch.zeros(B, H * W, 1).to(self.device)
+        W = decoder_imgsize[1]
 
-        if self.glc_smoothing:  
+        if self.glc_smoothing:
             f_scale = decoder_resolution//canonical_resolution # (2048/256)
             smoothing = gauss_filter.gauss_filter(glc.shape[1], 10 * f_scale+1, 1).to(glc.device) # channels, kernel_size, sigma
             glc = smoothing(glc)
+
+        if training:
+            """Training path: sample exactly `pixel_samples` pixels per batch element,
+            keep gradients, return only sampled per-pixel predictions + indices.
+            """
+            pred_n_list, idx_list = [], []
+            p = 0
+            for b in range(B):
+                num_imgs = int(nImgArray[b])
+                target = range(p, p + num_imgs)
+                p = p + num_imgs
+
+                m_ = M_dec[b, :, :, :].reshape(-1, H * W).permute(1, 0)
+                valid_ids = torch.nonzero(m_ > 0, as_tuple=False)[:, 0]
+                n_sample = self.pixel_samples
+                if valid_ids.numel() == 0:
+                    # no valid pixels: emit a placeholder so loss masking discards them
+                    ids = torch.zeros(n_sample, dtype=torch.long, device=I.device)
+                elif valid_ids.numel() >= n_sample:
+                    perm = torch.randperm(valid_ids.numel(), device=valid_ids.device)
+                    ids = valid_ids[perm[:n_sample]]
+                else:
+                    rep = torch.randint(0, valid_ids.numel(), (n_sample,), device=valid_ids.device)
+                    ids = valid_ids[rep]
+
+                X_n = self._decode_pixels(glc, I_dec, target, ids, num_imgs, H, W, C)
+                pred_n_list.append(X_n)
+                idx_list.append(ids)
+
+            pred_n = torch.stack(pred_n_list, dim=0)         # [B, n_sample, 3]
+            sample_idx = torch.stack(idx_list, dim=0)        # [B, n_sample]
+            return pred_n, sample_idx, (H, W)
+
+        nout = torch.zeros(B, H * W, 3).to(self.device)
+
         p = 0
-        for b in range(B):                
-            target = range(p, p+nImgArray[b])
-            p = p+nImgArray[b]
-            m_ = M_dec[b, :, :, :].reshape(-1, H * W).permute(1,0)        
-            ids = np.nonzero(m_>0)[:,0]  
-            ids = ids[np.random.permutation(len(ids))]                               
-            if len(ids) > self.pixel_samples:
-                num_split = len(ids) // self.pixel_samples + 1
-                idset = np.array_split(ids, num_split)
+        for b in range(B):
+            nimg_b = int(nImgArray[b]) if torch.is_tensor(nImgArray[b]) else int(nImgArray[b])
+            target = range(p, p + nimg_b)
+            p = p + nimg_b
+            m_ = M_dec[b, :, :, :].reshape(-1, H * W).permute(1, 0)
+            # Device-safe nonzero: works for both numpy arrays and CUDA/CPU tensors.
+            if torch.is_tensor(m_):
+                ids = torch.nonzero(m_ > 0, as_tuple=False)[:, 0]
+                ids = ids[torch.randperm(ids.numel(), device=ids.device)]
             else:
-                idset = [ids]     
+                ids = np.nonzero(m_ > 0)[:, 0]
+                ids = ids[np.random.permutation(len(ids))]
+            n_ids = ids.numel() if torch.is_tensor(ids) else len(ids)
+            if n_ids > self.pixel_samples:
+                num_split = n_ids // self.pixel_samples + 1
+                if torch.is_tensor(ids):
+                    idset = list(torch.chunk(ids, num_split))
+                else:
+                    idset = np.array_split(ids, num_split)
+            else:
+                idset = [ids]
 
-            o_ = I_dec[target, :, :, :].reshape(nImgArray[b], C, H * W).permute(2,0,1)  # [N, c, h, w]]
             for ids in idset:
-                o_ids = o_[ids, :, :]
-                coords = ind2coords(np.array((H, W)), ids).expand(nImgArray[b],-1,-1,-1)
-                glc_ids = F.grid_sample(glc[target, :, :, :], coords.to(self.device), mode='bilinear', align_corners=False).reshape(len(target), -1, len(ids)).permute(2,0,1) # [m, N, f]                   
+                X_n = self._decode_pixels(glc, I_dec, target, ids, int(nImgArray[b]), H, W, C)
+                nout[b, ids, :] = X_n.detach()
 
-                """ glc_ids """
-                x = torch.cat([o_ids, glc_ids], dim=2) # [len(ids), N, 256+3]
-                glc_ids = self.glc_upsample(x)            
-                x = torch.cat([o_ids, glc_ids], dim=2) # [len(ids), N, 256+3]
-
-                x = self.glc_aggregation(x)  #[len(ids), 384]       
-                x_n, x_brdf = self.regressor(x, len(ids)) # [len(ids), 3]       
-                X_n = F.normalize(x_n, dim=1, p=2)
-                if self.target == 'normal':
-                    nout[b, ids, :] = X_n.detach()  
-                if self.target == 'brdf':
-                    bout[b, ids, :] = torch.relu(x_brdf[0]).detach()  
-                    rout[b, ids, :] = torch.relu(x_brdf[1]).detach()  
-                    mout[b, ids, :] = torch.relu(x_brdf[2]).detach()  
-
-        nout = nout.permute(0, 2, 1).reshape(B, 3, H, W)
-        bout = bout.permute(0, 2, 1).reshape(B, 3, H, W)
-        rout = rout.permute(0, 2, 1).reshape(B, 1, H, W)
-        mout = mout.permute(0, 2, 1).reshape(B, 1, H, W)
-
-
-  
-        return nout, bout, rout, mout
+        return nout.permute(0, 2, 1).reshape(B, 3, H, W)
 
 

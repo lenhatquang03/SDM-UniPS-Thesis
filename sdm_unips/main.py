@@ -1,7 +1,7 @@
 """
-Scalable, Detailed and Mask-free Universal Photometric Stereo Network (CVPR2023)
-# Copyright (c) 2023 Satoshi Ikehata
-# All rights reserved.
+Scalable, Detailed and Mask-free Universal Photometric Stereo Network (CVPR2023).
+
+Inference entry point for normal-only recovery.
 """
 
 from __future__ import print_function, division
@@ -12,14 +12,11 @@ import sys
 import argparse
 import time
 
-sys.path.append('..')  # add parent directly for importing
+sys.path.append('..')
 
-# Argument parser
 parser = argparse.ArgumentParser()
 
-# Properties
 parser.add_argument('--session_name', default='sdm_unips')
-parser.add_argument('--target', default='normal_and_brdf', choices=['normal', 'brdf', 'normal_and_brdf'])
 parser.add_argument('--checkpoint', default='checkpoint')
 
 # Data Configuration
@@ -38,8 +35,7 @@ parser.add_argument('--scalable', action='store_true')
 
 def main():
     args = parser.parse_args()
-    print(f'\nStarting a session: {args.session_name}')
-    print(f'target: {args.target}\n')
+    print(f'\nStarting a session: {args.session_name}\n')
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     sdf_unips = builder.builder(args, device)
     test_data = dataio.dataio('Test', args)
@@ -51,9 +47,6 @@ def main():
                   )
     end_time = time.time()
     print(f"Prediction finished (Elapsed time is {end_time - start_time:.3f} sec)")
-    print("\nExecute the following script to render a video under new lighting conditions based on the generated BRDF and normal map.\n")
-    print(f"        python sdm_unips/relighting.py --datadir ./{args.session_name}/results/{test_data.data.objname}\n")
-         
 
 
 if __name__ == '__main__':

@@ -1,0 +1,18 @@
+# SDM-UniPS dependencies (inference + training).
+# Tested with Python 3.11. The author's published configuration uses
+# PyTorch 2.0 with CUDA 11.8 — pin accordingly when reproducing.
+
+# Core deep learning
+torch>=2.0,<2.4
+# Pull torchvision in only if you also use the standard pretrained backbones;
+# none of the SDM-UniPS modules import it. Uncomment if you add it later.
+# torchvision>=0.15,<0.19
+
+# Numerical
+numpy>=1.23,<2.0
+
+# Image I/O and processing
+opencv-python>=4.7
+
+# Transformer attention (used by modules/model/transformer.py)
+einops>=0.6
