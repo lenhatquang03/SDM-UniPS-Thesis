@@ -6,8 +6,8 @@ Scalable, Detailed and Mask-free Universal Photometric Stereo Network (CVPR2023)
 
 import glob
 import torch.utils.data as data
-from .dataloader import realdata, synthetic
-from .dataloader.mixed import MixedTrainDataset
+from .dataloader import realdata
+from .dataloader.mixed import build_mixed_split
 from .dataloader.diligent import DiligentLoader
 import numpy as np
 import os
@@ -55,73 +55,21 @@ class dataio(data.Dataset):
         return len(self.objlist)
 
 
-class TrainDataio(data.Dataset):
-    """Fixed-resolution training dataset that pads inputs to `max_image_num`.
-
-    Returns tensors compatible with `model.Net.forward(..., training=True)`:
-      - I: (3, H, W, Nmax) padded with zeros for unused slots
-      - N: (3, H, W)  GT normals
-      - M: (1, H, W)  foreground mask
-      - n_imgs: int   number of valid images in I[..., :n_imgs]
-    """
-
-    def __init__(self, args, augment=True):
-        self.augment = augment
-        self.max_image_num = args.max_image_num
-        self.prefix = getattr(args, 'train_prefix', 'L*')
-        self.extension = getattr(args, 'train_ext', '.data')
-        self.mask_margin = args.mask_margin
-        self.train_resolution = getattr(args, 'train_resolution', 256)
-        self.outdir = args.session_name
-        self.min_image_num = getattr(args, 'min_image_num', None)
-
-        data_root = args.train_dir
-        objlist = sorted(glob.glob(f'{data_root}/*{self.extension}'))
-        if len(objlist) == 0:
-            raise RuntimeError(f'No training objects found in {data_root} with ext {self.extension}')
-        self.objlist = objlist
-        self.loader = synthetic.SyntheticDataset(
-            max_image_num=self.max_image_num,
-            train_resolution=self.train_resolution,
-            outdir=self.outdir,
-            mask_margin=self.mask_margin,
-        )
-        print(f'[Train] Found {len(self.objlist)} synthetic objects in {data_root}')
-
-    def __len__(self):
-        return len(self.objlist)
-
-    def __getitem__(self, idx):
-        objdir = self.objlist[idx]
-        # Each worker uses its own RNG (numpy default).
-        self.loader.load(objdir, prefix=self.prefix, augment=self.augment,
-                         min_image_num=self.min_image_num)
-        h, w = self.loader.h, self.loader.w
-        n = self.loader.numberOfImages
-
-        # I: (h, w, 3, N) -> pad to (h, w, 3, Nmax) -> (3, h, w, Nmax)
-        I = np.zeros((h, w, 3, self.max_image_num), np.float32)
-        I[..., :n] = self.loader.I
-        I = I.transpose(2, 0, 1, 3)                          # (3, h, w, Nmax)
-
-        N = self.loader.N.transpose(2, 0, 1).astype(np.float32)         # (3, h, w)
-        M = self.loader.mask.transpose(2, 0, 1).astype(np.float32)      # (1, h, w)
-
-        return I, N, M, np.int64(n)
-
-
 def build_train_dataset(args, augment=True):
-    """Pick a training dataset backend.
+    """Build the mixed (hdlong-complexv1 + PolarPS) training split.
 
-    backend='synthetic'  → legacy PS-Mix / single-scene synthetic loader (paper).
-    backend='mixed'      → hdlong-complexv1 + PolarPS (thesis).
+    Returns only the train half of the deterministic scene-level split; the
+    held-out val half is obtained via `build_val_dataset` with the same
+    seed, guaranteeing the two are disjoint.
     """
-    backend = getattr(args, 'dataset_backend', 'mixed')
-    if backend == 'synthetic':
-        return TrainDataio(args, augment=augment)
-    if backend == 'mixed':
-        return MixedTrainDataset(args, augment=augment)
-    raise ValueError(f'Unknown --dataset_backend: {backend}')
+    train_set, _ = build_mixed_split(args, augment=augment)
+    return train_set
+
+
+def build_val_dataset(args):
+    """Build the held-out validation split (never augmented)."""
+    _, val_set = build_mixed_split(args, augment=False)
+    return val_set
 
 
 class DiligentEvalDataset(data.Dataset):

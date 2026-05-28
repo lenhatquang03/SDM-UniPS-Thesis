@@ -58,13 +58,13 @@ class Trainer:
 
         self.net = model.Net(args.pixel_samples, device).to(device)
         self.net.with_grad()
-        print(f"[Trainer] target=normal  params={get_n_params(self.net):,}")
+        print(f"[Trainer] Target = Normal  Params = {get_n_params(self.net):,}")
 
         if getattr(args, 'resume', None):
             ckpt_paths = (glob.glob(os.path.join(args.resume, '*.pytmodel'))
                           + glob.glob(os.path.join(args.resume, '*.pt')))
             if ckpt_paths:
-                print(f'[Trainer] resuming weights from {ckpt_paths[0]}')
+                print(f'[Trainer] Resuming weights from {ckpt_paths[0]}')
                 self.net = loadmodel(self.net, ckpt_paths[0], strict=False)
 
         self.optimizer = torch.optim.AdamW(
@@ -93,9 +93,9 @@ class Trainer:
         self.scaler = torch.cuda.amp.GradScaler(
             enabled=(self.amp_enabled and self.amp_dtype == 'fp16'),
         )
-        print(f'[Trainer] amp={self.amp_dtype}  enabled={self.amp_enabled}  '
-              f'schedule={args.lr_schedule}  warmup_steps={warmup_steps}  '
-              f'total_steps={total_steps}')
+        print(f'[Trainer] AMP = {self.amp_dtype}  Enabled = {self.amp_enabled}  '
+              f'schedule = {args.lr_schedule}  warmup_steps = {warmup_steps}  '
+              f'total_steps = {total_steps}')
 
         self.total_steps = total_steps
         self.steps_per_epoch = steps_per_epoch

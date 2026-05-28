@@ -31,17 +31,16 @@ The checkpoint directory must contain `<checkpoint>/normal/*.pytmodel`.
 
 ## Running Training
 
-**Model A (thesis recipe — hdlong-complexv1 + PolarPS mix, DiLiGenT eval):**
+**Model A (thesis recipe — hdlong-complexv1 + PolarPS mix, held-out val split, DiLiGenT test):**
 ```bash
 python sdm_unips/train.py \
   --session_name modelA_full \
   --hdlong_dir /path/to/hdlong-complexv1 \
   --polarps_dir /path/to/PolarPS \
   --eval_dir   /path/to/DiLiGenT/pmsData \
-  --max_scenes 8000 --dataset_backend mixed \
+  --max_scenes 8000 --val_fraction 0.1 \
   --train_resolution 512 --canonical_resolution 256 \
   --batch_size 8 --pixel_samples 2048 \
-  --min_image_num 3 --max_image_num 6 \
   --epochs 60 --lr 1e-4 --weight_decay 0.05 \
   --lr_schedule cosine --warmup_epochs 5 --min_lr_ratio 0.01 \
   --grad_clip 1.0 --amp_dtype bf16
@@ -57,15 +56,23 @@ python sdm_unips/train.py \
   --max_scenes 8000 --amp_dtype bf16
 ```
 
-**Legacy PS-Mix path** (single-scene synthetic loader): use `--dataset_backend synthetic --train_dir /path/to/PS-Mix`. Step decay ×0.8 every 10 epochs is available via `--lr_schedule step`.
+**Model selection & evaluation protocol:** the mixed pool is split at the
+**scene level** into train / val (`--val_fraction`, default 0.1), split
+proportionally within each source (hdlong and PolarPS split separately) and
+deterministic given `--seed`. `best.pt` is selected by **held-out validation
+loss** at the end of every `--val_every_epochs` epochs. DiLiGenT is the
+held-out **test** benchmark and is evaluated **exactly once, after the final
+epoch** (when `--eval_dir` is set) — it never influences checkpoint selection.
 
 **Key training flags** (defaults shown are thesis values):
-- `--dataset_backend`: `mixed` (hdlong + PolarPS) or `synthetic` (legacy PS-Mix)
-- `--hdlong_dir`, `--polarps_dir`: roots for the two mixed-backend sources (either or both)
-- `--max_scenes`: cap on the training set size (thesis uses 8000)
+- `--hdlong_dir`, `--polarps_dir`: roots for the two mixed sources (either or both)
+- `--train_dir`: auto-detect root (scenes classified into hdlong/polarps by on-disk markers)
+- `--max_scenes`: cap on the **combined** scene pool before the split (thesis uses 8000)
+- `--val_fraction`: held-out fraction for validation (default 0.1)
+- `--val_every_epochs`: epochs between validation passes / best.pt checks (default 1)
 - `--batch_size`: 8 — `--pixel_samples`: m=2048
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
-- `--min_image_num` / `--max_image_num`: 3 / 6 (K is sampled uniformly per batch)
+- K is fixed at 10 per scene inside `HdlongLoader` / `PolarPSLoader`.
 - `--lr`: 1e-4 — `--weight_decay`: 0.05
 - `--lr_schedule`: `cosine` (1e-4 → 1e-4·`min_lr_ratio` over the full run) or `step`
 - `--warmup_epochs`: 5.0 (linear)
@@ -75,18 +82,18 @@ python sdm_unips/train.py \
 - `--resume`: warm-start from a `*.pytmodel` or `*.pt` checkpoint dir
 - `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
 
-**Evaluation flags (DiLiGenT K-sweep, end of every epoch when `--eval_dir` is set):**
+**Evaluation flags (single DiLiGenT K-sweep, run once after the final epoch when `--eval_dir` is set):**
 - `--eval_dir`: DiLiGenT `pmsData` root (10 `*PNG` scene directories)
 - `--eval_K_list`: comma-separated K values (default `2,4,8,16,32,64,96`)
 - `--eval_trials`: random subsets per (scene, K) (default 10)
 - `--eval_side`: center-crop side (default 512; DiLiGenT is 612×512)
-- `--eval_best_K`: the K used to decide the best-by-MAE checkpoint (default 16)
+- `--eval_best_K`: the K whose mean MAE is reported as the headline test number (default 16)
 
 Checkpoints are written to `<session>/checkpoints/`. Each save also drops a `normal.pytmodel` copy that the inference `Builder` can load directly. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned.
 
 Logs land in `<session>/logs/`:
-- `train.jsonl` / `train.log`  — per-step loss, MAE, LR, grad norm, step seconds
-- `eval.jsonl` / `eval.log`    — per-scene, per-K, per-trial DiLiGenT MAE plus per-K summaries
+- `train.jsonl` / `train.log`  — per-step loss, MAE, LR, grad norm, step seconds; per-epoch and per-validation summaries
+- `eval.jsonl` / `eval.log`    — the single final DiLiGenT run: per-scene, per-K, per-trial MAE plus per-K summaries
 - `config.json`                — frozen CLI arguments for the run
 
 ## Data Format
@@ -106,16 +113,7 @@ normal.png
 error.png      # only if Normal_gt.png provided
 ```
 
-**Training layout (legacy `synthetic` backend, one directory per scene, suffix `--train_ext`, default `.data`):**
-```
-TRAIN_DATA_PATH/
-└── SCENE_NAME.data/
-    ├── L_*.png          # multi-light renders (16-bit recommended; PS-Mix is 512×512)
-    ├── normal.png       # required: GT surface normal, RGB-encoded as (n+1)/2
-    └── mask.png         # optional foreground mask (derived from normal magnitude if absent)
-```
-
-**Training layout (thesis `mixed` backend):**
+**Training layout (hdlong-complexv1 + PolarPS):**
 ```
 HDLONG_ROOT/
 └── SCENE_NAME/
@@ -172,9 +170,8 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 
 ### Data loading
 - Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).
-- Training (legacy PS-Mix): `modules/io/dataloader/synthetic.py` (wrapped by `modules/io/dataio.py:TrainDataio`) — square mask-bbox crop with jitter, resize to `--train_resolution`, random horizontal flip (with normal x-component sign flip), random K image subset, paper-spec per-image normalization.
-- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. Selected via `--dataset_backend mixed` and built by `modules/io/dataio.py:build_train_dataset`.
-- DiLiGenT eval: `modules/io/dataloader/diligent.py:DiligentLoader` + `modules/io/dataio.py:DiligentEvalDataset` — 1 scene preload, then per-call random K subsets for the K-sweep MAE evaluation invoked at the end of every epoch from `train.py:run_diligent_eval`.
+- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val split; `dataio.py:build_train_dataset` / `build_mixed_val_dataset` return the two halves (same seed ⇒ disjoint). K is fixed at 10 per scene.
+- DiLiGenT test: `modules/io/dataloader/diligent.py:DiligentLoader` + `modules/io/dataio.py:DiligentEvalDataset` — 1 scene preload, then per-call random K subsets for the K-sweep MAE evaluation invoked **once after the final epoch** from `train.py:run_diligent_eval`.
 
 ## Environment
 

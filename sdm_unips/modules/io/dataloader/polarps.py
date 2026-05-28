@@ -15,9 +15,9 @@ The mask is derived from `normal.exr`: encoded as (n+1)/2, so background
 pixels (rgb=0.5) decode to the zero vector and have magnitude 0. We
 threshold magnitude > 0.5 to isolate foreground.
 
-For one __getitem__ call we sample K (default 3..6) light directions
-out of the 32, mask each image, resize to --train_resolution if needed,
-and apply the paper-spec per-image (mean..max) luminance normalization.
+For one __getitem__ call we draw a fixed K=10 light directions out of
+the 32, mask each image, resize to --train_resolution if needed, and
+apply the paper-spec per-image (mean..max) luminance normalization.
 """
 
 import glob
@@ -42,38 +42,37 @@ def _read_exr(path):
 class PolarPSLoader:
     """Per-scene loader for PolarPS.
 
-    Public attributes mirror `synthetic.SyntheticDataset`:
+    Public attributes:
         I (h, w, 3, K), N (h, w, 3), mask (h, w, 1), roi, objname,
         data_workspace, h, w, numberOfImages.
     """
 
-    def __init__(self, max_image_num, train_resolution=512, outdir='.', mask_margin=8):
-        self.max_image_num = max_image_num
+    def __init__(self, train_resolution=512, outdir='.', mask_margin=8):
         self.train_resolution = int(train_resolution)
         self.outdir = outdir
         self.mask_margin = mask_margin
 
-    def _sample_K(self, total_available, min_image_num, rng):
-        n_max = min(total_available, self.max_image_num)
-        n_min = min_image_num if min_image_num is not None else max(2, n_max // 2)
-        n_min = min(n_min, n_max)
-        return int(rng.randint(n_min, n_max + 1))
+    def _sample_K(self, total_available):
+        # Fixed K=10 renders per scene (capped by what's actually on disk).
+        return min(10, total_available)
 
-    def load(self, scene_dir, augment=True, min_image_num=None, rng=None):
+    def load(self, scene_dir, augment=True, rng=None):
         rng = rng if rng is not None else np.random
+        # Resolve data paths
         self.objname = re.split(r'\\|/', scene_dir)[-1]
         self.data_workspace = f'{self.outdir}/results/{self.objname}'
 
         nml_path = os.path.join(scene_dir, 'normal.exr')
         if not os.path.isfile(nml_path):
             raise RuntimeError(f'Missing normal.exr in {scene_dir}')
+        # Extract binary mask from surface normal vectors
         n_raw = _read_exr(nml_path)
         n_vec = 2.0 * n_raw - 1.0
         mag = np.linalg.norm(n_vec, axis=2)
         mask = (mag > 0.5).astype(np.float32)
         N = n_vec / (mag[..., None] + 1e-12)
         N = N * mask[..., None]
-
+        # Randomply sample 10 images/scene
         subdirs = sorted(d for d in glob.glob(os.path.join(scene_dir, '*'))
                          if os.path.isdir(d))
         if not subdirs:
@@ -84,7 +83,7 @@ class PolarPSLoader:
         if not light_dirs:
             raise RuntimeError(f'No light-* dirs under {img_subdir}')
 
-        K = self._sample_K(len(light_dirs), min_image_num, rng)
+        K = self._sample_K(len(light_dirs))
         chosen = rng.permutation(len(light_dirs))[:K]
 
         out_h = out_w = self.train_resolution
@@ -92,11 +91,13 @@ class PolarPSLoader:
         mask_b = mask[..., None]
         for i, k in enumerate(chosen):
             img = _read_exr(os.path.join(light_dirs[k], 'S0.exr'))
+            # Apply mask
             img = np.maximum(img, 0.0) * mask_b
+            # Upsample to the desired shape (512, 512) if needed
             if img.shape[0] != out_h or img.shape[1] != out_w:
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
-            composed[i] = img
-
+            composed[i] = img # (K, H, W, 3)
+        # Upsample surface normals and masks (if needed) + normalize surface normals
         mask_r = (cv2.resize(mask, (out_h, out_w), interpolation=cv2.INTER_NEAREST) > 0.5).astype(np.float32)
         N_r = cv2.resize(N, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
         N_r = N_r / (np.linalg.norm(N_r, axis=2, keepdims=True) + 1e-12)
@@ -109,15 +110,15 @@ class PolarPSLoader:
             N_r = N_r[:, ::-1, :].copy()
             N_r[:, :, 0] = -N_r[:, :, 0]
 
-        m_flat = mask_r.reshape(-1)
-        I_flat = composed.reshape(K, -1, 3)
+        m_flat = mask_r.reshape(-1) 
+        I_flat = composed.reshape(K, -1, 3) # (K, H * W, 3)
         if m_flat.sum() > 0:
-            valid = I_flat[:, m_flat == 1, :]
+            valid = I_flat[:, m_flat == 1, :] # (K, V, 3); V = # foreground pixels
         else:
             valid = I_flat
-        lum = np.mean(valid, axis=2)
-        mx = np.max(lum, axis=1)
-        mn = np.mean(lum, axis=1)
+        lum = np.mean(valid, axis=2) # (K, V)
+        mx = np.max(lum, axis=1) # (K, )
+        mn = np.mean(lum, axis=1) # (K, )
         if augment:
             t = rng.rand(K).astype(np.float32)
             scale = (1.0 - t) * mn + t * mx
@@ -126,7 +127,7 @@ class PolarPSLoader:
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
         composed = I_flat.reshape(K, out_h, out_w, 3)
 
-        I = np.transpose(composed, (1, 2, 3, 0))
+        I = np.transpose(composed, (1, 2, 3, 0)) # (H, W, 3, K)
 
         self.h = out_h
         self.w = out_w

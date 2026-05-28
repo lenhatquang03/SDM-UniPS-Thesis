@@ -8,10 +8,9 @@ Quickstart for the thesis recipe (hdlong-complexv1 + PolarPS):
         --hdlong_dir /kaggle/input/hdlong-complexv1 \
         --polarps_dir /kaggle/input/polarps \
         --eval_dir /kaggle/input/diligent/pmsData \
-        --max_scenes 8000 --dataset_backend mixed \
+        --max_scenes 8000 --val_fraction 0.1 \
         --train_resolution 512 --canonical_resolution 256 \
         --batch_size 8 --pixel_samples 2048 \
-        --min_image_num 3 --max_image_num 6 \
         --lr 1e-4 --weight_decay 0.05 --lr_schedule cosine \
         --warmup_epochs 5 --min_lr_ratio 0.01 --grad_clip 1.0 \
         --amp_dtype bf16 --smoke_test
@@ -19,11 +18,16 @@ Quickstart for the thesis recipe (hdlong-complexv1 + PolarPS):
 `--smoke_test` clamps the run to `--smoke_epochs` (default 10) for a quick
 Kaggle dry-run before committing to the full 60-epoch schedule.
 
+Checkpoint selection uses a held-out scene-level validation split of the
+mixed (hdlong + PolarPS) pool. DiLiGenT is the held-out *test* benchmark and
+is evaluated exactly once, after the final epoch, to avoid leaking the test
+set into model selection.
+
 Logging
 -------
 Per-step JSONL lines are appended to `<session>/logs/train.jsonl` and a
-human-readable mirror to `<session>/logs/train.log`. End-of-epoch DiLiGenT
-results land in `<session>/logs/eval.jsonl`.
+human-readable mirror to `<session>/logs/train.log`. The single final
+DiLiGenT evaluation lands in `<session>/logs/eval.jsonl`.
 """
 
 from __future__ import print_function, division
@@ -42,7 +46,11 @@ sys.path.append('..')
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from modules.builder.trainer import Trainer, prune_checkpoints
-from modules.io.dataio import build_train_dataset, DiligentEvalDataset
+from modules.io.dataio import (
+    build_train_dataset,
+    build_val_dataset,
+    DiligentEvalDataset,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -53,19 +61,16 @@ def build_argparser():
 
     # I/O ----------------------------------------------------------------
     p.add_argument('--session_name', default='train_run')
-    p.add_argument('--dataset_backend', default='mixed',
-                   choices=['mixed', 'synthetic'])
     p.add_argument('--hdlong_dir', default=None,
                    help='Root of hdlong-complexv1 (scenes have light_means.config)')
     p.add_argument('--polarps_dir', default=None,
                    help='Root of PolarPS (scenes have normal.exr)')
     p.add_argument('--train_dir', default=None,
                    help='Auto-detect root: scenes are classified into hdlong/polarps '
-                        'by their on-disk markers. Also used by --dataset_backend synthetic.')
-    p.add_argument('--val_dir', default=None,
-                   help='Optional validation root (same layout rules as --train_dir)')
-    p.add_argument('--train_ext', default='.data')
-    p.add_argument('--train_prefix', default='L*')
+                        'by their on-disk markers.')
+    p.add_argument('--val_fraction', type=float, default=0.1,
+                   help='Held-out fraction of the mixed pool for validation '
+                        '(scene-level split, split proportionally per source).')
     p.add_argument('--mask_margin', type=int, default=8)
     p.add_argument('--checkpoint_dir', default=None,
                    help='Defaults to <session_name>/checkpoints')
@@ -80,23 +85,22 @@ def build_argparser():
     p.add_argument('--keep_last', type=int, default=3,
                    help='Number of recent epoch checkpoints to keep on disk')
 
-    # Eval (DiLiGenT) ----------------------------------------------------
+    # Eval (DiLiGenT) — run once after the final epoch -------------------
     p.add_argument('--eval_dir', default=None,
-                   help='DiLiGenT pmsData root (10 *PNG scene dirs).')
-    p.add_argument('--eval_every_epochs', type=int, default=1)
+                   help='DiLiGenT pmsData root (10 *PNG scene dirs). '
+                        'Evaluated once, after training, as the held-out test set.')
     p.add_argument('--eval_K_list', default='2,4,8,16,32,64,96')
     p.add_argument('--eval_trials', type=int, default=10)
     p.add_argument('--eval_side', type=int, default=512)
     p.add_argument('--eval_best_K', type=int, default=16,
-                   help='K used to decide the best-by-MAE checkpoint')
+                   help='K whose mean MAE is reported as the headline final test number')
 
     # Network ------------------------------------------------------------
     p.add_argument('--canonical_resolution', type=int, default=256)
     p.add_argument('--pixel_samples', type=int, default=2048)
 
     # Data ---------------------------------------------------------------
-    p.add_argument('--max_image_num', type=int, default=6)
-    p.add_argument('--min_image_num', type=int, default=3)
+    # K is fixed at 10 per scene inside HdlongLoader / PolarPSLoader.
     p.add_argument('--train_resolution', type=int, default=512)
     p.add_argument('--max_scenes', type=int, default=8000,
                    help='Cap the training set size. 0 = no cap.')
@@ -269,6 +273,7 @@ def run_diligent_eval(trainer, eval_set, device, logger, epoch, global_step,
 def main():
     args = build_argparser().parse_args()
 
+    # Smoke-test configurations
     if args.smoke_test:
         args.epochs = min(args.epochs, args.smoke_epochs)
         if args.smoke_max_scenes > 0:
@@ -277,24 +282,24 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # Create dedicated directories for logs and checkpoints
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     log_dir = args.log_dir or os.path.join(args.session_name, 'logs')
     ckpt_dir = args.checkpoint_dir or os.path.join(args.session_name, 'checkpoints')
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    print(f'[Train] device={device}  target=normal  session={args.session_name}')
-    print(f'[Train] dataset_backend={args.dataset_backend}  amp={args.amp_dtype}  '
-          f'epochs={args.epochs}  batch_size={args.batch_size}  '
-          f'K~U[{args.min_image_num},{args.max_image_num}]')
-    print(f'[Train] log_dir={log_dir}  ckpt_dir={ckpt_dir}')
+    print(f'[Train] Device = {device}  Session = {args.session_name}')
+    print(f'[Train] Dataset = mixed (hdlong + PolarPS)  Automatic Mixed Precision (AMP) = {args.amp_dtype}  '
+          f'Epochs = {args.epochs}  Batch size = {args.batch_size}  K=10')
+    print(f'[Train] Log directory = {log_dir}  Checkpoint directory = {ckpt_dir}')
     if torch.cuda.is_available():
         gpu_props = torch.cuda.get_device_properties(0)
-        print(f'[Train] gpu={torch.cuda.get_device_name(0)}  '
-              f'mem={gpu_props.total_memory / 2**30:.1f}GiB  '
-              f'capability={gpu_props.major}.{gpu_props.minor}')
+        print(f'[Train] GPU = {torch.cuda.get_device_name(0)}  '
+              f'Memory = {gpu_props.total_memory / 2**30:.1f} GiB  '
+              f'Capability = {gpu_props.major}.{gpu_props.minor}')
 
-    train_set = build_train_dataset(args, augment=True)
+    train_set = build_train_dataset(args, augment=False)
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=(device.type == 'cuda'),
@@ -302,19 +307,19 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
+    # Held-out scene-level split drives checkpoint selection (best.pt).
+    val_set = build_val_dataset(args)
     val_loader = None
-    if args.val_dir:
-        val_args = argparse.Namespace(**vars(args))
-        val_args.train_dir = args.val_dir
-        val_args.hdlong_dir = None
-        val_args.polarps_dir = None
-        val_set = build_train_dataset(val_args, augment=False)
+    if len(val_set) > 0:
         val_loader = torch.utils.data.DataLoader(
             val_set, batch_size=args.batch_size, shuffle=False,
             num_workers=max(1, args.num_workers // 2),
             pin_memory=(device.type == 'cuda'),
             drop_last=False, collate_fn=_collate,
         )
+    else:
+        print('[Train] Validatoin split is empty (--val_fraction too small); '
+              'best.pt will not be updated.')
 
     eval_set = None
     if args.eval_dir:
@@ -326,7 +331,7 @@ def main():
 
     steps_per_epoch = max(1, len(train_loader))
     total_steps = steps_per_epoch * args.epochs
-    print(f'[Train] steps_per_epoch={steps_per_epoch}  total_steps={total_steps}')
+    print(f'[Train] steps_per_epoch = {steps_per_epoch:,}  total_steps = {total_steps:,}')
 
     trainer = Trainer(args, device, total_steps=total_steps,
                        steps_per_epoch=steps_per_epoch)
@@ -339,7 +344,7 @@ def main():
                    if isinstance(v, (str, int, float, bool, type(None)))},
                   f, indent=2)
 
-    best_mae = float('inf')
+    best_val_loss = float('inf')
     best_path = os.path.join(ckpt_dir, 'best.pt')
     t0 = time.time()
     for epoch in range(args.epochs):
@@ -390,7 +395,7 @@ def main():
         path = trainer.save(ckpt_dir, tag=f'epoch_{epoch}')
         print(f'[ckpt] epoch checkpoint saved {path}')
 
-        # Optional validation.
+        # Held-out validation drives best.pt selection (lower loss = better).
         if val_loader is not None and (epoch + 1) % args.val_every_epochs == 0:
             v_logs = []
             for vb in val_loader:
@@ -401,35 +406,39 @@ def main():
                        for k in v_logs[0]}
                 avg['kind'] = 'val_summary'
                 avg['epoch'] = epoch
+                avg['global_step'] = trainer.global_step
                 train_logger.write(
                     avg,
                     text=f'[val epoch {epoch}] ' + _format_log(avg),
                 )
-
-        # Optional DiLiGenT eval.
-        if eval_set is not None and (epoch + 1) % args.eval_every_epochs == 0:
-            mae_at_best_K = run_diligent_eval(
-                trainer, eval_set, device, eval_logger,
-                epoch=epoch, global_step=trainer.global_step,
-                best_K=args.eval_best_K,
-            )
-            if mae_at_best_K == mae_at_best_K and mae_at_best_K < best_mae:
-                best_mae = mae_at_best_K
-                shutil.copyfile(path, best_path)
-                legacy = os.path.join(ckpt_dir, 'normal.pytmodel')
-                if os.path.isfile(legacy):
-                    shutil.copyfile(
-                        legacy,
-                        os.path.join(ckpt_dir, 'best_normal.pytmodel'),
-                    )
-                print(f'[best] epoch {epoch}  '
-                      f'mae@K{args.eval_best_K}={mae_at_best_K:.4f}  → {best_path}')
+                avg_val_loss = avg.get('val_loss', float('inf'))
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    shutil.copyfile(path, best_path)
+                    legacy = os.path.join(ckpt_dir, 'normal.pytmodel')
+                    if os.path.isfile(legacy):
+                        shutil.copyfile(
+                            legacy,
+                            os.path.join(ckpt_dir, 'best_normal.pytmodel'),
+                        )
+                    print(f'[best] epoch {epoch}  '
+                          f'val_loss={avg_val_loss:.4f}  → {best_path}')
 
         prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',))
 
     final = trainer.save(ckpt_dir, tag='final')
     print(f'[Train] done. final checkpoint: {final}  '
-          f'best_mae@K{args.eval_best_K}={best_mae:.4f}')
+          f'best_val_loss={best_val_loss:.4f}')
+
+    # DiLiGenT is the held-out test benchmark: evaluate exactly once, after
+    # training, so the test set never influences checkpoint selection.
+    if eval_set is not None:
+        final_mae = run_diligent_eval(
+            trainer, eval_set, device, eval_logger,
+            epoch=args.epochs - 1, global_step=trainer.global_step,
+            best_K=args.eval_best_K,
+        )
+        print(f'[Train] final DiLiGenT mae@K{args.eval_best_K}={final_mae:.4f}')
 
 
 if __name__ == '__main__':
