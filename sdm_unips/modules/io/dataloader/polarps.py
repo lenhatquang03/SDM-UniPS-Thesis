@@ -36,7 +36,11 @@ def _read_exr(path):
         raise IOError(f'Could not read EXR: {path}')
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return img.astype(np.float32)
+    img = img.astype(np.float32)
+    # Rendered HDR EXRs can carry Inf/NaN (clipped specular highlights, failed
+    # samples). Left in, a single Inf pixel poisons the per-image max-luminance
+    # normalization (Inf/Inf -> NaN) and produces NaN losses. Drop them to 0.
+    return np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class PolarPSLoader:

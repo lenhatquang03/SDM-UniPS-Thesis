@@ -299,6 +299,7 @@ def main():
               f'Memory = {gpu_props.total_memory / 2**30:.1f} GiB  '
               f'Capability = {gpu_props.major}.{gpu_props.minor}')
 
+    # Train Dataloader
     train_set = build_train_dataset(args, augment=False)
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
@@ -402,7 +403,10 @@ def main():
                 v_logs.append({k: _to_scalar(v)
                                 for k, v in trainer.val_step(vb).items()})
             if v_logs:
-                avg = {f'val_{k}': float(np.mean([d[k] for d in v_logs]))
+                # nanmean so a single non-finite val batch (already flagged by
+                # the trainer's nan-debug guard) doesn't poison the whole average
+                # and silently block best.pt selection.
+                avg = {f'val_{k}': float(np.nanmean([d[k] for d in v_logs]))
                        for k in v_logs[0]}
                 avg['kind'] = 'val_summary'
                 avg['epoch'] = epoch

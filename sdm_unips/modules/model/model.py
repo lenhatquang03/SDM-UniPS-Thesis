@@ -77,6 +77,8 @@ class ImageFeatureFusion(nn.Module):
         out = self.fusion(out_fuse) 
         return out
 
+# The Scale-Invariant Spatial-Light Image Encoder (SISL-IE) encodes the input image at the canonical resolution,
+# and produces a Global Light-aware Context (GLC) feature map of the same spatial size as the input image. 
 class ScaleInvariantSpatialLightImageEncoder(nn.Module): # image feature encoder at canonical resolution
     def __init__(self, input_nc, use_efficient_attention=False):
         super(ScaleInvariantSpatialLightImageEncoder, self).__init__()

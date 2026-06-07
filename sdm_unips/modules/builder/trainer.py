@@ -100,6 +100,7 @@ class Trainer:
         self.total_steps = total_steps
         self.steps_per_epoch = steps_per_epoch
         self.global_step = 0
+        self._nan_reported = False
 
     def _autocast(self):
         if not self.amp_enabled:
@@ -132,11 +133,39 @@ class Trainer:
             mae = losses.angular_error_deg(pred_n, N, M, sample_idx)
         return loss, {'loss': loss.detach(), 'mae_deg': mae.detach()}
 
+    def _report_nan(self, batch):
+        """One-time diagnostic: localize a non-finite loss to inputs vs forward."""
+        if self._nan_reported:
+            return
+        self._nan_reported = True
+        I, N, M, n_imgs = self._move_batch(batch)
+        def stat(name, t):
+            n_nan = int(torch.isnan(t).sum())
+            n_inf = int(torch.isinf(t).sum())
+            print(f'[nan-debug] {name}: shape={tuple(t.shape)} '
+                  f'nan={n_nan} inf={n_inf} '
+                  f'min={t[torch.isfinite(t)].min().item() if torch.isfinite(t).any() else float("nan"):.4g} '
+                  f'max={t[torch.isfinite(t)].max().item() if torch.isfinite(t).any() else float("nan"):.4g}')
+        print('[nan-debug] non-finite loss detected; inspecting this batch:')
+        stat('I (images)', I)
+        stat('N (gt normal)', N)
+        stat('M (mask)', M)
+        any_input_bad = any(not torch.isfinite(t).all() for t in (I, N, M))
+        if any_input_bad:
+            print('[nan-debug] => NaN/Inf is in the INPUT data (loader bug), '
+                  'not the forward pass.')
+        else:
+            print('[nan-debug] => inputs are finite; NaN arises INSIDE the '
+                  'forward/backward pass (e.g. fp16 overflow or model numerics).')
+
     def train_step(self, batch):
         self.net.train()
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
             loss, log = self._forward_losses(batch)
+
+        if not torch.isfinite(loss):
+            self._report_nan(batch)
 
         clip_val = self.args.grad_clip if self.args.grad_clip > 0 else float('inf')
         if self.amp_dtype == 'fp16':
@@ -161,6 +190,8 @@ class Trainer:
         self.net.eval()
         with self._autocast():
             loss, log = self._forward_losses(batch)
+        if not torch.isfinite(loss):
+            self._report_nan(batch)
         return log
 
     def save(self, ckpt_dir, tag):

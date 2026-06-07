@@ -43,6 +43,19 @@ def _read_image(path):
     return img.astype(np.float32) / scale
 
 
+def _resolve_normal_gt(scene_dir):
+    """Find the GT normal PNG regardless of filename casing.
+
+    DiLiGenT ships it as `Normal_gt.png` for most scenes but `normal_gt.png`
+    for at least one (pot2PNG), so match case-insensitively.
+    """
+    target = 'normal_gt.png'
+    for fn in os.listdir(scene_dir):
+        if fn.lower() == target:
+            return os.path.join(scene_dir, fn)
+    raise IOError(f'No Normal_gt.png found in {scene_dir}')
+
+
 def _center_crop_square(img, side):
     h, w = img.shape[:2]
     r0 = (h - side) // 2
@@ -79,7 +92,7 @@ class DiligentLoader:
             mask = mask[:, :, 0]
         mask = (mask > 0.5).astype(np.float32)
 
-        N = _read_image(os.path.join(scene_dir, 'Normal_gt.png'))
+        N = _read_image(_resolve_normal_gt(scene_dir))
         N = 2.0 * N - 1.0
         nrm = np.linalg.norm(N, axis=2, keepdims=True)
         N = N / (nrm + 1e-12)
