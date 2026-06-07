@@ -101,6 +101,10 @@ class Trainer:
         self.steps_per_epoch = steps_per_epoch
         self.global_step = 0
         self._nan_reported = False
+        self.detect_anomaly = bool(getattr(args, 'detect_anomaly', False))
+        if self.detect_anomaly:
+            print('[Trainer] torch.autograd anomaly detection ENABLED '
+                  '(slow; raises at the first NaN/Inf op).')
 
     def _autocast(self):
         if not self.amp_enabled:
@@ -151,33 +155,51 @@ class Trainer:
         stat('N (gt normal)', N)
         stat('M (mask)', M)
         any_input_bad = any(not torch.isfinite(t).all() for t in (I, N, M))
+        # Scan parameters: NaN weights mean a PREVIOUS backward/step corrupted
+        # the model (e.g. an exploding/NaN gradient), so the current forward NaNs
+        # even with clean inputs. Clean weights + NaN loss => pure forward issue.
+        bad_params = [name for name, p in self.net.named_parameters()
+                      if not torch.isfinite(p).all()]
+        if bad_params:
+            print(f'[nan-debug] {len(bad_params)} parameter tensors are NaN/Inf, '
+                  f'e.g. {bad_params[:3]}')
         if any_input_bad:
             print('[nan-debug] => NaN/Inf is in the INPUT data (loader bug), '
                   'not the forward pass.')
+        elif bad_params:
+            print('[nan-debug] => model WEIGHTS are corrupted: a prior backward '
+                  'produced a NaN/Inf gradient (grad_clip cannot fix a NaN). '
+                  'Look at the loss/normalization gradient, not the forward.')
         else:
-            print('[nan-debug] => inputs are finite; NaN arises INSIDE the '
-                  'forward/backward pass (e.g. fp16 overflow or model numerics).')
+            print('[nan-debug] => inputs and weights are finite; NaN arises in '
+                  'this forward pass itself (model numerics).')
 
     def train_step(self, batch):
         self.net.train()
         self.optimizer.zero_grad(set_to_none=True)
-        with self._autocast():
-            loss, log = self._forward_losses(batch)
+        # Anomaly detection must wrap BOTH forward and backward: it records the
+        # forward op stacks so a backward NaN/Inf raises pointing at the exact
+        # originating op.
+        anomaly_ctx = (torch.autograd.detect_anomaly()
+                       if self.detect_anomaly else nullcontext())
+        with anomaly_ctx:
+            with self._autocast():
+                loss, log = self._forward_losses(batch)
 
-        if not torch.isfinite(loss):
-            self._report_nan(batch)
+            if not torch.isfinite(loss):
+                self._report_nan(batch)
 
-        clip_val = self.args.grad_clip if self.args.grad_clip > 0 else float('inf')
-        if self.amp_dtype == 'fp16':
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
-            self.optimizer.step()
+            clip_val = self.args.grad_clip if self.args.grad_clip > 0 else float('inf')
+            if self.amp_dtype == 'fp16':
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
+                self.optimizer.step()
 
         self.scheduler.step()
         self.global_step += 1

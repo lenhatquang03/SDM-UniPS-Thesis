@@ -217,7 +217,13 @@ class Net(nn.Module):
         x = torch.cat([o_ids, glc_ids], dim=2)
         x = self.glc_aggregation(x)
         x_n = self.regressor(x, len(ids))
-        return F.normalize(x_n, dim=1, p=2)
+        # Gradient-safe unit normalization. F.normalize computes sqrt(sum(x^2))
+        # then clamp_min(eps); for a near-zero predicted vector that yields
+        # sqrt'(0)=inf times the clamped-region gradient 0 -> 0*inf = NaN, which
+        # silently corrupts weights through backward (grad_clip can't fix a NaN).
+        # Folding eps inside the sqrt keeps the gradient finite everywhere.
+        norm = torch.sqrt((x_n * x_n).sum(dim=1, keepdim=True) + 1e-12)
+        return x_n / norm
 
 
     def forward(self, I, M, nImgArray, decoder_resolution, canonical_resolution, training=False):

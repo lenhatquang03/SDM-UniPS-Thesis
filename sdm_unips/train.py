@@ -120,6 +120,10 @@ def build_argparser():
     p.add_argument('--amp', action='store_true',
                    help='Legacy alias: equivalent to --amp_dtype fp16')
     p.add_argument('--amp_dtype', default='bf16', choices=['bf16', 'fp16', 'none'])
+    p.add_argument('--detect_anomaly', action='store_true',
+                   help='Wrap each train step in torch.autograd.detect_anomaly so '
+                        'a NaN/Inf in forward or backward raises at the exact op '
+                        '(with the forward stack trace). Slow; use for debugging.')
     p.add_argument('--seed', type=int, default=42)
 
     # Smoke test ---------------------------------------------------------
