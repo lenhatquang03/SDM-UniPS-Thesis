@@ -105,6 +105,48 @@ class Trainer:
         if self.detect_anomaly:
             print('[Trainer] torch.autograd anomaly detection ENABLED '
                   '(slow; raises at the first NaN/Inf op).')
+            self._install_forward_nan_hooks()
+
+    def _install_forward_nan_hooks(self):
+        """Print the FIRST leaf module whose forward output goes non-finite.
+
+        Anomaly detection only flags backward ops, so a pure forward explosion
+        surfaces only at the loss. These post-forward hooks fire in execution
+        order; the first non-finite output localizes the culprit. If that
+        module's inputs were already non-finite, the blow-up is in a functional
+        op (einsum/exp/grid_sample/interpolate) just upstream of it.
+        """
+        self._fwd_nan_found = False
+
+        def make_hook(name):
+            def hook(module, inp, out):
+                if self._fwd_nan_found:
+                    return
+                outs = out if isinstance(out, (tuple, list)) else (out,)
+                bad = any(torch.is_tensor(t) and t.numel() > 0
+                          and not torch.isfinite(t).all() for t in outs)
+                if not bad:
+                    return
+                ins = [t for t in inp if torch.is_tensor(t) and t.numel() > 0]
+                in_finite = all(torch.isfinite(t).all() for t in ins)
+                self._fwd_nan_found = True
+                print(f'[fwd-nan] FIRST non-finite forward output: '
+                      f'{name} ({module.__class__.__name__})  '
+                      f'inputs_finite={in_finite}')
+                if in_finite:
+                    print('[fwd-nan] => this module is the culprit.')
+                else:
+                    print('[fwd-nan] => inputs already non-finite; culprit is a '
+                          'functional op (einsum/exp/grid_sample/interpolate) '
+                          'just upstream of this module.')
+            return hook
+
+        n = 0
+        for name, module in self.net.named_modules():
+            if not list(module.children()):  # leaf modules only
+                module.register_forward_hook(make_hook(name))
+                n += 1
+        print(f'[Trainer] forward NaN hooks installed on {n} leaf modules.')
 
     def _autocast(self):
         if not self.amp_enabled:
