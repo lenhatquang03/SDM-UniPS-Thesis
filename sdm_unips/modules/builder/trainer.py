@@ -181,9 +181,11 @@ class Trainer:
 
     def _report_nan(self, batch):
         """One-time diagnostic: localize a non-finite loss to inputs vs forward."""
+        # Only report the FIRST NaN/Inf occurrence, to avoid spamming.
         if self._nan_reported:
             return
         self._nan_reported = True
+        
         I, N, M, n_imgs = self._move_batch(batch)
         def stat(name, t):
             n_nan = int(torch.isnan(t).sum())

@@ -22,7 +22,6 @@ Required attrs on `args`:
 K is fixed at 10 per scene inside both `HdlongLoader` and `PolarPSLoader`.
 """
 
-import glob
 import os
 
 import numpy as np
@@ -34,12 +33,6 @@ from .polarps import PolarPSLoader
 K_PER_SCENE = 10
 
 
-def _list_dir(root):
-    if not root or not os.path.isdir(root):
-        return []
-    return sorted(d for d in glob.glob(os.path.join(root, '*')) if os.path.isdir(d))
-
-
 def _is_hdlong_scene(path):
     return os.path.isfile(os.path.join(path, 'light_means.config'))
 
@@ -48,25 +41,40 @@ def _is_polarps_scene(path):
     return os.path.isfile(os.path.join(path, 'normal.exr'))
 
 
+def _find_scenes(root, is_scene):
+    """Find every directory at or under `root` that *directly* holds a scene
+    marker, regardless of nesting depth.
+
+    Scenes live at different depths across sources: hdlong scenes are direct
+    children of `hdlong-complexv1/`, while PolarPS scenes sit one level deeper
+    under a per-object group dir (`PolarPS/<group>/<scene>/normal.exr`). A
+    marker-based walk handles both. We prune below a recognized scene so we
+    never descend into the heavy `cam_*/` (hdlong) or `light-NN/` (PolarPS)
+    leaf trees, and we sort for a deterministic, seed-reproducible order.
+    """
+    if not root or not os.path.isdir(root):
+        return []
+    found = []
+    for dirpath, dirnames, _ in os.walk(root):
+        if is_scene(dirpath):
+            found.append(dirpath)
+            dirnames[:] = []  # scene found: don't recurse into its leaves
+    return sorted(found)
+
+
 def _discover(roots, kinds):
     """Return list of (kind, scene_dir) for matching roots."""
+    predicate = {'hdlong': _is_hdlong_scene, 'polarps': _is_polarps_scene}
     out = []
     for kind, root in zip(kinds, roots):
-        for d in _list_dir(root):
-            if kind == 'hdlong' and _is_hdlong_scene(d):
-                out.append(('hdlong', d))
-            elif kind == 'polarps' and _is_polarps_scene(d):
-                out.append(('polarps', d))
+        for d in _find_scenes(root, predicate[kind]):
+            out.append((kind, d))
     return out
 
 
 def _auto_discover(root):
-    out = []
-    for d in _list_dir(root):
-        if _is_hdlong_scene(d):
-            out.append(('hdlong', d))
-        elif _is_polarps_scene(d):
-            out.append(('polarps', d))
+    out = [('hdlong', d) for d in _find_scenes(root, _is_hdlong_scene)]
+    out += [('polarps', d) for d in _find_scenes(root, _is_polarps_scene)]
     return out
 
 
@@ -76,9 +84,26 @@ def _discover_scenes(args):
     The cap (`--max_scenes`) is applied to the combined pool here, before any
     train/val split, so the split halves are carved out of the capped pool.
     """
-    scenes = []
-    scenes += _discover([getattr(args, 'hdlong_dir', None)], ['hdlong'])
-    scenes += _discover([getattr(args, 'polarps_dir', None)], ['polarps'])
+    hd_dir = getattr(args, 'hdlong_dir', None)
+    pp_dir = getattr(args, 'polarps_dir', None)
+    hd = _discover([hd_dir], ['hdlong'])
+    pp = _discover([pp_dir], ['polarps'])
+
+    # Fail loud on a configured-but-empty root. The usual cause is an
+    # incomplete extraction (e.g. the hdlong view zips without
+    # hdlong_config.zip, so no 'light_means.config' marker) or pointing the
+    # flag above/below the scene level. Without this, the run would silently
+    # train on whatever source did resolve, skewing the intended mix.
+    if hd_dir and os.path.isdir(hd_dir) and not hd:
+        print(f"[MixedTrainDataset] WARNING: --hdlong_dir='{hd_dir}' exists but "
+              f"yielded 0 scenes (no 'light_means.config' marker found at any "
+              f"depth). Did you extract hdlong_config.zip into the same tree?")
+    if pp_dir and os.path.isdir(pp_dir) and not pp:
+        print(f"[MixedTrainDataset] WARNING: --polarps_dir='{pp_dir}' exists but "
+              f"yielded 0 scenes (no 'normal.exr' marker found at any depth). "
+              f"Check that the flag points at the PolarPS root.")
+
+    scenes = hd + pp
     if not scenes and getattr(args, 'train_dir', None):
         scenes = _auto_discover(args.train_dir)
 
