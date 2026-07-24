@@ -36,16 +36,17 @@ import numpy as np
 os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
 
 
-def _read_exr(path):
-    img = cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+def _read_exr(path: str):
+    # cv2.IMREAD_ANYCOLOR: Read the image using its own color format without forcing it to cv2.IMREAD_GRAYSCALE for example
+    # cv2.IMREAD_ANYDEPTH: Preserve the image's bit depth (float32 for EXR)
+    img = cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH) # np.ndarray (256. 256. 3)
     if img is None:
         raise IOError(f'Could not read EXR: {path}')
+    # By default, OpenCV stores color images in BGR format. We convert it back to RGB.
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32)
-    # Rendered HDR EXRs can carry Inf/NaN (clipped specular highlights, failed
-    # samples). Left in, a single Inf pixel poisons the per-image max-luminance
-    # normalization (Inf/Inf -> NaN) and produces NaN losses. Drop them to 0.
+    # Rendered HDR EXRs can carry Inf/NaN. Drop them to 0.
     return np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -68,6 +69,10 @@ class HdlongLoader:
     After `load()` the loader exposes:
         I: (H, W, 3, K), N: (H, W, 3), Mask: (h, w, 1), Region of Interest (roi),
         objname, data_workspace, h, w, numberOfImages
+
+    Region Of Interest is [canvas_h, canvas_w, row_min, row_max, col_min, col_max]
+        - (canvas_h, canvas_w): The full frame the prediction eventually lives in
+        - (row_min, row_max, col_min, col_max: The bounding box fed to the network
     """
 
     def __init__(self, train_resolution=512, outdir='.', mask_margin=8):
@@ -76,7 +81,7 @@ class HdlongLoader:
         self.mask_margin = mask_margin
 
     def _sample_K(self, total_available):
-        # Fixed 10 rendered images per scene (capped by what's actually on disk).
+        # Fixed 10 rendered images per scene.
         return min(10, total_available)
 
     def load(self, scene_dir, augment=True, rng=None):
@@ -91,28 +96,29 @@ class HdlongLoader:
                           if os.path.isdir(d))
         if not cam_dirs:
             raise RuntimeError(f'No cam_* subdirectories in {scene_dir}')
+        # Shuffle all camera dirs
         cam_dir = cam_dirs[rng.randint(0, len(cam_dirs))]
 
+        # Extract different lighting condition means
         cfg_path = os.path.join(scene_dir, 'light_means.config')
         if not os.path.isfile(cfg_path):
             raise RuntimeError(f'Missing light_means.config in {scene_dir}')
         
-        # Different lighting condition means
         means = _read_light_means(cfg_path)
         point_mean = means.get('point_mean', 1.0)
         dir_mean = means.get('dir_mean', 1.0)
         env_mean = means.get('env_mean', 1.0)
 
-        # Process binary mask
-        mask = _read_exr(os.path.join(cam_dir, 'binary_mask.exr'))
-        if mask.ndim == 3:
-            mask = mask[..., 0]
-        mask = (mask >= 0.5).astype(np.float32)
+        # Process anti-aliased mask
+        mask_soft = _read_exr(os.path.join(cam_dir, 'binary_mask.exr')) # (256, 256)
+        # If the mask has 3 channels, take the first channel only
+        if mask_soft.ndim == 3:
+            mask_soft = mask_soft[..., 0]
+        mask = (mask_soft >= 0.5).astype(np.float32)
 
         # Normalize surface normal vectors
         N_raw = _read_exr(os.path.join(cam_dir, 'local_normal.exr'))
         N = 2.0 * N_raw - 1.0
-        N = N / (np.linalg.norm(N, axis=2, keepdims=True) + 1e-12)
         N = N * mask[..., None]
 
         # Generate K rendered images/scene
@@ -126,7 +132,11 @@ class HdlongLoader:
 
         out_h = out_w = self.train_resolution
         composed = np.zeros((K, out_h, out_w, 3), np.float32)
-        mask_b = mask[..., None]
+
+        # For correct broadcasting
+        # Upsample the anti-aliased mask using LINEAR INTERPOLATION
+        mask_soft_r = cv2.resize(mask_soft, (out_h, out_w), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+        mask_r = (mask_soft_r >= 0.5).astype(np.float32)
 
         for k in range(K):
             # Randomly sample 
@@ -136,26 +146,28 @@ class HdlongLoader:
             p_img = _read_exr(point_paths[pi]) / (point_mean + 1e-8)
             d_img = _read_exr(dir_paths[di]) / (dir_mean + 1e-8)
             e_img = _read_exr(env_paths[ei]) / (env_mean + 1e-8)
-            # Apply mask
-            p_img *= mask_b
-            d_img *= mask_b
-            e_img *= mask_b
+            # Apply mask: (256, 256, 3) * (256, 256, 1)
+            p_img *= mask[..., None]
+            d_img *= mask[..., None]
+            e_img *= mask[..., None]
             # Rendered image = a convex combination of three component images
             w = rng.dirichlet(np.ones(3))
             img = (w[0] * p_img + w[1] * d_img + w[2] * e_img).astype(np.float32)
-            img = np.maximum(img, 0.0)
             # hdlong-complexv1's images have spatial size (256, 256), need upsampling
             if img.shape[0] != out_h or img.shape[1] != out_w:
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
+                # Apply the mask once again
+                img = img * mask_r[..., None]
+            img = np.maximum(img, 0.0)
             composed[k] = img # composed: (K, H, W, 3)
 
-        # Upsample surface normals and masks + Normalize surface normals
-        mask_r = (cv2.resize(mask, (out_h, out_w), interpolation=cv2.INTER_NEAREST) > 0.5).astype(np.float32)
-        N_r = cv2.resize(N, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
-        N_r = N_r / (np.linalg.norm(N_r, axis=2, keepdims=True) + 1e-12)
+        # Upsample + Normalize surface normals
+        N_r = cv2.resize(N, (out_h, out_w), interpolation=cv2.INTER_LINEAR)
         N_r = N_r * mask_r[..., None]
+        N_r = N_r / (np.linalg.norm(N_r, axis=2, keepdims=True) + 1e-12)
 
         do_flip = bool(augment and rng.rand() < 0.5)
+        # Horizontal flip everything
         if do_flip:
             composed = composed[:, :, ::-1, :].copy()
             mask_r = mask_r[:, ::-1].copy()
@@ -168,16 +180,17 @@ class HdlongLoader:
         if m_flat.sum() > 0:
             valid = I_flat[:, m_flat == 1, :] # (K, V, 3); V = # foregound pixels
         else:
-            valid = I_flat
+            raise ValueError(f'{scene_dir}/{cam_dir}: empty mask — per-image scale is undefined.')
+        
         lum = np.mean(valid, axis=2) # (K, V)
-        mx = np.max(lum, axis=1) # (K,)
+        mx = np.percentile(lum, 99.5, axis=1).astype(np.float32) # (K,)
         mn = np.mean(lum, axis=1) # (K,)
         if augment:
             t = rng.rand(K).astype(np.float32)
-            scale = (1.0 - t) * mn + t * mx
+            scale = (1.0 - t) * mn + t * mx # (K,)
         else:
-            scale = mx
-        # Normalize image
+            scale = mx # (K,)
+        # Normalize image (scale.reshape(-1, 1, 1) = (K, 1, 1) for broadcasting)
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
         composed = I_flat.reshape(K, out_h, out_w, 3)
 
