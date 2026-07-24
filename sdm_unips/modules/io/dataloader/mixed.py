@@ -27,21 +27,23 @@ import os
 import numpy as np
 import torch.utils.data as data
 
+from typing import Callable
+
 from .hdlong import HdlongLoader
 from .polarps import PolarPSLoader
 
 K_PER_SCENE = 10
 
 
-def _is_hdlong_scene(path):
+def _is_hdlong_scene(path: str) -> bool:
     return os.path.isfile(os.path.join(path, 'light_means.config'))
 
 
-def _is_polarps_scene(path):
+def _is_polarps_scene(path: str) -> bool:
     return os.path.isfile(os.path.join(path, 'normal.exr'))
 
 
-def _find_scenes(root, is_scene):
+def _find_scenes(root: str, is_scene: Callable[[str], bool]) -> list[str]:
     """Find every directory at or under `root` that *directly* holds a scene
     marker, regardless of nesting depth.
 
@@ -55,14 +57,16 @@ def _find_scenes(root, is_scene):
     if not root or not os.path.isdir(root):
         return []
     found = []
-    for dirpath, dirnames, _ in os.walk(root):
+    # os.walk(root) returns the name of the directory, a list of sub-directories, and a list of files in that directory
+    # It decides the next directory to traverse by looking at the previously found list of sub-directories.
+    for dirpath, subdirs, _ in os.walk(root):
         if is_scene(dirpath):
             found.append(dirpath)
-            dirnames[:] = []  # scene found: don't recurse into its leaves
+            subdirs[:] = []  # scene found: don't recurse into its leaves
     return sorted(found)
 
 
-def _discover(roots, kinds):
+def _discover(roots: list[str], kinds: list[str]) -> list[tuple[str, str]]:
     """Return list of (kind, scene_dir) for matching roots."""
     predicate = {'hdlong': _is_hdlong_scene, 'polarps': _is_polarps_scene}
     out = []
@@ -72,28 +76,63 @@ def _discover(roots, kinds):
     return out
 
 
-def _auto_discover(root):
+def _auto_discover(root: str) -> list[tuple[str, str]]:
     out = [('hdlong', d) for d in _find_scenes(root, _is_hdlong_scene)]
     out += [('polarps', d) for d in _find_scenes(root, _is_polarps_scene)]
     return out
 
 
+def _proportional_cap(
+        hd: list[tuple[str, str]], pp: list[tuple[str, str]], 
+        max_scenes: int, seed: int
+    ):
+    """Sub-sample (hd, pp) down to `max_scenes` while preserving the full-pool
+    hdlong:polarps ratio.
+
+    A single uniform draw over the concatenated pool (the previous approach)
+    could wipe out the minority source entirely when the cap is small —
+    PolarPS is ~1% of the combined pool, so `permutation(len)[:max_scenes]`
+    can easily return zero PolarPS scenes. Instead we allocate the budget
+    between the two sources in proportion to their full-pool sizes, then draw
+    within each source independently. Every source that is present keeps at
+    least one scene, so the mix never silently collapses to a single source.
+
+    Both draws use the same seed for a deterministic, reproducible sub-pool.
+    """
+    total = len(hd) + len(pp)
+    if total <= max_scenes:
+        return hd, pp
+
+    # n_hd / max_scenes ~ len(hd) / total
+    n_hd = int(round(max_scenes * len(hd) / total)) if hd else 0
+    # Clamp n_hd between 1 and len(hd). If n_hd < 1, n_hd=1. If n_hd > len(hd), n_hd=len(hd). Else n_hd
+    n_hd = min(max(n_hd, 1), len(hd)) if hd else n_hd
+    # Clamp n_pp beteween 1 and len(pp)
+    n_pp = min(max(max_scenes - n_hd, 1), len(pp)) if pp else 0
+    # If n_hd + n_pp < max_scenes still, take more hdlong-complexv1 scenes.
+    n_hd = min(max(max_scenes - n_pp, 1 if hd else 0), len(hd))
+
+    rng = np.random.RandomState(seed)
+    hd_sampled = [hd[i] for i in sorted(rng.permutation(len(hd))[:n_hd].tolist())]
+    pp_sampled = [pp[i] for i in sorted(rng.permutation(len(pp))[:n_pp].tolist())]
+    return hd_sampled, pp_sampled
+
+
 def _discover_scenes(args):
     """Discover and (optionally) cap the combined hdlong + PolarPS scene pool.
 
-    The cap (`--max_scenes`) is applied to the combined pool here, before any
-    train/val split, so the split halves are carved out of the capped pool.
+    The cap (`--max_scenes`) is applied here, before any train/val split, so
+    the split halves are carved out of the capped pool. The cap is allocated
+    per source in proportion to the full-pool ratio (see `_proportional_cap`)
+    rather than as a uniform draw, so the minority source cannot be sampled
+    out of existence.
     """
     hd_dir = getattr(args, 'hdlong_dir', None)
     pp_dir = getattr(args, 'polarps_dir', None)
     hd = _discover([hd_dir], ['hdlong'])
     pp = _discover([pp_dir], ['polarps'])
 
-    # Fail loud on a configured-but-empty root. The usual cause is an
-    # incomplete extraction (e.g. the hdlong view zips without
-    # hdlong_config.zip, so no 'light_means.config' marker) or pointing the
-    # flag above/below the scene level. Without this, the run would silently
-    # train on whatever source did resolve, skewing the intended mix.
+    # Fail loud on a configured-but-empty root.
     if hd_dir and os.path.isdir(hd_dir) and not hd:
         print(f"[MixedTrainDataset] WARNING: --hdlong_dir='{hd_dir}' exists but "
               f"yielded 0 scenes (no 'light_means.config' marker found at any "
@@ -103,22 +142,22 @@ def _discover_scenes(args):
               f"yielded 0 scenes (no 'normal.exr' marker found at any depth). "
               f"Check that the flag points at the PolarPS root.")
 
-    scenes = hd + pp
-    if not scenes and getattr(args, 'train_dir', None):
-        scenes = _auto_discover(args.train_dir)
+    # Execute only if hd = pp = [] with non-NaN train_dir
+    if not (hd or pp) and getattr(args, 'train_dir', None):
+        auto = _auto_discover(args.train_dir)
+        hd = [s for s in auto if s[0] == 'hdlong']
+        pp = [s for s in auto if s[0] == 'polarps']
 
-    if len(scenes) == 0:
+    if len(hd) + len(pp) == 0:
         raise RuntimeError(
             'MixedTrainDataset found no scenes. Pass --hdlong_dir and/or '
             '--polarps_dir, or place scenes under --train_dir.'
         )
 
     max_scenes = getattr(args, 'max_scenes', None)
-    if max_scenes is not None and max_scenes > 0 and len(scenes) > max_scenes:
-        rng = np.random.RandomState(getattr(args, 'seed', 42))
-        idx = rng.permutation(len(scenes))[:max_scenes]
-        scenes = [scenes[i] for i in idx]
-    return scenes
+    if max_scenes is not None and max_scenes > 0:
+        hd, pp = _proportional_cap(hd, pp, max_scenes, getattr(args, 'seed', 42))
+    return hd + pp
 
 
 def build_mixed_split(args, augment=True):
@@ -131,26 +170,48 @@ def build_mixed_split(args, augment=True):
 
     Returns (train_dataset, val_dataset); the val set never augments.
     """
-    scenes = _discover_scenes(args)
+    # Validate the cheap argument before the (expensive) filesystem walk, so a
+    # bad flag dies immediately instead of after discovering ~1200 scenes.
     val_fraction = float(getattr(args, 'val_fraction', 0.1))
     seed = int(getattr(args, 'seed', 42))
+    if not 0 < val_fraction < 1:
+        raise ValueError(
+            f"--val_fraction must be in the open interval (0, 1); got "
+            f"{val_fraction}. Use e.g. 0.1 for a 10% held-out split."
+        )
 
+    scenes = _discover_scenes(args)
     hd = [s for s in scenes if s[0] == 'hdlong']
     pp = [s for s in scenes if s[0] == 'polarps']
 
-    def _split(items, rng):
-        if not items:
+    def _split(
+        items: list[tuple[str, str]], rng: np.random.RandomState, 
+        name: str, flag: str
+    ):
+        n = len(items)
+        if n == 0:
             return [], []
-        perm = rng.permutation(len(items))
-        n_val = int(round(len(items) * val_fraction))
-        n_val = min(max(n_val, 0), len(items))
+        # A source present in the pool must land in *both* halves. That needs
+        # at least one scene per side, so a single-scene source is unsplittable
+        # and n_val is clamped into [1, n-1] (>=1 val, >=1 train) otherwise.
+        if n == 1:
+            raise RuntimeError(
+                f"The {name} pool has only 1 scene, which cannot be placed in "
+                f"both the train and val splits. Provide at least 2 {name} "
+                f"scenes, or drop {flag} to train without {name}."
+            )
+        perm = rng.permutation(n)
+        n_val = int(round(n * val_fraction))
+        n_val = min(max(n_val, 1), n - 1)
         val_pos = set(perm[:n_val].tolist())
-        train = [items[i] for i in range(len(items)) if i not in val_pos]
-        val = [items[i] for i in range(len(items)) if i in val_pos]
+        train = [items[i] for i in range(n) if i not in val_pos]
+        val = [items[i] for i in range(n) if i in val_pos]
         return train, val
 
-    hd_train, hd_val = _split(hd, np.random.RandomState(seed + 1))
-    pp_train, pp_val = _split(pp, np.random.RandomState(seed + 2))
+    hd_train, hd_val = _split(hd, np.random.RandomState(seed + 1),
+                              'hdlong', '--hdlong_dir')
+    pp_train, pp_val = _split(pp, np.random.RandomState(seed + 2),
+                              'polarps', '--polarps_dir')
 
     # Ensure the ratio between hdlong-complexv1 and PolarPS scenes are the same
     train_ds = MixedTrainDataset(args, augment=augment,
@@ -161,7 +222,9 @@ def build_mixed_split(args, augment=True):
                                subset_name='MixedVal', noun='val')
     return train_ds, val_ds
 
-
+# Inhertis from Pytorch's base Dataset class
+# Must override the "magic" methods: __len__ and __getitem__
+# Allows us to plug directly into Pytorch's DataLoader for automatic batching, shuffling, and parallel data loading.
 class MixedTrainDataset(data.Dataset):
     """Mixed hdlong-complexv1 + PolarPS training dataset.
 
@@ -170,14 +233,15 @@ class MixedTrainDataset(data.Dataset):
     returns the 4-tuple expected by `train._collate`: (I, N, M, n_imgs).
     """
 
-    def __init__(self, args, augment=True, scenes=None,
+    def __init__(self, args, augment=True, 
+                 scenes: list[tuple[str, str]]|None=None,
                  subset_name='MixedTrain', noun='train'):
         self.args = args
         self.augment = augment
         self.train_resolution = int(args.train_resolution)
         self.mask_margin = getattr(args, 'mask_margin', 8)
         self.outdir = args.session_name
-
+        # Default to max_scenes scenes with respected hdlong-polarps ratio
         self.scenes = scenes if scenes is not None else _discover_scenes(args)
         n_hd = sum(1 for k, _ in self.scenes if k == 'hdlong')
         n_pp = sum(1 for k, _ in self.scenes if k == 'polarps')
