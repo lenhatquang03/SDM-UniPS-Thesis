@@ -56,6 +56,13 @@ class PolarPSLoader:
         self.outdir = outdir
         self.mask_margin = mask_margin
 
+    def _is_same_resolution(img: np.ndarray, expected: tuple[int, int]=(512, 512)):
+        if len(img.shape) < 2: raise ValueError("Input array must have > 1 dimension!")
+
+        if (img.shape[0] == expected[0]) and (img.shape[1] == expected[1]):
+            return True
+        return False
+
     def _sample_K(self, total_available):
         # Fixed K=10 renders per scene (capped by what's actually on disk).
         return min(10, total_available)
@@ -74,9 +81,11 @@ class PolarPSLoader:
         n_vec = 2.0 * n_raw - 1.0
         mag = np.linalg.norm(n_vec, axis=2)
         mask = (mag > 0.5).astype(np.float32)
-        N = n_vec / (mag[..., None] + 1e-12)
-        N = N * mask[..., None]
+        # Normalization
+        N = (n_vec * mask[..., None]) / (mag[..., None] + 1e-12)
+
         # Randomply sample 10 images/scene
+        # There should only be 1 sub-directory
         subdirs = sorted(d for d in glob.glob(os.path.join(scene_dir, '*'))
                          if os.path.isdir(d))
         if not subdirs:
@@ -92,20 +101,24 @@ class PolarPSLoader:
 
         out_h = out_w = self.train_resolution
         composed = np.zeros((K, out_h, out_w, 3), np.float32)
-        mask_b = mask[..., None]
         for i, k in enumerate(chosen):
             img = _read_exr(os.path.join(light_dirs[k], 'S0.exr'))
             # Apply mask
-            img = np.maximum(img, 0.0) * mask_b
+            img = np.maximum(img, 0.0) * mask[..., None]
             # Upsample to the desired shape (512, 512) if needed
-            if img.shape[0] != out_h or img.shape[1] != out_w:
+            if not self._is_same_resolution(img):
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
             composed[i] = img # (K, H, W, 3)
+
         # Upsample surface normals and masks (if needed) + normalize surface normals
-        mask_r = (cv2.resize(mask, (out_h, out_w), interpolation=cv2.INTER_NEAREST) > 0.5).astype(np.float32)
-        N_r = cv2.resize(N, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
-        N_r = N_r / (np.linalg.norm(N_r, axis=2, keepdims=True) + 1e-12)
-        N_r = N_r * mask_r[..., None]
+        mask_r = mask
+        if not self._is_same_resolution(mask_r):
+            mask_r = (cv2.resize(mask_r, (out_h, out_w), interpolation=cv2.INTER_NEAREST) > 0.5).astype(np.float32)
+
+        N_r = N
+        if not self._is_same_resolution(N_r):
+            N_r = cv2.resize(N_r, (out_h, out_w), interpolation=cv2.INTER_LINEAR)
+            N_r = (N_r * mask_r[..., None]) / (np.linalg.norm(N_r, axis=2, keepdims=True) + 1e-12)
 
         do_flip = bool(augment and rng.rand() < 0.5)
         if do_flip:
@@ -114,6 +127,7 @@ class PolarPSLoader:
             N_r = N_r[:, ::-1, :].copy()
             N_r[:, :, 0] = -N_r[:, :, 0]
 
+        # Per-image normalization
         m_flat = mask_r.reshape(-1) 
         I_flat = composed.reshape(K, -1, 3) # (K, H * W, 3)
         if m_flat.sum() > 0:
@@ -121,13 +135,9 @@ class PolarPSLoader:
         else:
             valid = I_flat
         lum = np.mean(valid, axis=2) # (K, V)
-        mx = np.max(lum, axis=1) # (K, )
-        mn = np.mean(lum, axis=1) # (K, )
-        if augment:
-            t = rng.rand(K).astype(np.float32)
-            scale = (1.0 - t) * mn + t * mx
-        else:
-            scale = mx
+        mx = np.percentile(lum, 99.5, axis=1).astype(np.float32) # (K,)
+        # Max-scaled for both train and val sets.
+        scale = mx
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
         composed = I_flat.reshape(K, out_h, out_w, 3)
 

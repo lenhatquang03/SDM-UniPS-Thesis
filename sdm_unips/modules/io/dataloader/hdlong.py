@@ -184,12 +184,8 @@ class HdlongLoader:
         
         lum = np.mean(valid, axis=2) # (K, V)
         mx = np.percentile(lum, 99.5, axis=1).astype(np.float32) # (K,)
-        mn = np.mean(lum, axis=1) # (K,)
-        if augment:
-            t = rng.rand(K).astype(np.float32)
-            scale = (1.0 - t) * mn + t * mx # (K,)
-        else:
-            scale = mx # (K,)
+        # Max-scaled for both train and val sets
+        scale = mx # (K,)
         # Normalize image (scale.reshape(-1, 1, 1) = (K, 1, 1) for broadcasting)
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
         composed = I_flat.reshape(K, out_h, out_w, 3)
