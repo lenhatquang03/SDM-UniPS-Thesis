@@ -55,7 +55,7 @@ class dataio(data.Dataset):
         return len(self.objlist)
 
 
-def build_train_dataset(args, augment=True):
+def build_train_dataset(args, augment: bool=True):
     """Build the mixed (hdlong-complexv1 + PolarPS) training split.
 
     Returns only the train half of the deterministic scene-level split; the
@@ -66,9 +66,9 @@ def build_train_dataset(args, augment=True):
     return train_set
 
 
-def build_val_dataset(args):
+def build_val_dataset(args, augment: bool=False):
     """Build the held-out validation split (never augmented)."""
-    _, val_set = build_mixed_split(args, augment=False)
+    _, val_set = build_mixed_split(args, augment=augment)
     return val_set
 
 
@@ -137,7 +137,7 @@ class DiligentEvalDataset(data.Dataset):
         I, N, M, K_used = loader.sample(K, rng)
         # Pad to a fixed K_max so default collate can stack across batches if used.
         # (We typically run batch_size=1 in eval, so this is just safety.)
-        I = I.transpose(2, 0, 1, 3)             # (3, h, w, K)
-        N = N.transpose(2, 0, 1).astype(np.float32)
+        I = I.transpose(2, 0, 1, 3)             # (3, H, W, K)
+        N = N.transpose(2, 0, 1).astype(np.float32) # (3, H, W)
         M = M.transpose(2, 0, 1).astype(np.float32)
         return I, N, M, np.int64(K_used), self.K_list[k_idx], obj_idx, trial

@@ -304,7 +304,7 @@ def main():
               f'Capability = {gpu_props.major}.{gpu_props.minor}')
 
     # Train Dataloader
-    train_set = build_train_dataset(args, augment=False)
+    train_set = build_train_dataset(args)
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=(device.type == 'cuda'),
@@ -323,7 +323,7 @@ def main():
             drop_last=False, collate_fn=_collate,
         )
     else:
-        print('[Train] Validatoin split is empty (--val_fraction too small); '
+        print('[Train] Validation split is empty (--val_fraction too small); '
               'best.pt will not be updated.')
 
     eval_set = None

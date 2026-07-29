@@ -233,7 +233,7 @@ class MixedTrainDataset(data.Dataset):
     returns the 4-tuple expected by `train._collate`: (I, N, M, n_imgs).
     """
 
-    def __init__(self, args, augment=True, 
+    def __init__(self, args, augment: bool=True, 
                  scenes: list[tuple[str, str]]|None=None,
                  subset_name='MixedTrain', noun='train'):
         self.args = args
