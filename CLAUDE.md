@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SDM-UniPS is a **CVPR 2023 Highlight** paper implementation for **Universal Photometric Stereo** — recovering surface normal maps from multiple images captured under arbitrary, spatially-varying lighting with a fixed camera. The upstream repository is inference-only; this fork adds a training pipeline (`sdm_unips/train.py`, `modules/builder/trainer.py`, `modules/io/dataloader/`, `modules/loss/`) plus a DiLiGenT K-sweep evaluation hook.
+SDM-UniPS is a **CVPR 2023 Highlight** paper implementation for **Universal Photometric Stereo** — recovering surface normal maps from multiple images captured under arbitrary, spatially-varying lighting with a fixed camera. The upstream repository is inference-only; this fork adds a training pipeline (`sdm_unips/train.py`, `modules/builder/trainer.py`, `modules/io/dataloader/`, `modules/loss/`) with train/val/test all drawn from the same synthetic mixed pool.
 
 **Scope:** this fork targets **surface-normal prediction only**. The upstream BRDF heads (baseColor / roughness / metallic from Appendix C of the paper) and novel-view relighting (`relighting.py`, `modules/utils/render.py`) have been removed.
 
@@ -31,14 +31,13 @@ The checkpoint directory must contain `<checkpoint>/normal/*.pytmodel`.
 
 ## Running Training
 
-**Model A (thesis recipe — hdlong-complexv1 + PolarPS mix, held-out val split, DiLiGenT test):**
+**Model A (thesis recipe — hdlong-complexv1 + PolarPS mix, held-out val + test splits):**
 ```bash
 python sdm_unips/train.py \
   --session_name modelA_full \
   --hdlong_dir /path/to/hdlong-complexv1 \
   --polarps_dir /path/to/PolarPS \
-  --eval_dir   /path/to/DiLiGenT/pmsData \
-  --max_scenes 8000 --val_fraction 0.1 \
+  --max_scenes 8000 --val_fraction 0.1 --test_fraction 0.1 \
   --train_resolution 512 --canonical_resolution 256 \
   --batch_size 8 --pixel_samples 2048 \
   --epochs 60 --lr 1e-4 --weight_decay 0.05 \
@@ -52,24 +51,63 @@ python sdm_unips/train.py \
   --session_name modelA_smoke --smoke_test --smoke_epochs 10 \
   --hdlong_dir /kaggle/input/hdlong-complexv1 \
   --polarps_dir /kaggle/input/polarps \
-  --eval_dir   /kaggle/input/diligent/pmsData \
   --max_scenes 8000 --amp_dtype bf16
 ```
 
 **Model selection & evaluation protocol:** the mixed pool is split at the
-**scene level** into train / val (`--val_fraction`, default 0.1), split
-proportionally within each source (hdlong and PolarPS split separately) and
-deterministic given `--seed`. `best.pt` is selected by **held-out validation
-loss** at the end of every `--val_every_epochs` epochs. DiLiGenT is the
-held-out **test** benchmark and is evaluated **exactly once, after the final
-epoch** (when `--eval_dir` is set) — it never influences checkpoint selection.
+**scene level** into train / val / test (`--val_fraction` and
+`--test_fraction`, both default 0.1), split proportionally within each source
+(hdlong and PolarPS split separately, so the mix ratio is preserved in all
+three splits) and deterministic given `--seed`. A source present in the pool
+must supply at least 3 scenes (one per split) or training aborts with an
+informative error (and training also aborts if the val or test split comes
+out empty). `best.pt` is selected by **held-out validation loss** at the end
+of every `--val_every_epochs` epochs. The **held-out test split** is evaluated
+**exactly once, after the final epoch** via the same `val_step` path, on the
+weights loaded from `best.pt` (not the last-epoch weights, so late overfitting
+or early stopping never biases the headline number), and it never influences
+checkpoint selection. There is no external benchmark; DiLiGenT is no longer
+used.
+
+Test and validation report the **same quantities** (identical `val_step`
+forward + loss path) but **aggregate them differently**, so treat them as
+close-but-not-identical estimators rather than exactly comparable numbers:
+`run_test_eval` takes a scene-count-weighted mean over batches and drops any
+non-finite value, while the per-epoch val loop takes a plain per-batch
+`np.nanmean` (short final batch over-weighted; NaN dropped but `±inf`
+propagates). The two coincide exactly only when the split size is a multiple
+of `--batch_size`. Neither gap affects `best.pt` selection — the val loop's
+bias is a fixed reweighting of a fixed batch partition, hence consistent
+across epochs.
+
+**Early stopping (safety cutoff):** `--patience` (default 10, in units of
+validation checks; 0 disables) stops training once val loss has not improved
+by more than `--min_delta` (default 0.0) for that many consecutive checks. The
+cosine LR schedule still spans the full `--epochs`; patience only trims the
+unproductive tail, and `best.pt` already holds the best-val weights, so
+stopping early never costs the deliverable.
+
+**Reproducibility:** a run is reproducible for a fixed config — all RNGs are
+seeded from `--seed` (python/numpy/torch/cuda), cuDNN is pinned to
+deterministic kernels, and the DataLoaders seed their workers' numpy RNG
+(`worker_init_fn`) with a seeded shuffle `generator`. The test evaluation is
+strongly reproducible: `MixedEvalDataset` seeds each scene's random
+camera/lights from its flat index (independent of worker count), and the
+final eval re-seeds torch so the model's pixel sampling is fixed too. To cut
+the variance of the random K-image draw, each test scene is rendered
+`--test_trials` times (default 3), each trial a different fixed K-image draw,
+and their MAE is averaged with a scene-count-weighted (unbiased) mean.
 
 **Key training flags** (defaults shown are thesis values):
 - `--hdlong_dir`, `--polarps_dir`: roots for the two mixed sources (either or both)
 - `--train_dir`: auto-detect root (scenes classified into hdlong/polarps by on-disk markers)
 - `--max_scenes`: cap on the **combined** scene pool before the split (thesis uses 8000)
 - `--val_fraction`: held-out fraction for validation (default 0.1)
+- `--test_fraction`: held-out fraction for the final test report (default 0.1)
+- `--test_trials`: deterministic K-image draws per test scene, averaged (default 3; keep small)
 - `--val_every_epochs`: epochs between validation passes / best.pt checks (default 1)
+- `--patience`: early-stopping patience in validation checks (default 10; 0 disables)
+- `--min_delta`: min val-loss decrease counted as improvement (default 0.0)
 - `--batch_size`: 8 — `--pixel_samples`: m=2048
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
 - K is fixed at 10 per scene inside `HdlongLoader` / `PolarPSLoader`.
@@ -82,18 +120,24 @@ epoch** (when `--eval_dir` is set) — it never influences checkpoint selection.
 - `--resume`: warm-start from a `*.pytmodel` or `*.pt` checkpoint dir
 - `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
 
-**Evaluation flags (single DiLiGenT K-sweep, run once after the final epoch when `--eval_dir` is set):**
-- `--eval_dir`: DiLiGenT `pmsData` root (10 `*PNG` scene directories)
-- `--eval_K_list`: comma-separated K values (default `2,4,8,16,32,64,96`)
-- `--eval_trials`: random subsets per (scene, K) (default 10)
-- `--eval_side`: center-crop side (default 512; DiLiGenT is 612×512)
-- `--eval_best_K`: the K whose mean MAE is reported as the headline test number (default 16)
+The final test evaluation runs automatically after the last epoch on the
+held-out `--test_fraction` split, averaged over `--test_trials` deterministic
+trials.
 
-Checkpoints are written to `<session>/checkpoints/`. Each save also drops a `normal.pytmodel` copy that the inference `Builder` can load directly. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned.
+Checkpoints are written to `<session>/checkpoints/`. Each save also drops a bare-`state_dict` `normal.pytmodel` copy (overwritten every save, so it tracks the *latest* weights); each `best.pt` update additionally copies it to `best_normal.pytmodel`. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned (`final.pt` and `step_*.pt` are never auto-pruned).
+
+After the final epoch, `train.py:export_for_inference` publishes the weights the test number was reported on to `<session>/checkpoints/normal/normal.pytmodel` — `best_normal.pytmodel` when a best was recorded, else `normal.pytmodel` (the final-epoch weights). Inference then runs directly against the training output:
+
+```bash
+python sdm_unips/main.py --session_name SESSION --test_dir DATA \
+    --checkpoint <session>/checkpoints
+```
+
+The dedicated `normal/` subdirectory is required because `builder.load_models` globs `*.pytmodel` and `"".join`s the matches — the directory it points at must hold exactly one file, which `<session>/checkpoints/` itself does not.
 
 Logs land in `<session>/logs/`:
 - `train.jsonl` / `train.log`  — per-step loss, MAE, LR, grad norm, step seconds; per-epoch and per-validation summaries
-- `eval.jsonl` / `eval.log`    — the single final DiLiGenT run: per-scene, per-K, per-trial MAE plus per-K summaries
+- `eval.jsonl` / `eval.log`    — the single final held-out test summary (mean loss + MAE)
 - `config.json`                — frozen CLI arguments for the run
 
 ## Data Format
@@ -136,18 +180,7 @@ POLARPS_ROOT/
 ```
 The dataset class auto-detects scene type via these markers (`light_means.config` ⇒ hdlong, `normal.exr` ⇒ PolarPS). It synthesizes each training render via a Dirichlet (α, β, γ) mix of one randomly chosen point/dir/env light triple (hdlong) or by drawing one of 32 `S0.exr` images (PolarPS). hdlong is upsampled from 256×256 to `--train_resolution`.
 
-**Evaluation layout (`DiLiGenT/pmsData/`):**
-```
-DILIGENT_ROOT/
-└── <obj>PNG/
-    ├── filenames.txt         # 96 lines, one image filename each
-    ├── light_intensities.txt # 96 RGB triples, one per line
-    ├── light_directions.txt  # 96 unit-vector triples (unused — SDM-UniPS is uncalibrated)
-    ├── mask.png
-    ├── Normal_gt.png         # uint8, encoded as (n+1)/2
-    └── 001.png .. 096.png    # uint16 16-bit observations (612×512)
-```
-The eval loader center-crops to 512×512 and divides each image by its per-channel light intensity before per-image max-luminance normalization.
+**Per-image normalization:** each observation is divided by a single scalar — the mean intensity over its foreground pixels across all three colour channels. That scalar depends only on the source file + mask, so it is computed once and cached in an `image_means.config` sidecar next to the images (per camera for hdlong, per scene for PolarPS); the same value is reused every epoch and for both train and val/test. hdlong's composite scalar is the Dirichlet-weighted sum of its three cached component means (mean is linear over a shared mask). Read-only dataset mounts (e.g. Kaggle inputs) simply skip the sidecar write and keep an in-process cache.
 
 ## Architecture
 
@@ -170,8 +203,8 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 
 ### Data loading
 - Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).
-- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val split; `dataio.py:build_train_dataset` / `build_mixed_val_dataset` return the two halves (same seed ⇒ disjoint). K is fixed at 10 per scene.
-- DiLiGenT test: `modules/io/dataloader/diligent.py:DiligentLoader` + `modules/io/dataio.py:DiligentEvalDataset` — 1 scene preload, then per-call random K subsets for the K-sweep MAE evaluation invoked **once after the final epoch** from `train.py:run_diligent_eval`.
+- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. The per-image mean cache lives in `modules/io/dataloader/mean_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits); `dataio.py:build_train_dataset` / `build_val_dataset` / `build_test_dataset` are thin single-split accessors. K is fixed at 10 per scene.
+- Held-out test: the test third of the same mixed split, wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × --test_trials`, per-index-seeded so it is worker-count-independent and reproducible) and evaluated **once after the final epoch** via `train.py:run_test_eval` (reuses `Trainer.val_step`; scene-count-weighted mean over trials). No external benchmark is involved.
 
 ## Environment
 

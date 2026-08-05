@@ -7,17 +7,19 @@ PolarPS has `normal.exr`), and dispatches to the appropriate per-scene
 loader. `__getitem__` returns the 4-tuple `(I, N, M, n_imgs)` consumed by
 `train._collate`.
 
-`build_mixed_split` performs a deterministic, scene-level train/val split
-of the discovered pool so checkpoint selection uses a held-out subset of
-the synthetic data instead of leaking the DiLiGenT test set.
+`build_mixed_split` performs a deterministic, scene-level train/val/test
+split of the discovered pool. Both the held-out val (checkpoint selection)
+and the held-out test (final reporting) come from the same synthetic mix,
+so no external benchmark is needed and no split leaks into another.
 
 Required attrs on `args`:
     - hdlong_dir (optional)
     - polarps_dir (optional)
     - train_dir (optional fallback: auto-detect both kinds under one root)
-    - train_resolution, mask_margin, session_name, seed
+    - train_resolution, session_name, seed
     - max_scenes (optional cap; default unlimited)
     - val_fraction (held-out fraction for the val split; default 0.1)
+    - test_fraction (held-out fraction for the test split; default 0.1)
 
 K is fixed at 10 per scene inside both `HdlongLoader` and `PolarPSLoader`.
 """
@@ -159,25 +161,34 @@ def _discover_scenes(args):
         hd, pp = _proportional_cap(hd, pp, max_scenes, getattr(args, 'seed', 42))
     return hd + pp
 
-
 def build_mixed_split(args, augment=True):
-    """Deterministic scene-level train/val split of the mixed pool.
+    """Deterministic scene-level train/val/test split of the mixed pool.
 
     The pool is split proportionally *within* each source (hdlong split
-    separately from PolarPS) so the mix ratio is preserved in both halves.
-    The split is fully determined by `--seed`, so calling this twice with the
-    same args yields identical, disjoint train/val scene lists.
+    separately from PolarPS) so the hdlong:PolarPS mix ratio is preserved in
+    all three splits. The split is fully determined by `--seed`, so calling
+    this repeatedly with the same args yields identical, disjoint
+    train/val/test scene lists.
 
-    Returns (train_dataset, val_dataset); the val set never augments.
+    Returns (train_dataset, val_dataset, test_dataset); val and test never
+    augment.
     """
-    # Validate the cheap argument before the (expensive) filesystem walk, so a
+    # Validate the cheap arguments before the (expensive) filesystem walk, so a
     # bad flag dies immediately instead of after discovering ~1200 scenes.
     val_fraction = float(getattr(args, 'val_fraction', 0.1))
+    test_fraction = float(getattr(args, 'test_fraction', 0.1))
     seed = int(getattr(args, 'seed', 42))
-    if not 0 < val_fraction < 1:
+    for flag, frac in (('--val_fraction', val_fraction),
+                       ('--test_fraction', test_fraction)):
+        if not 0 < frac < 1:
+            raise ValueError(
+                f"{flag} must be in the open interval (0, 1); got {frac}. "
+                f"Use e.g. 0.1 for a 10% held-out split."
+            )
+    if val_fraction + test_fraction >= 1:
         raise ValueError(
-            f"--val_fraction must be in the open interval (0, 1); got "
-            f"{val_fraction}. Use e.g. 0.1 for a 10% held-out split."
+            f"--val_fraction ({val_fraction}) + --test_fraction "
+            f"({test_fraction}) must be < 1 to leave scenes for training."
         )
 
     scenes = _discover_scenes(args)
@@ -185,42 +196,50 @@ def build_mixed_split(args, augment=True):
     pp = [s for s in scenes if s[0] == 'polarps']
 
     def _split(
-        items: list[tuple[str, str]], rng: np.random.RandomState, 
+        items: list[tuple[str, str]], rng: np.random.RandomState,
         name: str, flag: str
     ):
         n = len(items)
         if n == 0:
-            return [], []
-        # A source present in the pool must land in *both* halves. That needs
-        # at least one scene per side, so a single-scene source is unsplittable
-        # and n_val is clamped into [1, n-1] (>=1 val, >=1 train) otherwise.
-        if n == 1:
+            return [], [], []
+        # A source present in the pool must land in *all three* splits, which
+        # needs at least one scene each. Fewer than 3 scenes is unsplittable.
+        if n < 3:
             raise RuntimeError(
-                f"The {name} pool has only 1 scene, which cannot be placed in "
-                f"both the train and val splits. Provide at least 2 {name} "
-                f"scenes, or drop {flag} to train without {name}."
+                f"The {name} pool has only {n} scene(s), which cannot fill the "
+                f"train, val, and test splits (one scene each minimum). Provide "
+                f"at least 3 {name} scenes, or drop {flag} to train without "
+                f"{name}."
             )
         perm = rng.permutation(n)
-        n_val = int(round(n * val_fraction))
-        n_val = min(max(n_val, 1), n - 1)
+        # Clamp so every split keeps >=1 scene: val in [1, n-2], then test in
+        # [1, n-1-n_val], leaving n_train = n - n_val - n_test >= 1.
+        n_val = min(max(int(round(n * val_fraction)), 1), n - 2)
+        n_test = min(max(int(round(n * test_fraction)), 1), n - 1 - n_val)
         val_pos = set(perm[:n_val].tolist())
-        train = [items[i] for i in range(n) if i not in val_pos]
+        test_pos = set(perm[n_val:n_val + n_test].tolist())
+        train = [items[i] for i in range(n)
+                 if i not in val_pos and i not in test_pos]
         val = [items[i] for i in range(n) if i in val_pos]
-        return train, val
+        test = [items[i] for i in range(n) if i in test_pos]
+        return train, val, test
 
-    hd_train, hd_val = _split(hd, np.random.RandomState(seed + 1),
-                              'hdlong', '--hdlong_dir')
-    pp_train, pp_val = _split(pp, np.random.RandomState(seed + 2),
-                              'polarps', '--polarps_dir')
+    hd_train, hd_val, hd_test = _split(hd, np.random.RandomState(seed + 1),
+                                       'hdlong', '--hdlong_dir')
+    pp_train, pp_val, pp_test = _split(pp, np.random.RandomState(seed + 2),
+                                       'polarps', '--polarps_dir')
 
-    # Ensure the ratio between hdlong-complexv1 and PolarPS scenes are the same
+    # The hdlong:PolarPS ratio is preserved across all three splits.
     train_ds = MixedTrainDataset(args, augment=augment,
                                  scenes=hd_train + pp_train,
                                  subset_name='MixedTrain', noun='train')
     val_ds = MixedTrainDataset(args, augment=False,
                                scenes=hd_val + pp_val,
                                subset_name='MixedVal', noun='val')
-    return train_ds, val_ds
+    test_ds = MixedTrainDataset(args, augment=False,
+                                scenes=hd_test + pp_test,
+                                subset_name='MixedTest', noun='test')
+    return train_ds, val_ds, test_ds
 
 # Inhertis from Pytorch's base Dataset class
 # Must override the "magic" methods: __len__ and __getitem__
@@ -239,7 +258,6 @@ class MixedTrainDataset(data.Dataset):
         self.args = args
         self.augment = augment
         self.train_resolution = int(args.train_resolution)
-        self.mask_margin = getattr(args, 'mask_margin', 8)
         self.outdir = args.session_name
         # Default to max_scenes scenes with respected hdlong-polarps ratio
         self.scenes = scenes if scenes is not None else _discover_scenes(args)
@@ -250,11 +268,9 @@ class MixedTrainDataset(data.Dataset):
 
         self._hdlong = HdlongLoader(
             self.train_resolution, outdir=self.outdir,
-            mask_margin=self.mask_margin,
         )
         self._polarps = PolarPSLoader(
             self.train_resolution, outdir=self.outdir,
-            mask_margin=self.mask_margin,
         )
 
     def __len__(self):
@@ -271,8 +287,59 @@ class MixedTrainDataset(data.Dataset):
         h, w = loader.h, loader.w
         n = loader.numberOfImages
 
-        # I: (H, W, 3, K) -> pad to (3, h, w, K_PER_SCENE). Padding slots
+        # I: (H, W, 3, K) -> pad to (3, H, W, K_PER_SCENE). Padding slots
         # are zero so any scene that fell short of 10 on disk still stacks.
+        I = np.zeros((h, w, 3, K_PER_SCENE), np.float32)
+        I[..., :n] = loader.I
+        I = I.transpose(2, 0, 1, 3)
+
+        N = loader.N.transpose(2, 0, 1).astype(np.float32)         # (3, H, W)
+        M = loader.mask.transpose(2, 0, 1).astype(np.float32)      # (1, H, W)
+        return I, N, M, np.int64(n)
+
+
+class MixedEvalDataset(MixedTrainDataset):
+    """Deterministic, multi-trial wrapper over a fixed scene list for the final
+    held-out test evaluation.
+
+    Length = len(scenes) * n_trials. For a flat index i, the trial = i // n_scenes 
+    and the scene = i % n_scenes; that scene's random camera
+    and lights are drawn from an RNG seeded PURELY by (seed, trial, scene).
+    Two consequences:
+
+    - REPRODUCIBLE: The draw is a pure function of the index, so the result
+      is identical run-to-run and independent of the DataLoader worker count
+      (no reliance on per-worker global RNG state).
+    - UNBIASED, LOW VARIANCE: Each trial uses a different but fixed seed
+      offset, so it draws a different K-image subset of the scene; averaging the
+      `n_trials` renders reduces the variance of that random draw without
+      biasing the estimate.
+
+    Returns the same `(I, N, M, n_imgs)` 4-tuple as `MixedTrainDataset`, so the
+    trainer's `val_step` path consumes it unchanged.
+    """
+
+    def __init__(self, args, scenes, n_trials=3, seed=42):
+        super().__init__(args, augment=False, scenes=scenes,
+                         subset_name='MixedTestEval', noun='test-eval')
+        self.n_trials = max(1, int(n_trials))
+        self.n_scenes = len(self.scenes)
+        self.eval_seed = int(seed)
+
+    def __len__(self):
+        return self.n_scenes * self.n_trials
+
+    def __getitem__(self, idx):
+        trial_idx, scene_idx = divmod(idx, self.n_scenes)
+        kind, scene_dir = self.scenes[scene_idx]
+        loader = self._hdlong if kind == 'hdlong' else self._polarps
+        # Deterministic per-(trial, scene) RNG -> worker-count-independent and
+        # reproducible; the trial offset makes each trial a distinct fixed draw.
+        seed = (self.eval_seed + 1_000_003 * trial_idx + scene_idx) % (2 ** 32)
+        loader.load(scene_dir, augment=False, rng=np.random.RandomState(seed))
+        h, w = loader.h, loader.w
+        n = loader.numberOfImages
+
         I = np.zeros((h, w, 3, K_PER_SCENE), np.float32)
         I[..., :n] = loader.I
         I = I.transpose(2, 0, 1, 3)

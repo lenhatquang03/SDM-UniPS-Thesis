@@ -22,7 +22,7 @@ For one __getitem__ call we:
        and environment light image, each pre-normalized by its per-scene
        `light_means.config` value and masked.
     3. Upsample 256x256 -> --train_resolution (default 512).
-    4. Apply the paper-spec per-image (mean..max) luminance normalization.
+    4. Divide each composite by its (cached) foreground mean intensity.
 """
 
 import glob
@@ -31,6 +31,8 @@ import re
 
 import cv2
 import numpy as np
+
+from .mean_cache import masked_mean, read_means, write_means
 
 # Required for OpenCV EXR support.
 os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
@@ -75,10 +77,19 @@ class HdlongLoader:
         - (row_min, row_max, col_min, col_max: The bounding box fed to the network
     """
 
-    def __init__(self, train_resolution=512, outdir='.', mask_margin=8):
+    def __init__(self, train_resolution=512, outdir='.'):
         self.train_resolution = int(train_resolution)
         self.outdir = outdir
-        self.mask_margin = mask_margin
+        # Per-camera {component_filename: foreground_mean} caches, memoized so
+        # the sidecar is read from disk at most once per camera per worker.
+        self._means_by_dir = {}
+
+    def _get_means(self, cache_dir: str):
+        means = self._means_by_dir.get(cache_dir)
+        if means is None:
+            means = read_means(cache_dir)
+            self._means_by_dir[cache_dir] = means
+        return means
 
     def _sample_K(self, total_available):
         # Fixed 10 rendered images per scene.
@@ -115,6 +126,8 @@ class HdlongLoader:
         if mask_soft.ndim == 3:
             mask_soft = mask_soft[..., 0]
         mask = (mask_soft >= 0.5).astype(np.float32)
+        if mask.sum() == 0:
+            raise ValueError(f'{cam_dir}: empty mask — per-image scale is undefined.')
 
         # Normalize surface normal vectors
         N_raw = _read_exr(os.path.join(cam_dir, 'local_normal.exr'))
@@ -138,8 +151,19 @@ class HdlongLoader:
         mask_soft_r = cv2.resize(mask_soft, (out_h, out_w), interpolation=cv2.INTER_LINEAR).astype(np.float32)
         mask_r = (mask_soft_r >= 0.5).astype(np.float32)
 
+        means = self._get_means(cam_dir)
+        new_entries = {}
+        scale = np.ones(K, np.float32)  # per-composite foreground mean intensity
+
+        def _comp_mean(path: str, arr: np.ndarray) -> float:
+            # Foreground mean of one masked component, computed once then cached.
+            key = os.path.basename(path)
+            if key not in means:
+                means[key] = new_entries[key] = masked_mean(arr, mask)
+            return means[key]
+
         for k in range(K):
-            # Randomly sample 
+            # Randomly sample
             pi = rng.randint(0, len(point_paths))
             di = rng.randint(0, len(dir_paths))
             ei = rng.randint(0, len(env_paths))
@@ -153,13 +177,20 @@ class HdlongLoader:
             # Rendered image = a convex combination of three component images
             w = rng.dirichlet(np.ones(3))
             img = (w[0] * p_img + w[1] * d_img + w[2] * e_img).astype(np.float32)
+            # Mean is linear and the mask is shared, so the composite's foreground
+            # mean is the same convex combination of the three components' means.
+            scale[k] = (w[0] * _comp_mean(point_paths[pi], p_img)
+                        + w[1] * _comp_mean(dir_paths[di], d_img)
+                        + w[2] * _comp_mean(env_paths[ei], e_img))
             # hdlong-complexv1's images have spatial size (256, 256), need upsampling
             if img.shape[0] != out_h or img.shape[1] != out_w:
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
                 # Apply the mask once again
-                img = img * mask_r[..., None]
+                img *= mask_r[..., None]
             img = np.maximum(img, 0.0)
             composed[k] = img # composed: (K, H, W, 3)
+        if new_entries:
+            write_means(cam_dir, means)
 
         # Upsample + Normalize surface normals
         N_r = cv2.resize(N, (out_h, out_w), interpolation=cv2.INTER_LINEAR)
@@ -174,19 +205,11 @@ class HdlongLoader:
             N_r = N_r[:, ::-1, :].copy()
             N_r[:, :, 0] = -N_r[:, :, 0]
 
-        # Paper Sec. 3.1: Per-image normalization (mean..max scale).
-        m_flat = mask_r.reshape(-1)
+        # Per-image mean normalization: divide each composite by its foreground
+        # mean intensity (`scale`, assembled from cached component means above;
+        # identical for train and val). Flipping is spatial and leaves it intact.
+        # scale.reshape(-1, 1, 1) = (K, 1, 1) for broadcasting.
         I_flat = composed.reshape(K, -1, 3) # (K, H * W, 3)
-        if m_flat.sum() > 0:
-            valid = I_flat[:, m_flat == 1, :] # (K, V, 3); V = # foregound pixels
-        else:
-            raise ValueError(f'{scene_dir}/{cam_dir}: empty mask — per-image scale is undefined.')
-        
-        lum = np.mean(valid, axis=2) # (K, V)
-        mx = np.percentile(lum, 99.5, axis=1).astype(np.float32) # (K,)
-        # Max-scaled for both train and val sets
-        scale = mx # (K,)
-        # Normalize image (scale.reshape(-1, 1, 1) = (K, 1, 1) for broadcasting)
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
         composed = I_flat.reshape(K, out_h, out_w, 3)
 

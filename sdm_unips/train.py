@@ -7,8 +7,7 @@ Quickstart for the thesis recipe (hdlong-complexv1 + PolarPS):
         --session_name modelA_smoke \
         --hdlong_dir /kaggle/input/hdlong-complexv1 \
         --polarps_dir /kaggle/input/polarps \
-        --eval_dir /kaggle/input/diligent/pmsData \
-        --max_scenes 8000 --val_fraction 0.1 \
+        --max_scenes 8000 --val_fraction 0.1 --test_fraction 0.1 \
         --train_resolution 512 --canonical_resolution 256 \
         --batch_size 8 --pixel_samples 2048 \
         --lr 1e-4 --weight_decay 0.05 --lr_schedule cosine \
@@ -18,23 +17,25 @@ Quickstart for the thesis recipe (hdlong-complexv1 + PolarPS):
 `--smoke_test` clamps the run to `--smoke_epochs` (default 10) for a quick
 Kaggle dry-run before committing to the full 60-epoch schedule.
 
-Checkpoint selection uses a held-out scene-level validation split of the
-mixed (hdlong + PolarPS) pool. DiLiGenT is the held-out *test* benchmark and
-is evaluated exactly once, after the final epoch, to avoid leaking the test
-set into model selection.
+Train, validation, and test are all disjoint scene-level slices of the same
+mixed (hdlong + PolarPS) pool. Checkpoint selection uses the held-out
+validation split; the held-out test split is evaluated exactly once, after
+the final epoch, so it never influences model selection.
 
 Logging
 -------
 Per-step JSONL lines are appended to `<session>/logs/train.jsonl` and a
 human-readable mirror to `<session>/logs/train.log`. The single final
-DiLiGenT evaluation lands in `<session>/logs/eval.jsonl`.
+held-out test evaluation lands in `<session>/logs/eval.jsonl`.
 """
 
 from __future__ import print_function, division
 
 import argparse
+import glob
 import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -46,11 +47,21 @@ sys.path.append('..')
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from modules.builder.trainer import Trainer, prune_checkpoints
-from modules.io.dataio import (
-    build_train_dataset,
-    build_val_dataset,
-    DiligentEvalDataset,
-)
+from modules.io.dataloader.mixed import build_mixed_split, MixedEvalDataset
+
+
+def _seed_worker(worker_id):
+    """Seed a DataLoader worker's numpy + python RNGs deterministically.
+
+    PyTorch gives each worker a unique base seed derived from the main
+    generator and uses it to seed `torch` and python `random`, but it does
+    NOT seed numpy — the classic gotcha that makes np.random-based loaders
+    non-reproducible (and duplicated across workers). Mirroring
+    `torch.initial_seed()` into numpy/random fixes both.
+    """
+    seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +82,13 @@ def build_argparser():
     p.add_argument('--val_fraction', type=float, default=0.1,
                    help='Held-out fraction of the mixed pool for validation '
                         '(scene-level split, split proportionally per source).')
-    p.add_argument('--mask_margin', type=int, default=8)
+    p.add_argument('--test_fraction', type=float, default=0.1,
+                   help='Held-out fraction of the mixed pool for the final '
+                        'test report (scene-level, proportional per source).')
+    p.add_argument('--test_trials', type=int, default=3,
+                   help='Number of deterministic trials (independent K-image '
+                        'draws) per test scene; their MAE is averaged for an '
+                        'unbiased, low-variance test number (keep small, e.g. 3).')
     p.add_argument('--checkpoint_dir', default=None,
                    help='Defaults to <session_name>/checkpoints')
     p.add_argument('--log_dir', default=None,
@@ -82,18 +99,18 @@ def build_argparser():
     p.add_argument('--ckpt_every', type=int, default=0,
                    help='Step interval for extra checkpoints. 0 disables.')
     p.add_argument('--val_every_epochs', type=int, default=1)
+    p.add_argument('--patience', type=int, default=10,
+                   help='Early-stopping patience, counted in validation checks: '
+                        'stop once val loss has not improved for this many '
+                        'consecutive checks. 0 disables (train the full '
+                        '--epochs). The cosine LR schedule still spans --epochs; '
+                        'this is only a safety cutoff, and best.pt keeps the '
+                        'best-val weights regardless.')
+    p.add_argument('--min_delta', type=float, default=0.0,
+                   help='Minimum decrease in val loss to count as an improvement '
+                        'for early stopping (default 0.0 = any improvement).')
     p.add_argument('--keep_last', type=int, default=3,
                    help='Number of recent epoch checkpoints to keep on disk')
-
-    # Eval (DiLiGenT) — run once after the final epoch -------------------
-    p.add_argument('--eval_dir', default=None,
-                   help='DiLiGenT pmsData root (10 *PNG scene dirs). '
-                        'Evaluated once, after training, as the held-out test set.')
-    p.add_argument('--eval_K_list', default='2,4,8,16,32,64,96')
-    p.add_argument('--eval_trials', type=int, default=10)
-    p.add_argument('--eval_side', type=int, default=512)
-    p.add_argument('--eval_best_K', type=int, default=16,
-                   help='K whose mean MAE is reported as the headline final test number')
 
     # Network ------------------------------------------------------------
     p.add_argument('--canonical_resolution', type=int, default=256)
@@ -147,13 +164,18 @@ def _collate(batch):
     return I, N, M, n_imgs
 
 
-def _to_scalar(v):
+def _to_scalar(v) -> float:
+    """"Convert a tensor to a float"""
     if torch.is_tensor(v):
         return float(v.detach().cpu().item())
     return float(v)
 
 
-def _fmt_value(v):
+def _fmt_value(v: float) -> str:
+    """
+    If v >= 0.001, use the 4-decimal format
+    else, use scientific notation (e.g, 5.00e-0.5)
+    """
     a = abs(v)
     if a == 0:
         return f'{v:.4f}'
@@ -162,8 +184,13 @@ def _fmt_value(v):
     return f'{v:.2e}'
 
 
-def _format_log(log):
-    return '  '.join(f'{k}={_fmt_value(_to_scalar(v))}'
+def _format_log(log: dict) -> str:
+    """
+    Return a presentable format for the log records
+    e.g,  {"loss": 0.0412, "mae_deg": 11.8734, "lr": 4.1e-05, "grad_norm": 2.3145,
+   "step_sec": 0.9123, "epoch": 3, "it": 40, "global_step": 1240}
+    """
+    return ' | '.join(f'{k}={_fmt_value(_to_scalar(v))}'
                      for k, v in log.items()
                      if isinstance(v, (int, float)) or torch.is_tensor(v))
 
@@ -185,90 +212,98 @@ class JSONLLogger:
 
 
 # ---------------------------------------------------------------------------
-# DiLiGenT evaluation hook
+# Held-out test evaluation
 # ---------------------------------------------------------------------------
-@torch.no_grad()
-def _eval_one_pack(trainer, I_np, N_np, M_np, K_used, device):
-    """Run inference on one (scene, K) pack and return masked-mean MAE in deg."""
-    I = torch.from_numpy(I_np).unsqueeze(0).to(device).float()       # (1, 3, h, w, K)
-    M = torch.from_numpy(M_np).unsqueeze(0).to(device).float()       # (1, 1, h, w)
-    N = torch.from_numpy(N_np).unsqueeze(0).to(device).float()       # (1, 3, h, w)
-    n_imgs = torch.tensor([[int(K_used)]], dtype=torch.long, device=device)
-    H = I.shape[2]
-    dec_res = torch.full((1, 1), H, dtype=torch.long, device=device)
-    can_res = torch.full((1, 1), trainer.args.canonical_resolution,
-                         dtype=torch.long, device=device)
+def run_test_eval(
+        trainer: Trainer, test_loader: torch.utils.data.DataLoader, 
+        logger: JSONLLogger, global_step: int, n_trials: int
+) -> dict:
+    """Evaluate the held-out mixed test split and return its summary.
 
-    trainer.net.eval()
-    with trainer._autocast():
-        nout = trainer.net(
-            I, M, n_imgs,
-            decoder_resolution=dec_res,
-            canonical_resolution=can_res,
-            training=False,
-        )
-    nout = nout.float()
-    nrm = torch.linalg.norm(nout, dim=1, keepdim=True).clamp_min(1e-8)
-    nout = nout / nrm
-    mask_bool = (M[:, 0] > 0.5)
-    dot = (nout * N).sum(dim=1).clamp(-1 + 1e-6, 1 - 1e-6)
-    ang = torch.acos(dot) * (180.0 / 3.141592653589793)
-    err = ang[mask_bool]
-    if err.numel() == 0:
-        return float('nan')
-    return float(err.mean().detach().cpu().item())
+    Reuses the trainer's validation path (`val_step`), so the per-batch loss
+    and MAE are the same quantities the validation loop reports. The loader is
+    `MixedEvalDataset`, whose length is `n_scenes * n_trials`; a single sweep
+    therefore averages every scene over `n_trials` deterministic trials.
+
+    Note the *aggregation* differs from the validation loop, so the two
+    headline numbers are close but not identical estimators:
+
+    - here, batches are weighted by their scene count, making the mean exactly
+      the per-(scene, trial) average (unbiased) even when the last batch is
+      short; the val loop takes a plain per-batch mean, which over-weights a
+      short final batch. The two coincide only when the split size is an exact
+      multiple of `--batch_size`.
+    - here, any non-finite value is dropped (`np.isfinite`); the val loop uses
+      `np.nanmean`, which drops NaN but propagates +/-inf.
+
+    Both gaps are small (sub-percent for realistic split sizes) and neither
+    affects `best.pt` selection, since the val loop's bias is a fixed
+    reweighting of a fixed batch partition and so is consistent across epochs.
+    """
+    totals = {}  # key -> [weighted_sum, weight]
+    for test_batch in test_loader:
+        batch_size = int(test_batch[0].shape[0])
+        for k, v in trainer.val_step(test_batch).items():
+            # MAE and MSE from a batch
+            val = _to_scalar(v)
+            if not np.isfinite(val):
+                continue  # skip a non-finite batch instead of poisoning the mean
+            acc = totals.setdefault(k, [0.0, 0.0])
+            acc[0] += val * batch_size
+            acc[1] += batch_size
+    if not totals:
+        return {}
+    summary = {f'test_{k}': (s / w if w > 0 else float('nan'))
+               for k, (s, w) in totals.items()}
+    summary['kind'] = 'test_summary'
+    summary['global_step'] = global_step
+    summary['n_trials'] = int(n_trials)
+    logger.write(summary, text='[TEST] ' + _format_log(summary))
+    print('[TEST SUMMARY] ' + _format_log(summary))
+    return summary
 
 
-def run_diligent_eval(trainer, eval_set, device, logger, epoch, global_step,
-                       best_K=16):
-    """Run the K-sweep and return mean MAE at `best_K`."""
-    per_scene_K_trials = {}
-    obj_names = {}
-    for i in range(len(eval_set)):
-        meta = eval_set.get_meta(i)
-        I, N, M, K_used, K, obj_idx, trial = eval_set[i]
-        mae = _eval_one_pack(trainer, I, N, M, int(K_used), device)
-        obj_names[obj_idx] = meta['objname']
-        per_scene_K_trials.setdefault((obj_idx, K), []).append(mae)
-        logger.write(
-            {
-                'epoch': epoch,
-                'global_step': global_step,
-                'obj_idx': obj_idx,
-                'objname': meta['objname'],
-                'K': int(K),
-                'trial': trial,
-                'mae_deg': mae,
-            },
-            text=(f'[eval] epoch={epoch} step={global_step} '
-                  f'obj={meta["objname"]} K={K} trial={trial} mae={mae:.4f}'),
-        )
+# ---------------------------------------------------------------------------
+# Inference export
+# ---------------------------------------------------------------------------
+def export_for_inference(ckpt_dir: str) -> str | None:
+    """Publish the reported weights to `<ckpt_dir>/normal/normal.pytmodel`.
 
-    K_list = sorted({K for (_, K) in per_scene_K_trials})
-    per_K_mean = {}
-    per_obj_mean = {}
-    for K in K_list:
-        per_obj = {}
-        for obj_idx in sorted(obj_names):
-            trials = per_scene_K_trials.get((obj_idx, K), [])
-            if trials:
-                per_obj[obj_names[obj_idx]] = float(np.nanmean(trials))
-        per_obj_mean[K] = per_obj
-        per_K_mean[K] = (float(np.nanmean(list(per_obj.values())))
-                         if per_obj else float('nan'))
+    `builder.load_models` globs `*.pytmodel` under `<--checkpoint>/normal` and
+    `"".join`s the matches, so that directory must contain exactly one file —
+    hence the dedicated subdirectory rather than pointing inference at
+    `ckpt_dir`, which holds both `normal.pytmodel` and `best_normal.pytmodel`.
 
-    summary = {
-        'kind': 'eval_summary',
-        'epoch': epoch,
-        'global_step': global_step,
-        'per_K_mean_mae_deg': per_K_mean,
-        'per_K_per_obj_mae_deg': per_obj_mean,
-    }
-    summary_text = ('[eval-summary] epoch={}  '.format(epoch)
-                    + '  '.join(f'K={K}:{per_K_mean[K]:.4f}' for K in K_list))
-    logger.write(summary, text=summary_text)
-    print(summary_text)
-    return per_K_mean.get(best_K, float('nan'))
+    Source preference mirrors the checkpoint the final test number is reported
+    on: `best_normal.pytmodel` (written alongside every `best.pt` update, so
+    its presence means a best was recorded) when it exists, otherwise
+    `normal.pytmodel`, which `Trainer.save(tag='final')` last overwrote with
+    the final-epoch weights.
+
+    Returns the exported path, or None if neither source exists.
+    """
+    best_src = os.path.join(ckpt_dir, 'best_normal.pytmodel')
+    final_src = os.path.join(ckpt_dir, 'normal.pytmodel')
+    if os.path.isfile(best_src):
+        src, provenance = best_src, 'best_normal.pytmodel (val-selected)'
+    elif os.path.isfile(final_src):
+        src, provenance = final_src, 'normal.pytmodel (final-epoch fallback)'
+    else:
+        print(f'[EXPORT] WARNING: no *.pytmodel found in {ckpt_dir}; '
+              f'skipping the inference export.')
+        return None
+
+    out_dir = os.path.join(ckpt_dir, 'normal')
+    os.makedirs(out_dir, exist_ok=True)
+    # Keep exactly one .pytmodel here (see docstring): drop anything a previous
+    # export left behind, e.g. a best export superseded by a fallback one.
+    for stale in glob.glob(os.path.join(out_dir, '*.pytmodel')):
+        os.remove(stale)
+    dst = os.path.join(out_dir, 'normal.pytmodel')
+    shutil.copyfile(src, dst)
+    print(f'[EXPORT] Inference weights = {provenance} → {dst}\n'
+          f'[EXPORT] Run inference with --checkpoint {ckpt_dir}')
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +318,15 @@ def main():
         if args.smoke_max_scenes > 0:
             args.max_scenes = args.smoke_max_scenes
 
-    torch.manual_seed(args.seed)
+    # Reproducibility: seed every RNG the pipeline touches and pin cuDNN to deterministic kernels. 
+    # Combined with the DataLoader `generator` +`_seed_worker` below (numpy in workers)
+    # And the deterministic MixedEvalDataset, a run is reproducible for a fixed config.
+    random.seed(args.seed)
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # Create dedicated directories for logs and checkpoints
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -293,50 +335,69 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    print(f'[Train] Device = {device}  Session = {args.session_name}')
-    print(f'[Train] Dataset = mixed (hdlong + PolarPS)  Automatic Mixed Precision (AMP) = {args.amp_dtype}  '
-          f'Epochs = {args.epochs}  Batch size = {args.batch_size}  K=10')
-    print(f'[Train] Log directory = {log_dir}  Checkpoint directory = {ckpt_dir}')
+    print(f'[TRAIN] Device = {device}  Session = {args.session_name}')
+    print(f'[TRAIN] Dataset = mixed (hdlong + PolarPS) | Automatic Mixed Precision (AMP) = {args.amp_dtype}  '
+          f'Epochs = {args.epochs} | Batch size = {args.batch_size}  K=10')
+    print(f'[TRAIN] Log directory = {log_dir} | Checkpoint directory = {ckpt_dir}')
     if torch.cuda.is_available():
         gpu_props = torch.cuda.get_device_properties(0)
-        print(f'[Train] GPU = {torch.cuda.get_device_name(0)}  '
-              f'Memory = {gpu_props.total_memory / 2**30:.1f} GiB  '
+        print(f'[TRAIN] GPU = {torch.cuda.get_device_name(0)} | '
+              f'Memory = {gpu_props.total_memory / 2**30:.1f} GiB | '
               f'Capability = {gpu_props.major}.{gpu_props.minor}')
 
-    # Train Dataloader
-    train_set = build_train_dataset(args)
+    # Seeded generator makes the train shuffle order reproducible; combined
+    # with _seed_worker (numpy in workers) the whole loader stream is fixed.
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(args.seed)
+
+    # Deterministic scene-level splits of the mixed PolarPS/hdlong-complexv1 pool 
+    # produces train (augmented), held-out val (drives best.pt), and held-out test (final report).
+    train_set, val_set, test_set = build_mixed_split(args)
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=(device.type == 'cuda'),
         drop_last=True, collate_fn=_collate,
         persistent_workers=(args.num_workers > 0),
+        worker_init_fn=_seed_worker, generator=loader_gen,
     )
 
-    # Held-out scene-level split drives checkpoint selection (best.pt).
-    val_set = build_val_dataset(args)
-    val_loader = None
-    if len(val_set) > 0:
-        val_loader = torch.utils.data.DataLoader(
-            val_set, batch_size=args.batch_size, shuffle=False,
-            num_workers=max(1, args.num_workers // 2),
-            pin_memory=(device.type == 'cuda'),
-            drop_last=False, collate_fn=_collate,
+    # Validation set drives best.pt and test set is the final report, so neither may be empty.
+    if len(val_set) == 0:
+        raise RuntimeError(
+            'Validation split is empty. --val_fraction '
+            f'({args.val_fraction}) rounded every present source to 0 val '
+            'scenes. Increase --val_fraction or provide more scenes per source .'
         )
-    else:
-        print('[Train] Validation split is empty (--val_fraction too small); '
-              'best.pt will not be updated.')
+    if len(test_set) == 0:
+        raise RuntimeError(
+            'Test split is empty. --test_fraction '
+            f'({args.test_fraction}) rounded every present source to 0 test '
+            'scenes. Increase --test_fraction or provide more scenes per source.'
+        )
 
-    eval_set = None
-    if args.eval_dir:
-        K_list = tuple(int(k) for k in args.eval_K_list.split(',') if k)
-        eval_set = DiligentEvalDataset(
-            args.eval_dir, K_list=K_list, trials_per_K=args.eval_trials,
-            side=args.eval_side, seed=args.seed,
-        )
+    val_loader = torch.utils.data.DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=max(1, args.num_workers // 2),
+        pin_memory=(device.type == 'cuda'),
+        drop_last=False, collate_fn=_collate,
+        worker_init_fn=_seed_worker, generator=loader_gen,
+    )
+
+    # Test eval: a deterministic multi-trial wrapper over the test scenes (unbiased).
+    # Its per-item RNG is seeded from the index, so results are worker-count independent.
+    test_eval_set = MixedEvalDataset(args, test_set.scenes,
+                                     n_trials=args.test_trials, seed=args.seed)
+    test_loader = torch.utils.data.DataLoader(
+        test_eval_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=max(1, args.num_workers // 2),
+        pin_memory=(device.type == 'cuda'),
+        drop_last=False, collate_fn=_collate,
+        worker_init_fn=_seed_worker, generator=loader_gen,
+    )
 
     steps_per_epoch = max(1, len(train_loader))
     total_steps = steps_per_epoch * args.epochs
-    print(f'[Train] steps_per_epoch = {steps_per_epoch:,}  total_steps = {total_steps:,}')
+    print(f'[TRAIN] steps_per_epoch = {steps_per_epoch:,} | total_steps = {total_steps:,}')
 
     trainer = Trainer(args, device, total_steps=total_steps,
                        steps_per_epoch=steps_per_epoch)
@@ -344,6 +405,7 @@ def main():
     train_logger = JSONLLogger(log_dir, 'train')
     eval_logger = JSONLLogger(log_dir, 'eval')
 
+    # Store the run arguments
     with open(os.path.join(log_dir, 'config.json'), 'w') as f:
         json.dump({k: v for k, v in sorted(vars(args).items())
                    if isinstance(v, (str, int, float, bool, type(None)))},
@@ -351,13 +413,15 @@ def main():
 
     best_val_loss = float('inf')
     best_path = os.path.join(ckpt_dir, 'best.pt')
+    epochs_no_improve = 0   # consecutive validation checks without improvement
+    stopped_early = False
     t0 = time.time()
     for epoch in range(args.epochs):
         epoch_t0 = time.time()
         epoch_running = {}
         for it, batch in enumerate(train_loader):
             step_t0 = time.time()
-            log = trainer.train_step(batch)
+            log = trainer.train_step(batch) # MSE, MAE, lr, and grad_norm
             step_dt = time.time() - step_t0
 
             scalar_log = {k: _to_scalar(v) for k, v in log.items()}
@@ -368,19 +432,20 @@ def main():
 
             for k, v in scalar_log.items():
                 if isinstance(v, float):
+                    # Only MSE, MAE, lr, and grad_norm
                     epoch_running.setdefault(k, []).append(v)
 
             if trainer.global_step % args.log_every == 0 or it == 0:
                 elapsed = time.time() - t0
-                head = (f'[step {trainer.global_step}/{total_steps}] '
-                        f'epoch={epoch} it={it} elapsed={elapsed:.1f}s')
-                text = head + '  ' + _format_log(scalar_log)
+                head = (f'[STEP {trainer.global_step}/{total_steps}] '
+                        f'epoch={epoch} | it={it} | elapsed={elapsed:.1f}s')
+                text = head + ' | ' + _format_log(scalar_log)
                 train_logger.write(scalar_log, text=text)
                 print(text)
 
             if args.ckpt_every > 0 and trainer.global_step % args.ckpt_every == 0:
                 path = trainer.save(ckpt_dir, tag=f'step_{trainer.global_step}')
-                print(f'[ckpt] step checkpoint saved {path}')
+                print(f'[CHECKPOINT] Step checkpoint saved {path}')
 
         epoch_summary = {
             'kind': 'epoch_summary',
@@ -390,20 +455,22 @@ def main():
         }
         for k, vals in epoch_running.items():
             if vals:
+                # Average MAE, MSE, lr, and grad_norm over all training batches
                 epoch_summary[f'avg_{k}'] = float(np.mean(vals))
         train_logger.write(
             epoch_summary,
-            text=f'[epoch {epoch} done] ' + _format_log(epoch_summary),
+            text=f'[EPOCH {epoch} DONE] ' + _format_log(epoch_summary),
         )
 
         # Save end-of-epoch checkpoint.
         path = trainer.save(ckpt_dir, tag=f'epoch_{epoch}')
-        print(f'[ckpt] epoch checkpoint saved {path}')
+        print(f'[CHECKPOINT] Epoch checkpoint saved: {path}')
 
         # Held-out validation drives best.pt selection (lower loss = better).
         if val_loader is not None and (epoch + 1) % args.val_every_epochs == 0:
             v_logs = []
             for vb in val_loader:
+                # MSEs and MAEs of all validation batches 
                 v_logs.append({k: _to_scalar(v)
                                 for k, v in trainer.val_step(vb).items()})
             if v_logs:
@@ -417,11 +484,12 @@ def main():
                 avg['global_step'] = trainer.global_step
                 train_logger.write(
                     avg,
-                    text=f'[val epoch {epoch}] ' + _format_log(avg),
+                    text=f'[VAL EPOCH {epoch}] ' + _format_log(avg),
                 )
                 avg_val_loss = avg.get('val_loss', float('inf'))
-                if avg_val_loss < best_val_loss:
+                if avg_val_loss < best_val_loss - args.min_delta:
                     best_val_loss = avg_val_loss
+                    epochs_no_improve = 0
                     shutil.copyfile(path, best_path)
                     legacy = os.path.join(ckpt_dir, 'normal.pytmodel')
                     if os.path.isfile(legacy):
@@ -429,24 +497,70 @@ def main():
                             legacy,
                             os.path.join(ckpt_dir, 'best_normal.pytmodel'),
                         )
-                    print(f'[best] epoch {epoch}  '
-                          f'val_loss={avg_val_loss:.4f}  → {best_path}')
+                    print(f'[BEST] Epoch {epoch} | '
+                          f'val_loss={avg_val_loss:.4f} → {best_path}')
+                else:
+                    epochs_no_improve += 1
+                    if args.patience > 0:
+                        print(f'[EARLY STOPPING]: No val improvement '
+                              f'({epochs_no_improve}/{args.patience}) | '
+                              f'best_val_loss={best_val_loss:.4f}')
 
         prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',))
 
+        # Early stopping (option 1): a safety cutoff that leaves the cosine
+        # schedule spanning --epochs but bails once val loss plateaus.
+        if args.patience > 0 and epochs_no_improve >= args.patience:
+            stopped_early = True
+            msg = (f'[EARLY STOPPING] Stopping at epoch {epoch}: val loss did not '
+                   f'improve by > {args.min_delta} for {args.patience} '
+                   f'consecutive validation check(s) | '
+                   f'best_val_loss={best_val_loss:.4f}')
+            print(msg)
+            train_logger.write(
+                {'kind': 'early_stop', 'epoch': epoch,
+                 'global_step': trainer.global_step,
+                 'best_val_loss': best_val_loss,
+                 'epochs_no_improve': epochs_no_improve},
+                text=msg,
+            )
+            break
+
     final = trainer.save(ckpt_dir, tag='final')
-    print(f'[Train] done. final checkpoint: {final}  '
+    reason = 'early-stopped' if stopped_early else 'completed all epochs'
+    print(f'[TRAIN] DONE ({reason}) | Final checkpoint: {final} | '
           f'best_val_loss={best_val_loss:.4f}')
 
-    # DiLiGenT is the held-out test benchmark: evaluate exactly once, after
-    # training, so the test set never influences checkpoint selection.
-    if eval_set is not None:
-        final_mae = run_diligent_eval(
-            trainer, eval_set, device, eval_logger,
-            epoch=args.epochs - 1, global_step=trainer.global_step,
-            best_K=args.eval_best_K,
-        )
-        print(f'[Train] final DiLiGenT mae@K{args.eval_best_K}={final_mae:.4f}')
+    # Report the final test number on the SELECTED model (best.pt, chosen by
+    # val loss). Fall back to the in-memory weights only if best.pt is somehow absent (e.g. val never yielded a
+    # finite loss so no best was ever written).
+    if os.path.isfile(best_path):
+        print(f'[TRAIN] loading best.pt (val_loss={best_val_loss:.4f}) '
+              f'for the final held-out test evaluation')
+        trainer.load(best_path)
+    else:
+        print('[TRAIN] WARNING: best.pt not found; running the final test '
+              'evaluation on the last-epoch weights instead.')
+
+    # Publish the same weights the test number is reported on as a drop-in
+    # inference checkpoint. `trainer.load` above only updates the in-memory
+    # model — `normal.pytmodel` on disk still holds the final-epoch weights —
+    # so the export reads from `best_normal.pytmodel` when a best exists.
+    export_for_inference(ckpt_dir)
+
+    # The held-out mixed test split is the final benchmark.
+    # Re-seed here so the eval's pixel sampling (torch RNG inside the model) is
+    # reproducible independent of how many RNG draws training consumed.
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    summary = run_test_eval(trainer, test_loader, eval_logger,
+                            global_step=trainer.global_step,
+                            n_trials=args.test_trials)
+    if summary:
+        print(f'[TRAIN] Final held-out test (avg of {args.test_trials} trials) | '
+              f'mae={summary.get("test_mae_deg", float("nan")):.4f} | '
+              f'loss={summary.get("test_loss", float("nan")):.4f}')
 
 
 if __name__ == '__main__':
