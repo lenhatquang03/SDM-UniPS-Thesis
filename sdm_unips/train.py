@@ -669,10 +669,24 @@ def main():
             steps = epoch_running.get('step_sec', [])
             if waits and steps:
                 total_wait, total_step = float(np.sum(waits)), float(np.sum(steps))
-                # The headline tuning number: share of wall time the GPU spent
-                # idle waiting for input.
+                epoch_summary['data_wait_sec_total'] = total_wait
+                epoch_summary['step_sec_total'] = total_step
+                # The headline tuning number: share of the time the loop spent
+                # idle waiting for input. Note the denominator is the ACCOUNTED
+                # time (wait + step), not epoch_sec — the residual below belongs
+                # to neither timer.
                 epoch_summary['data_wait_share'] = (
                     total_wait / max(total_wait + total_step, 1e-9))
+                # Epoch time the two timers never saw: per-step JSONL writes,
+                # /proc reads for host_rss, the epoch checkpoint, validation,
+                # and the trailing flush_accum. A small residual means the
+                # accounting closes and data_wait_share can be read at face
+                # value; a large one means the instrumentation (or validation)
+                # is itself a big share of the epoch, so tune against
+                # data_wait_share with suspicion and re-check with --log_memory
+                # off once sizing is settled.
+                epoch_summary['unaccounted_sec'] = max(
+                    epoch_summary['epoch_sec'] - total_wait - total_step, 0.0)
         train_logger.write(
             epoch_summary,
             text=f'[EPOCH {epoch} DONE] ' + _format_log(epoch_summary),

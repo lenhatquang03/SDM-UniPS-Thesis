@@ -156,7 +156,8 @@ Logs land in `<session>/logs/`:
 epoch), `host_rss_gib` (self + DataLoader workers, an upper bound since
 copy-on-write pages are counted per process), and `data_wait_sec` (seconds the
 step spent blocked on the loader) to every `train.jsonl` record, plus
-`epoch_*` peaks and `data_wait_share` on each epoch summary. It is opt-in
+`epoch_*` peaks, `data_wait_sec_total` / `step_sec_total`, `data_wait_share`
+and `unaccounted_sec` on each epoch summary. It is opt-in
 because these fields roughly double the width of every record; enable it only
 when sizing `--batch_size` / `--num_workers`, then turn it off.
 
@@ -173,6 +174,15 @@ next step's `data_wait_sec`, leaving both non-comparable across runs. Ignore
 epoch 0's
 `data_wait_share`: its first `data_wait_sec` absorbs worker-pool startup and
 the initial fill, which `persistent_workers=True` pays only once.
+
+`data_wait_share`'s denominator is the **accounted** time
+(`data_wait_sec_total + step_sec_total`), not `epoch_sec`. The difference is
+reported as `unaccounted_sec` — per-step JSONL writes, the `/proc` reads for
+`host_rss_gib`, the epoch checkpoint, validation, and the trailing
+`flush_accum`, none of which either timer covers. Check it before trusting a
+tuning decision: a small residual means the accounting closes; a large one
+means profiling overhead (or validation) dominates the epoch, so re-measure
+with `--log_memory` off once the sizing is settled.
 
 `_seed_worker` calls `cv2.setNumThreads(0)`: OpenCV otherwise spawns one
 thread per core inside *each* worker, so `W` workers oversubscribe the CPU by
