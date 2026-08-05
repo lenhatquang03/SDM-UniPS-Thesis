@@ -153,6 +153,20 @@ class PMA(nn.Module):
     def __init__(self, dim, num_heads, num_seeds, ln=False, attn_mode='Normal'):
         super(PMA, self).__init__()
         self.S = nn.Parameter(torch.Tensor(1, num_seeds, dim))
+        # `torch.Tensor(*sizes)` is the legacy constructor -- it allocates
+        # UNINITIALIZED memory. Upstream never noticed because the repo is
+        # inference-only and `load_state_dict` overwrites S before it is used;
+        # training from scratch is the first time those bytes reach a forward
+        # pass. PMA is built with the default `ln=False` (see AggregationBlock
+        # below), so S goes raw into fc_q and raw into the `Q_ + A` residual
+        # with no LayerNorm to damp it -- arbitrary heap bytes reinterpreted as
+        # float32 are routinely 1e20+, which overflows the `x**2` inside a
+        # downstream LayerNorm and yields a finite forward (the unit
+        # normalization in Net._decode_pixels hides it) with a NaN backward.
+        # Worse, the garbage depends on the process's prior allocation history,
+        # so it varies with things like --num_workers and NO seed covers it.
+        # xavier_uniform_ is what the original Set Transformer PMA uses.
+        nn.init.xavier_uniform_(self.S)
         self.mab = MultiHeadSelfAttentionBlock(dim, dim, num_heads, ln=ln, attn_mode=attn_mode)
 
     def forward(self, X):

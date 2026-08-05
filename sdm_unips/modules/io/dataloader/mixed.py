@@ -237,9 +237,13 @@ def build_mixed_split(args, augment=True):
     val_ds = MixedTrainDataset(args, augment=False,
                                scenes=hd_val + pp_val,
                                subset_name='MixedVal', noun='val')
+    # Not announced: `MixedEvalDataset` wraps exactly these scenes and prints
+    # the identical counts as `[MixedTestEval]`, so announcing here duplicates
+    # the line. train.py's `[TRAIN] scenes: ...` summary also reports the count.
     test_ds = MixedTrainDataset(args, augment=False,
                                 scenes=hd_test + pp_test,
-                                subset_name='MixedTest', noun='test')
+                                subset_name='MixedTest', noun='test',
+                                announce=False)
     return train_ds, val_ds, test_ds
 
 # Inhertis from Pytorch's base Dataset class
@@ -253,19 +257,20 @@ class MixedTrainDataset(data.Dataset):
     returns the 4-tuple expected by `train._collate`: (I, N, M, n_imgs).
     """
 
-    def __init__(self, args, augment: bool=True, 
+    def __init__(self, args, augment: bool=True,
                  scenes: list[tuple[str, str]]|None=None,
-                 subset_name='MixedTrain', noun='train'):
+                 subset_name='MixedTrain', noun='train', announce: bool=True):
         self.args = args
         self.augment = augment
         self.train_resolution = int(args.train_resolution)
         self.outdir = args.session_name
         # Default to max_scenes scenes with respected hdlong-polarps ratio
         self.scenes = scenes if scenes is not None else _discover_scenes(args)
-        n_hd = sum(1 for k, _ in self.scenes if k == 'hdlong')
-        n_pp = sum(1 for k, _ in self.scenes if k == 'polarps')
-        print(f'[{subset_name}] {len(self.scenes):,} {noun} scenes  '
-              f'({n_hd:,} hdlong + {n_pp:,} polarps)')
+        if announce:
+            n_hd = sum(1 for k, _ in self.scenes if k == 'hdlong')
+            n_pp = sum(1 for k, _ in self.scenes if k == 'polarps')
+            print(f'[{subset_name}] {len(self.scenes):,} {noun} scenes  '
+                  f'({n_hd:,} hdlong + {n_pp:,} polarps)')
 
         self._hdlong = HdlongLoader(
             self.train_resolution, outdir=self.outdir,
