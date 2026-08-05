@@ -17,7 +17,8 @@ threshold magnitude > 0.5 to isolate foreground.
 
 For one __getitem__ call we draw a fixed K=10 light directions out of
 the 32, mask each image, resize to --train_resolution if needed, and
-divide each image by its (cached) foreground mean intensity.
+divide each image by its (cached) foreground max intensity, matching the
+inference-time normalization in `realdata.py`.
 """
 
 import glob
@@ -27,7 +28,7 @@ import re
 import cv2
 import numpy as np
 
-from .mean_cache import masked_mean, read_means, write_means
+from .scale_cache import masked_scale, read_scales, write_scales
 
 os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
 
@@ -56,16 +57,16 @@ class PolarPSLoader:
     def __init__(self, train_resolution=512, outdir='.'):
         self.train_resolution = int(train_resolution)
         self.outdir = outdir
-        # Per-scene {rel_path: foreground_mean} caches, memoized so the sidecar
+        # Per-scene {rel_path: foreground_scale} caches, memoized so the sidecar
         # is read from disk at most once per scene per worker.
-        self._means_by_dir = {}
+        self._scales_by_dir = {}
 
-    def _get_means(self, cache_dir: str) -> dict[str, float]:
-        means = self._means_by_dir.get(cache_dir)
-        if means is None:
-            means = read_means(cache_dir)
-            self._means_by_dir[cache_dir] = means
-        return means
+    def _get_scales(self, cache_dir: str) -> dict[str, float]:
+        scales = self._scales_by_dir.get(cache_dir)
+        if scales is None:
+            scales = read_scales(cache_dir)
+            self._scales_by_dir[cache_dir] = scales
+        return scales
 
     @staticmethod
     def _is_same_resolution(img: np.ndarray, expected: tuple[int, int]=(512, 512)):
@@ -124,21 +125,23 @@ class PolarPSLoader:
             N_r = (N_r * mask_r[..., None]) / (np.linalg.norm(N_r, axis=2, keepdims=True) + 1e-12)
 
         composed = np.zeros((K, out_h, out_w, 3), np.float32)
-        means = self._get_means(scene_dir)
+        scales = self._get_scales(scene_dir)
         new_entries = {}
-        scale = np.ones(K, np.float32)  # per-image foreground mean intensity
+        scale = np.ones(K, np.float32)  # per-image foreground max intensity
         for i, k in enumerate(chosen):
             img_path = os.path.join(light_dirs[k], 'S0.exr')
             img = _read_exr(img_path)
             # Apply mask
             img *= mask[..., None]
-            # Per-image foreground mean, computed once per file then cached.
+            # Per-image foreground max, computed once per file then cached.
+            # Taken at the ON-DISK resolution (before any resize below) so the
+            # cached value stays valid across --train_resolution settings.
             rel = os.path.relpath(img_path, scene_dir)
-            if rel in means:
-                scale[i] = means[rel]
+            if rel in scales:
+                scale[i] = scales[rel]
             else:
-                scale[i] = masked_mean(img, mask)
-                means[rel] = new_entries[rel] = scale[i]
+                scale[i] = masked_scale(img, mask)
+                scales[rel] = new_entries[rel] = scale[i]
             # Upsample to the desired shape (512, 512) if needed
             if not self._is_same_resolution(img):
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
@@ -146,7 +149,7 @@ class PolarPSLoader:
             img = np.maximum(img, 0.0)
             composed[i] = img # (K, H, W, 3)
         if new_entries:
-            write_means(scene_dir, means)
+            write_scales(scene_dir, scales)
 
 
         do_flip = bool(augment and rng.rand() < 0.5)
@@ -156,9 +159,10 @@ class PolarPSLoader:
             N_r = N_r[:, ::-1, :].copy()
             N_r[:, :, 0] = -N_r[:, :, 0]
 
-        # Per-image mean normalization: divide each image by its foreground
-        # mean intensity (cached above; identical for train and val). Flipping
-        # is spatial, so `scale` is unaffected by the flip above.
+        # Per-image max normalization: divide each image by its foreground max
+        # intensity (cached above; identical for train and val), which puts the
+        # observations in ~[0, 1] exactly as `realdata.py` does at inference.
+        # Flipping is spatial, so `scale` is unaffected by the flip above.
         I_flat = composed.reshape(K, -1, 3) # (K, H * W, 3)
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
         composed = I_flat.reshape(K, out_h, out_w, 3)

@@ -22,7 +22,15 @@ For one __getitem__ call we:
        and environment light image, each pre-normalized by its per-scene
        `light_means.config` value and masked.
     3. Upsample 256x256 -> --train_resolution (default 512).
-    4. Divide each composite by its (cached) foreground mean intensity.
+    4. Divide each composite by its foreground max intensity, matching the
+       inference-time normalization in `realdata.py`.
+
+Unlike PolarPS this loader keeps no `scale_cache` sidecar: the observation is a
+*random* Dirichlet mix drawn afresh every epoch, and the max -- unlike the mean
+the previous version used -- is not linear, so there is no per-component
+quantity that could be cached and recombined. The scale is computed directly on
+each composite, a masked max over 256x256 that is negligible next to the three
+EXR reads that produced it.
 """
 
 import glob
@@ -32,7 +40,7 @@ import re
 import cv2
 import numpy as np
 
-from .mean_cache import masked_mean, read_means, write_means
+from .scale_cache import masked_scale
 
 # Required for OpenCV EXR support.
 os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
@@ -80,16 +88,6 @@ class HdlongLoader:
     def __init__(self, train_resolution=512, outdir='.'):
         self.train_resolution = int(train_resolution)
         self.outdir = outdir
-        # Per-camera {component_filename: foreground_mean} caches, memoized so
-        # the sidecar is read from disk at most once per camera per worker.
-        self._means_by_dir = {}
-
-    def _get_means(self, cache_dir: str):
-        means = self._means_by_dir.get(cache_dir)
-        if means is None:
-            means = read_means(cache_dir)
-            self._means_by_dir[cache_dir] = means
-        return means
 
     def _sample_K(self, total_available):
         # Fixed 10 rendered images per scene.
@@ -151,16 +149,7 @@ class HdlongLoader:
         mask_soft_r = cv2.resize(mask_soft, (out_h, out_w), interpolation=cv2.INTER_LINEAR).astype(np.float32)
         mask_r = (mask_soft_r >= 0.5).astype(np.float32)
 
-        means = self._get_means(cam_dir)
-        new_entries = {}
-        scale = np.ones(K, np.float32)  # per-composite foreground mean intensity
-
-        def _comp_mean(path: str, arr: np.ndarray) -> float:
-            # Foreground mean of one masked component, computed once then cached.
-            key = os.path.basename(path)
-            if key not in means:
-                means[key] = new_entries[key] = masked_mean(arr, mask)
-            return means[key]
+        scale = np.ones(K, np.float32)  # per-composite foreground max intensity
 
         for k in range(K):
             # Randomly sample
@@ -177,11 +166,12 @@ class HdlongLoader:
             # Rendered image = a convex combination of three component images
             w = rng.dirichlet(np.ones(3))
             img = (w[0] * p_img + w[1] * d_img + w[2] * e_img).astype(np.float32)
-            # Mean is linear and the mask is shared, so the composite's foreground
-            # mean is the same convex combination of the three components' means.
-            scale[k] = (w[0] * _comp_mean(point_paths[pi], p_img)
-                        + w[1] * _comp_mean(dir_paths[di], d_img)
-                        + w[2] * _comp_mean(env_paths[ei], e_img))
+            # Foreground max of THIS composite. The max is not linear, so it
+            # cannot be recombined from per-component maxima the way the old
+            # mean-based scale could -- it has to be read off the mix itself.
+            # Taken pre-resize (256x256, the native render size) so the value
+            # does not depend on --train_resolution or on cubic overshoot.
+            scale[k] = masked_scale(img, mask)
             # hdlong-complexv1's images have spatial size (256, 256), need upsampling
             if img.shape[0] != out_h or img.shape[1] != out_w:
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
@@ -189,8 +179,6 @@ class HdlongLoader:
                 img *= mask_r[..., None]
             img = np.maximum(img, 0.0)
             composed[k] = img # composed: (K, H, W, 3)
-        if new_entries:
-            write_means(cam_dir, means)
 
         # Upsample + Normalize surface normals
         N_r = cv2.resize(N, (out_h, out_w), interpolation=cv2.INTER_LINEAR)
@@ -205,9 +193,10 @@ class HdlongLoader:
             N_r = N_r[:, ::-1, :].copy()
             N_r[:, :, 0] = -N_r[:, :, 0]
 
-        # Per-image mean normalization: divide each composite by its foreground
-        # mean intensity (`scale`, assembled from cached component means above;
-        # identical for train and val). Flipping is spatial and leaves it intact.
+        # Per-image max normalization: divide each composite by its foreground
+        # max intensity (`scale`, measured on the composite above), which puts
+        # the observations in ~[0, 1] exactly as `realdata.py` does at
+        # inference. Flipping is spatial and leaves it intact.
         # scale.reshape(-1, 1, 1) = (K, 1, 1) for broadcasting.
         I_flat = composed.reshape(K, -1, 3) # (K, H * W, 3)
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
