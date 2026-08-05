@@ -570,6 +570,14 @@ def main():
     # Run-wide high-water marks, carried across the per-epoch peak resets.
     run_peak = {'mem_peak_gib': 0.0, 'mem_reserved_peak_gib': 0.0,
                 'host_rss_gib': 0.0}
+    # CUDA kernels are launched asynchronously, so an unsynchronized
+    # `step_sec` times launches, not compute, and the real GPU time leaks into
+    # whichever later call happens to sync (`.item()` on grad_norm, or the next
+    # iteration's data_wait). That makes step_sec / data_wait_sec
+    # non-comparable across runs — exactly the measurement --log_memory exists
+    # to provide. Sync explicitly while profiling; skip it otherwise, since a
+    # per-step sync costs real throughput in a production run.
+    profile_sync = args.log_memory and device.type == 'cuda'
     t0 = time.time()
     for epoch in range(args.epochs):
         epoch_t0 = time.time()
@@ -586,6 +594,8 @@ def main():
             data_wait = time.time() - iter_end
             step_t0 = time.time()
             log = trainer.train_step(batch)  # MSE, MAE (+ lr, grad_norm on steps)
+            if profile_sync:
+                torch.cuda.synchronize()
             step_dt = time.time() - step_t0
             stepped = bool(log.pop('stepped', True))
 

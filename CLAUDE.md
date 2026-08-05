@@ -165,7 +165,12 @@ larger batch (`mem_reserved_peak_gib − mem_peak_gib` is allocator
 fragmentation). `data_wait_share ≈ 0` means the loader keeps up and more
 workers buy nothing; a large share means input-bound, so raise
 `--num_workers` / `--prefetch_factor` or move the data off a slow disk.
-`step_sec` alone cannot distinguish the two. Ignore epoch 0's
+`step_sec` alone cannot distinguish the two. `--log_memory` also inserts a
+`torch.cuda.synchronize()` before reading `step_sec` (and only then — a
+per-step sync costs throughput), without which async kernel launches make
+`step_sec` time launches rather than compute and leak real GPU time into the
+next step's `data_wait_sec`, leaving both non-comparable across runs. Ignore
+epoch 0's
 `data_wait_share`: its first `data_wait_sec` absorbs worker-pool startup and
 the initial fill, which `persistent_workers=True` pays only once.
 
