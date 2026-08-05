@@ -108,7 +108,18 @@ and their MAE is averaged with a scene-count-weighted (unbiased) mean.
 - `--val_every_epochs`: epochs between validation passes / best.pt checks (default 1)
 - `--patience`: early-stopping patience in validation checks (default 10; 0 disables)
 - `--min_delta`: min val-loss decrease counted as improvement (default 0.0)
-- `--batch_size`: 8 — `--pixel_samples`: m=2048
+- `--batch_size`: 8 (**micro**-batch) — `--pixel_samples`: m=2048
+- `--accum_steps`: 1 — micro-batches per optimizer step; effective batch is
+  `--batch_size × --accum_steps`. Use it to keep the recipe's effective batch
+  of 8 on a GPU too small to hold it in one pass (`--batch_size 2
+  --accum_steps 4`). `global_step`, the LR schedule, `--log_every` and
+  `--ckpt_every` all count **optimizer** steps, so the schedule is unchanged.
+- `--num_workers`: 4 — `--prefetch_factor`: 2 (batches prefetched per worker;
+  in-flight host memory ≈ `num_workers × prefetch_factor × batch_size × 36 MB`
+  at K=10/512², passed through `/dev/shm`)
+- `--max_vram_gib`: 0 (no cap) — hard per-process VRAM ceiling; over-large
+  batches raise OOM instead of consuming the whole card. Worth setting when
+  the GPU also drives a display.
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
 - K is fixed at 10 per scene inside `HdlongLoader` / `PolarPSLoader`.
 - `--lr`: 1e-4 — `--weight_decay`: 0.05
@@ -139,6 +150,32 @@ Logs land in `<session>/logs/`:
 - `train.jsonl` / `train.log`  — per-step loss, MAE, LR, grad norm, step seconds; per-epoch and per-validation summaries
 - `eval.jsonl` / `eval.log`    — the single final held-out test summary (mean loss + MAE)
 - `config.json`                — frozen CLI arguments for the run
+
+**Resource profiling (`--log_memory`, off by default).** Adds
+`mem_peak_gib` / `mem_reserved_peak_gib` (CUDA high-water marks, reset each
+epoch), `host_rss_gib` (self + DataLoader workers, an upper bound since
+copy-on-write pages are counted per process), and `data_wait_sec` (seconds the
+step spent blocked on the loader) to every `train.jsonl` record, plus
+`epoch_*` peaks and `data_wait_share` on each epoch summary. It is opt-in
+because these fields roughly double the width of every record; enable it only
+when sizing `--batch_size` / `--num_workers`, then turn it off.
+
+Reading it: `mem_peak_gib` vs the card's capacity is the headroom for a
+larger batch (`mem_reserved_peak_gib − mem_peak_gib` is allocator
+fragmentation). `data_wait_share ≈ 0` means the loader keeps up and more
+workers buy nothing; a large share means input-bound, so raise
+`--num_workers` / `--prefetch_factor` or move the data off a slow disk.
+`step_sec` alone cannot distinguish the two. Ignore epoch 0's
+`data_wait_share`: its first `data_wait_sec` absorbs worker-pool startup and
+the initial fill, which `persistent_workers=True` pays only once.
+
+`_seed_worker` calls `cv2.setNumThreads(0)`: OpenCV otherwise spawns one
+thread per core inside *each* worker, so `W` workers oversubscribe the CPU by
+a factor of `W` and raising `--num_workers` can reduce throughput. Any
+worker-count benchmark taken without this measures contention, not the loader.
+`train.py` also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+(via `setdefault`, so an explicit env var still wins) to reduce the
+fragmentation-driven OOMs that occur while `nvidia-smi` still shows free VRAM.
 
 ## Data Format
 
@@ -200,6 +237,8 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 
 ### Training orchestration — `modules/builder/trainer.py`
 `Trainer` builds `Net`, `AdamW`, the LR scheduler (step decay or cosine, both with epoch-based warmup), and `GradScaler` (AMP only for fp16). `Net.forward(..., training=True)` samples exactly `pixel_samples` valid-mask pixels per batch element with gradients on (no `.detach()`), and returns flat per-pixel predictions plus the sampled flat indices. The loss (`modules/loss/losses.py:normal_loss`) gathers GT at those indices and computes masked MSE on normals (Sec. 4). Each save also writes `normal.pytmodel` so checkpoints are drop-in for inference.
+
+`train_step` runs one **micro**-batch: it zeroes gradients only at the start of an accumulation cycle, divides the loss by `--accum_steps` before `backward()` (so the accumulated gradient is the *mean* over the effective batch), and optimizes on every `accum_steps`-th call, flagging that in `log['stepped']`. Clipping therefore sees the complete effective-batch gradient, which is what `--grad_clip 1.0` is calibrated against. `Trainer.flush_accum()` applies a short trailing cycle at each epoch boundary so the last micro-batches are not discarded by the next `zero_grad`; `steps_per_epoch` is `ceil(len(train_loader) / accum_steps)` to match.
 
 ### Data loading
 - Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).

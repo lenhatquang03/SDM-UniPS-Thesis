@@ -92,9 +92,10 @@ def _proportional_cap(
     hdlong:polarps ratio.
 
     A single uniform draw over the concatenated pool (the previous approach)
-    could wipe out the minority source entirely when the cap is small —
-    PolarPS is ~1% of the combined pool, so `permutation(len)[:max_scenes]`
-    can easily return zero PolarPS scenes. Instead we allocate the budget
+    could wipe out the minority source entirely when the cap is small — with
+    the full thesis pool (1,198 hdlong vs 17,047 PolarPS) hdlong is only ~6.6%
+    of the scenes, so `permutation(len)[:max_scenes]` can easily return very
+    few hdlong scenes, or none at a small cap. Instead we allocate the budget
     between the two sources in proportion to their full-pool sizes, then draw
     within each source independently. Every source that is present keeps at
     least one scene, so the mix never silently collapses to a single source.

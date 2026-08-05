@@ -14,6 +14,20 @@ Mixed-precision policy
 - fp16  : legacy `torch.cuda.amp.autocast(dtype=torch.float16)` with a
           `GradScaler` (matches the upstream paper code).
 - none  : no autocast; model runs in the optimizer's default dtype.
+
+Gradient accumulation
+---------------------
+`--accum_steps > 1` splits one *effective* batch across that many forward /
+backward passes, so a GPU that cannot hold `--batch_size 8` can still train
+the thesis recipe at `--batch_size 2 --accum_steps 4`. Each micro-batch loss
+is divided by `accum_steps` before `.backward()`, so the accumulated gradient
+is the mean over the effective batch — numerically equivalent to a single
+large batch (up to per-sample-count rounding when micro-batches differ in
+size, which `drop_last=True` prevents on the train loader).
+
+`global_step`, the scheduler, and `--log_every` / `--ckpt_every` all count
+*optimizer* steps, not micro-batches, so the LR schedule is identical to an
+un-accumulated run at the same effective batch size.
 """
 
 import glob
@@ -99,7 +113,13 @@ class Trainer:
 
         self.total_steps = total_steps
         self.steps_per_epoch = steps_per_epoch
-        self.global_step = 0
+        self.global_step = 0          # counts OPTIMIZER steps, not micro-batches
+        self.accum_steps = max(1, int(getattr(args, 'accum_steps', 1)))
+        self._micro_in_cycle = 0      # micro-batches accumulated since last step
+        if self.accum_steps > 1:
+            print(f'[Trainer] Gradient accumulation = {self.accum_steps} x '
+                  f'batch_size {args.batch_size} => effective batch '
+                  f'{self.accum_steps * args.batch_size}')
         self._nan_reported = False
         self.detect_anomaly = bool(getattr(args, 'detect_anomaly', False))
         if self.detect_anomaly:
@@ -218,9 +238,45 @@ class Trainer:
             print('[nan-debug] => inputs and weights are finite; NaN arises in '
                   'this forward pass itself (model numerics).')
 
+    def _apply_optimizer_step(self, log):
+        """Unscale (fp16), clip, step, advance the schedule, close the cycle.
+
+        Called once per `accum_steps` micro-batches — and by `flush_accum` for
+        a short final cycle — so gradient clipping sees the *complete*
+        effective-batch gradient, which is what `--grad_clip 1.0` is calibrated
+        against.
+        """
+        clip_val = self.args.grad_clip if self.args.grad_clip > 0 else float('inf')
+        if self.amp_dtype == 'fp16':
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
+            self.optimizer.step()
+
+        self.scheduler.step()
+        self.global_step += 1
+        self._micro_in_cycle = 0
+        log['stepped'] = True
+        log['lr'] = self.optimizer.param_groups[0]['lr']
+        log['grad_norm'] = (grad_norm.detach() if torch.is_tensor(grad_norm)
+                            else float(grad_norm))
+        return log
+
     def train_step(self, batch):
+        """Run one MICRO-batch. Only every `accum_steps`-th call optimizes.
+
+        The returned log always carries `loss` / `mae_deg` for this
+        micro-batch; `lr` / `grad_norm` appear only on calls that actually
+        stepped, flagged by `log['stepped']`.
+        """
         self.net.train()
-        self.optimizer.zero_grad(set_to_none=True)
+        # Zero only at the start of an accumulation cycle — mid-cycle the
+        # gradients from previous micro-batches must survive.
+        if self._micro_in_cycle == 0:
+            self.optimizer.zero_grad(set_to_none=True)
         # Anomaly detection must wrap BOTH forward and backward: it records the
         # forward op stacks so a backward NaN/Inf raises pointing at the exact
         # originating op.
@@ -233,23 +289,36 @@ class Trainer:
             if not torch.isfinite(loss):
                 self._report_nan(batch)
 
-            clip_val = self.args.grad_clip if self.args.grad_clip > 0 else float('inf')
+            # Divide so the accumulated gradient is the MEAN over the effective
+            # batch rather than its sum; `log['loss']` stays the unscaled
+            # per-micro-batch loss so logged values are accum-independent.
+            scaled_loss = loss / self.accum_steps
             if self.amp_dtype == 'fp16':
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
-                self.optimizer.step()
+                scaled_loss.backward()
 
-        self.scheduler.step()
-        self.global_step += 1
-        log['lr'] = self.optimizer.param_groups[0]['lr']
-        log['grad_norm'] = grad_norm.detach() if torch.is_tensor(grad_norm) else float(grad_norm)
+        self._micro_in_cycle += 1
+        log['stepped'] = False
+        if self._micro_in_cycle >= self.accum_steps:
+            self._apply_optimizer_step(log)
         return log
+
+    def flush_accum(self):
+        """Apply a partial accumulation cycle left over at the end of an epoch.
+
+        Without this, the trailing `len(loader) % accum_steps` micro-batches
+        would have their gradients silently discarded by the next cycle's
+        `zero_grad`. Their contribution is under-weighted (divided by
+        `accum_steps` rather than the true short-cycle count), which is the
+        standard trade-off and affects at most `accum_steps - 1` micro-batches
+        per epoch.
+
+        Returns the step's log, or None if the epoch ended on a cycle boundary.
+        """
+        if self._micro_in_cycle == 0:
+            return None
+        return self._apply_optimizer_step({})
 
     @torch.no_grad()
     def val_step(self, batch):

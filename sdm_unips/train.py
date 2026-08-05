@@ -27,6 +27,21 @@ Logging
 Per-step JSONL lines are appended to `<session>/logs/train.jsonl` and a
 human-readable mirror to `<session>/logs/train.log`. The single final
 held-out test evaluation lands in `<session>/logs/eval.jsonl`.
+
+`--log_memory` (off by default) adds resource fields to those records —
+`mem_peak_gib`, `mem_reserved_peak_gib`, `host_rss_gib`, `data_wait_sec`, and
+a per-epoch `data_wait_share`. They exist to size `--batch_size` and
+`--num_workers` from measurement rather than guesswork: peak memory says how
+much VRAM headroom is left, and `data_wait_share` says whether the GPU is
+starved by the loader (raise workers) or already saturated (do not).
+
+Fitting a large effective batch on a small GPU
+----------------------------------------------
+`--batch_size` is the micro-batch; `--accum_steps` micro-batches make one
+optimizer step. `--batch_size 2 --accum_steps 4` trains the same effective
+batch of 8 as `--batch_size 8`, at roughly a quarter of the activation
+memory. `--max_vram_gib` caps this process's VRAM so an over-large batch
+fails fast instead of exhausting a card that may also be driving a display.
 """
 
 from __future__ import print_function, division
@@ -34,12 +49,14 @@ from __future__ import print_function, division
 import argparse
 import glob
 import json
+import math
 import os
 import random
 import shutil
 import sys
 import time
 
+import cv2
 import numpy as np
 import torch
 
@@ -51,17 +68,77 @@ from modules.io.dataloader.mixed import build_mixed_split, MixedEvalDataset
 
 
 def _seed_worker(worker_id):
-    """Seed a DataLoader worker's numpy + python RNGs deterministically.
+    """Seed a DataLoader worker's RNGs and stop OpenCV from oversubscribing.
 
-    PyTorch gives each worker a unique base seed derived from the main
+    Seeding: PyTorch gives each worker a unique base seed derived from the main
     generator and uses it to seed `torch` and python `random`, but it does
     NOT seed numpy — the classic gotcha that makes np.random-based loaders
     non-reproducible (and duplicated across workers). Mirroring
     `torch.initial_seed()` into numpy/random fixes both.
+
+    Threading: `cv2` defaults to one thread per core for `imread`/`resize`, so
+    W workers each spawn ~ncore threads and the loader thrashes the CPU
+    (W x ncore threads over ncore cores). One thread per worker is the right
+    policy when parallelism already comes from the worker pool — without this,
+    raising `--num_workers` can make throughput *worse*, and any
+    num_workers benchmark is measuring contention rather than the loader.
     """
+    cv2.setNumThreads(0)
     seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(seed)
     random.seed(seed)
+
+
+# ---------------------------------------------------------------------------
+# Resource instrumentation (opt-in via --log_memory)
+# ---------------------------------------------------------------------------
+def _gpu_mem_stats(device) -> dict:
+    """Peak/current CUDA memory in GiB. Counter reads only — no device sync.
+
+    `alloc` is what tensors hold right now; `peak` is the high-water mark since
+    the last `reset_peak_memory_stats` (this script resets per epoch), and is
+    the number to compare against the VRAM budget when sizing `--batch_size`.
+    `reserved_peak` is what the caching allocator took from the driver — the
+    gap between it and `peak` is fragmentation.
+    """
+    if device.type != 'cuda':
+        return {}
+    gib = 1024 ** 3
+    return {
+        'mem_alloc_gib': torch.cuda.memory_allocated() / gib,
+        'mem_peak_gib': torch.cuda.max_memory_allocated() / gib,
+        'mem_reserved_peak_gib': torch.cuda.max_memory_reserved() / gib,
+    }
+
+
+def _host_rss_gib() -> float:
+    """Resident host memory of this process plus its DataLoader workers (GiB).
+
+    Sums `VmRSS` over self + child PIDs found via `/proc/self/task/*/children`.
+    Shared copy-on-write pages are counted once per process, so this is an
+    upper bound on true footprint — useful as a ceiling check against
+    available RAM and `/dev/shm`, not as an exact figure. Returns 0.0 where
+    /proc is unavailable (non-Linux).
+    """
+    def rss_kib(pid) -> int:
+        try:
+            with open(f'/proc/{pid}/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
+
+    total_kib = rss_kib('self')
+    try:
+        for task in os.listdir('/proc/self/task'):
+            with open(f'/proc/self/task/{task}/children') as f:
+                for child in f.read().split():
+                    total_kib += rss_kib(child)
+    except OSError:
+        pass
+    return total_kib / (1024 ** 2)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +172,13 @@ def build_argparser():
                    help='Defaults to <session_name>/logs')
     p.add_argument('--resume', default=None)
     p.add_argument('--log_every', type=int, default=10,
-                   help='Steps between log records')
+                   help='Optimizer steps between log records')
+    p.add_argument('--log_memory', action='store_true',
+                   help='Add resource-usage fields to every log record: peak '
+                        'CUDA memory, allocator reservation, host RSS, and the '
+                        'seconds each step spent WAITING on the DataLoader. '
+                        'Off by default to keep train.jsonl lean; turn it on '
+                        'when tuning --batch_size / --num_workers.')
     p.add_argument('--ckpt_every', type=int, default=0,
                    help='Step interval for extra checkpoints. 0 disables.')
     p.add_argument('--val_every_epochs', type=int, default=1)
@@ -124,8 +207,28 @@ def build_argparser():
 
     # Optimization (thesis recipe defaults) ------------------------------
     p.add_argument('--epochs', type=int, default=60)
-    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--batch_size', type=int, default=8,
+                   help='MICRO-batch size (scenes per forward pass). The '
+                        'effective batch is --batch_size x --accum_steps.')
+    p.add_argument('--accum_steps', type=int, default=1,
+                   help='Gradient accumulation: number of micro-batches per '
+                        'optimizer step. Use it to keep the recipe effective '
+                        'batch of 8 on a GPU that cannot hold it in one pass '
+                        '(e.g. --batch_size 2 --accum_steps 4). The LR '
+                        'schedule counts optimizer steps, so it is unchanged.')
     p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--prefetch_factor', type=int, default=2,
+                   help='Batches each worker prefetches. In-flight host memory '
+                        'is roughly num_workers x prefetch_factor x batch_size '
+                        'x 36 MB (K=10 at 512x512), and it passes through '
+                        '/dev/shm — raise only if data-wait is nonzero AND '
+                        'shm has room. Ignored when --num_workers 0.')
+    p.add_argument('--max_vram_gib', type=float, default=0.0,
+                   help='Hard cap on CUDA memory for this process (0 = no '
+                        'cap). Allocations beyond it raise OOM instead of '
+                        'consuming the whole card — worth setting on a GPU '
+                        'that also drives a display, where an uncapped run can '
+                        'take down the desktop session.')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=0.05)
     p.add_argument('--warmup_epochs', type=float, default=5.0)
@@ -312,6 +415,17 @@ def export_for_inference(ckpt_dir: str) -> str | None:
 def main():
     args = build_argparser().parse_args()
 
+    # Read by the caching allocator on its first allocation (which has not
+    # happened yet), so setting it here still takes effect. Expandable segments
+    # let the allocator grow a block instead of stranding memory in the wrong
+    # size class — the usual cause of an OOM while `nvidia-smi` still shows
+    # free VRAM. `setdefault` keeps an explicit env override authoritative.
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+    # Same rationale as in `_seed_worker`, for the --num_workers 0 path where
+    # loading runs in this process.
+    cv2.setNumThreads(0)
+
     # Smoke-test configurations
     if args.smoke_test:
         args.epochs = min(args.epochs, args.smoke_epochs)
@@ -337,13 +451,30 @@ def main():
 
     print(f'[TRAIN] Device = {device}  Session = {args.session_name}')
     print(f'[TRAIN] Dataset = mixed (hdlong + PolarPS) | Automatic Mixed Precision (AMP) = {args.amp_dtype}  '
-          f'Epochs = {args.epochs} | Batch size = {args.batch_size}  K=10')
+          f'Epochs = {args.epochs} | Batch size = {args.batch_size} '
+          f'x {max(1, args.accum_steps)} accum '
+          f'(effective {args.batch_size * max(1, args.accum_steps)})  K=10')
+    print(f'[TRAIN] DataLoader workers = {args.num_workers} | '
+          f'prefetch_factor = {args.prefetch_factor}')
     print(f'[TRAIN] Log directory = {log_dir} | Checkpoint directory = {ckpt_dir}')
     if torch.cuda.is_available():
         gpu_props = torch.cuda.get_device_properties(0)
+        total_gib = gpu_props.total_memory / 2**30
         print(f'[TRAIN] GPU = {torch.cuda.get_device_name(0)} | '
-              f'Memory = {gpu_props.total_memory / 2**30:.1f} GiB | '
+              f'Memory = {total_gib:.1f} GiB | '
               f'Capability = {gpu_props.major}.{gpu_props.minor}')
+        if args.max_vram_gib > 0:
+            # set_per_process_memory_fraction takes a fraction of TOTAL VRAM,
+            # counting only this process's allocations — memory already held by
+            # other processes (a desktop compositor, another job) is not
+            # deducted, so leave headroom when choosing the cap.
+            fraction = min(max(args.max_vram_gib / total_gib, 0.0), 1.0)
+            torch.cuda.set_per_process_memory_fraction(fraction, 0)
+            print(f'[TRAIN] VRAM cap = {args.max_vram_gib:.1f} GiB '
+                  f'({fraction:.1%} of the card); allocations past it raise OOM.')
+    if args.log_memory:
+        print('[TRAIN] Resource logging ENABLED (--log_memory): peak CUDA '
+              'memory, host RSS, and DataLoader wait time per record.')
 
     # Seeded generator makes the train shuffle order reproducible; combined
     # with _seed_worker (numpy in workers) the whole loader stream is fixed.
@@ -353,12 +484,22 @@ def main():
     # Deterministic scene-level splits of the mixed PolarPS/hdlong-complexv1 pool 
     # produces train (augmented), held-out val (drives best.pt), and held-out test (final report).
     train_set, val_set, test_set = build_mixed_split(args)
+
+    def _worker_kwargs(n_workers):
+        """DataLoader worker options. `prefetch_factor` is only a legal
+        argument when workers exist (torch raises otherwise)."""
+        if n_workers <= 0:
+            return {'num_workers': 0}
+        return {'num_workers': n_workers,
+                'prefetch_factor': max(1, args.prefetch_factor)}
+
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=(device.type == 'cuda'),
+        pin_memory=(device.type == 'cuda'),
         drop_last=True, collate_fn=_collate,
         persistent_workers=(args.num_workers > 0),
         worker_init_fn=_seed_worker, generator=loader_gen,
+        **_worker_kwargs(args.num_workers),
     )
 
     # Validation set drives best.pt and test set is the final report, so neither may be empty.
@@ -377,10 +518,10 @@ def main():
 
     val_loader = torch.utils.data.DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=max(1, args.num_workers // 2),
         pin_memory=(device.type == 'cuda'),
         drop_last=False, collate_fn=_collate,
         worker_init_fn=_seed_worker, generator=loader_gen,
+        **_worker_kwargs(max(1, args.num_workers // 2)),
     )
 
     # Test eval: a deterministic multi-trial wrapper over the test scenes (unbiased).
@@ -389,15 +530,26 @@ def main():
                                      n_trials=args.test_trials, seed=args.seed)
     test_loader = torch.utils.data.DataLoader(
         test_eval_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=max(1, args.num_workers // 2),
         pin_memory=(device.type == 'cuda'),
         drop_last=False, collate_fn=_collate,
         worker_init_fn=_seed_worker, generator=loader_gen,
+        **_worker_kwargs(max(1, args.num_workers // 2)),
     )
 
-    steps_per_epoch = max(1, len(train_loader))
+    # The scheduler and every *_every counter run on OPTIMIZER steps, so with
+    # accumulation they must be derived from the micro-batch count, not from
+    # len(train_loader). ceil, because `flush_accum` applies the short trailing
+    # cycle at each epoch boundary rather than dropping it.
+    accum_steps = max(1, args.accum_steps)
+    micro_per_epoch = max(1, len(train_loader))
+    steps_per_epoch = max(1, math.ceil(micro_per_epoch / accum_steps))
     total_steps = steps_per_epoch * args.epochs
-    print(f'[TRAIN] steps_per_epoch = {steps_per_epoch:,} | total_steps = {total_steps:,}')
+    print(f'[TRAIN] scenes: train = {len(train_set):,} | val = {len(val_set):,} | '
+          f'test = {len(test_set):,} (x{args.test_trials} trials)')
+    print(f'[TRAIN] micro-batches/epoch = {micro_per_epoch:,} | '
+          f'optimizer steps/epoch = {steps_per_epoch:,} | '
+          f'total steps = {total_steps:,} | '
+          f'effective batch = {args.batch_size * accum_steps}')
 
     trainer = Trainer(args, device, total_steps=total_steps,
                        steps_per_epoch=steps_per_epoch)
@@ -415,27 +567,51 @@ def main():
     best_path = os.path.join(ckpt_dir, 'best.pt')
     epochs_no_improve = 0   # consecutive validation checks without improvement
     stopped_early = False
+    # Run-wide high-water marks, carried across the per-epoch peak resets.
+    run_peak = {'mem_peak_gib': 0.0, 'mem_reserved_peak_gib': 0.0,
+                'host_rss_gib': 0.0}
     t0 = time.time()
     for epoch in range(args.epochs):
         epoch_t0 = time.time()
         epoch_running = {}
+        last_ckpt_step = -1
+        # Peak memory is a high-water mark: reset it per epoch so each summary
+        # reports THIS epoch's peak rather than the run's.
+        if args.log_memory and device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        # Wall clock at the end of the previous iteration; the gap to the top of
+        # the next one is time spent blocked on the loader (see data_wait_sec).
+        iter_end = time.time()
         for it, batch in enumerate(train_loader):
+            data_wait = time.time() - iter_end
             step_t0 = time.time()
-            log = trainer.train_step(batch) # MSE, MAE, lr, and grad_norm
+            log = trainer.train_step(batch)  # MSE, MAE (+ lr, grad_norm on steps)
             step_dt = time.time() - step_t0
+            stepped = bool(log.pop('stepped', True))
 
             scalar_log = {k: _to_scalar(v) for k, v in log.items()}
             scalar_log['step_sec'] = step_dt
             scalar_log['epoch'] = epoch
             scalar_log['it'] = it
             scalar_log['global_step'] = trainer.global_step
+            if args.log_memory:
+                # data_wait_sec ~ 0 => the loader keeps up and more workers buy
+                # nothing; a large fraction of step_sec => input-bound, so raise
+                # --num_workers / --prefetch_factor or move the data off a slow
+                # disk. step_sec alone cannot tell these apart.
+                scalar_log['data_wait_sec'] = data_wait
+                scalar_log['host_rss_gib'] = _host_rss_gib()
+                scalar_log.update(_gpu_mem_stats(device))
 
             for k, v in scalar_log.items():
                 if isinstance(v, float):
-                    # Only MSE, MAE, lr, and grad_norm
+                    # MSE, MAE, lr, grad_norm (+ resource fields if enabled)
                     epoch_running.setdefault(k, []).append(v)
 
-            if trainer.global_step % args.log_every == 0 or it == 0:
+            # Log on optimizer-step boundaries only: mid-cycle micro-batches
+            # share a global_step, so an unguarded modulo would emit a burst of
+            # near-duplicate records for every logged step.
+            if (stepped and trainer.global_step % args.log_every == 0) or it == 0:
                 elapsed = time.time() - t0
                 head = (f'[STEP {trainer.global_step}/{total_steps}] '
                         f'epoch={epoch} | it={it} | elapsed={elapsed:.1f}s')
@@ -443,9 +619,22 @@ def main():
                 train_logger.write(scalar_log, text=text)
                 print(text)
 
-            if args.ckpt_every > 0 and trainer.global_step % args.ckpt_every == 0:
+            # `stepped` guards against re-saving the same step for every
+            # micro-batch of an accumulation cycle.
+            if (args.ckpt_every > 0 and stepped
+                    and trainer.global_step % args.ckpt_every == 0
+                    and trainer.global_step != last_ckpt_step):
+                last_ckpt_step = trainer.global_step
                 path = trainer.save(ckpt_dir, tag=f'step_{trainer.global_step}')
                 print(f'[CHECKPOINT] Step checkpoint saved {path}')
+
+            iter_end = time.time()
+
+        # Apply a short trailing accumulation cycle so the epoch's last
+        # micro-batches are not discarded by the next cycle's zero_grad.
+        if trainer.flush_accum() is not None:
+            print(f'[TRAIN] epoch {epoch}: flushed a partial accumulation cycle '
+                  f'({micro_per_epoch % accum_steps} micro-batches).')
 
         epoch_summary = {
             'kind': 'epoch_summary',
@@ -457,6 +646,23 @@ def main():
             if vals:
                 # Average MAE, MSE, lr, and grad_norm over all training batches
                 epoch_summary[f'avg_{k}'] = float(np.mean(vals))
+        if args.log_memory:
+            # Peaks, not averages: the peak is what has to fit in VRAM, and the
+            # averaged `avg_mem_peak_gib` above understates it badly.
+            epoch_mem = _gpu_mem_stats(device)
+            epoch_mem['host_rss_gib'] = _host_rss_gib()
+            for k, v in epoch_mem.items():
+                epoch_summary[f'epoch_{k}'] = v
+                if k in run_peak:
+                    run_peak[k] = max(run_peak[k], v)
+            waits = epoch_running.get('data_wait_sec', [])
+            steps = epoch_running.get('step_sec', [])
+            if waits and steps:
+                total_wait, total_step = float(np.sum(waits)), float(np.sum(steps))
+                # The headline tuning number: share of wall time the GPU spent
+                # idle waiting for input.
+                epoch_summary['data_wait_share'] = (
+                    total_wait / max(total_wait + total_step, 1e-9))
         train_logger.write(
             epoch_summary,
             text=f'[EPOCH {epoch} DONE] ' + _format_log(epoch_summary),
@@ -530,6 +736,13 @@ def main():
     reason = 'early-stopped' if stopped_early else 'completed all epochs'
     print(f'[TRAIN] DONE ({reason}) | Final checkpoint: {final} | '
           f'best_val_loss={best_val_loss:.4f}')
+    if args.log_memory and device.type == 'cuda':
+        # Max over the per-epoch peaks (peak stats are reset each epoch).
+        # Compare against the card's capacity to see how much room is left for
+        # a larger --batch_size.
+        print(f'[MEM] run peak allocated = {run_peak["mem_peak_gib"]:.2f} GiB | '
+              f'peak reserved = {run_peak["mem_reserved_peak_gib"]:.2f} GiB | '
+              f'peak host RSS (self+workers) = {run_peak["host_rss_gib"]:.2f} GiB')
 
     # Report the final test number on the SELECTED model (best.pt, chosen by
     # val loss). Fall back to the in-memory weights only if best.pt is somehow absent (e.g. val never yielded a
