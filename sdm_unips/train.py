@@ -372,7 +372,8 @@ def run_eval_pass(trainer: Trainer,
 
 def run_test_eval(
         trainer: Trainer, test_loader: torch.utils.data.DataLoader,
-        logger: JSONLLogger, global_step: int, n_trials: int
+        logger: JSONLLogger, global_step: int, n_trials: int,
+        elapsed_sec: float | None = None,
 ) -> dict:
     """Evaluate the held-out mixed test split and return its summary.
 
@@ -389,6 +390,9 @@ def run_test_eval(
     summary['kind'] = 'test_summary'
     summary['global_step'] = global_step
     summary['n_trials'] = int(n_trials)
+    if elapsed_sec is not None:
+        # Total wall-clock for the run, up to and including the final epoch.
+        summary['elapsed_sec'] = float(elapsed_sec)
     logger.write(summary, text='[TEST] ' + _format_log(summary))
     print('[TEST SUMMARY] ' + _format_log(summary))
     return summary
@@ -683,9 +687,17 @@ def main():
             # share a global_step, so an unguarded modulo would emit a burst of
             # near-duplicate records for every logged step.
             if (stepped and trainer.global_step % args.log_every == 0) or it == 0:
-                elapsed = time.time() - t0
+                # Wall-clock since the start of training. Set here, AFTER the
+                # `epoch_running` accumulation above, deliberately: it is
+                # monotonically increasing, so an `avg_elapsed_sec` on the epoch
+                # summary would be meaningless. This is the x-axis for a
+                # convergence-vs-time plot, which `epoch_sec` cannot supply on
+                # its own (it excludes the checkpoint save and validation, so
+                # its cumulative sum under-counts).
+                scalar_log['elapsed_sec'] = time.time() - t0
                 head = (f'[STEP {trainer.global_step}/{total_steps}] '
-                        f'epoch={epoch} | it={it} | elapsed={elapsed:.1f}s')
+                        f'epoch={epoch} | it={it} | '
+                        f'elapsed={scalar_log["elapsed_sec"]:.1f}s')
                 text = head + ' | ' + _format_log(scalar_log)
                 train_logger.write(scalar_log, text=text)
                 print(text)
@@ -716,6 +728,10 @@ def main():
             'epoch': epoch,
             'global_step': trainer.global_step,
             'epoch_sec': time.time() - epoch_t0,
+            # Cumulative wall-clock since training began (this epoch's training
+            # only -- validation and the checkpoint save happen after this
+            # record is built, and land in the next epoch's figure).
+            'elapsed_sec': time.time() - t0,
             # Cumulative over the run. Read alongside `avg_grad_skipped` below
             # (this epoch's skip rate): a run can waste days at a 40% skip rate
             # without ever tripping --max_consecutive_skips.
@@ -783,6 +799,9 @@ def main():
                 avg['kind'] = 'val_summary'
                 avg['epoch'] = epoch
                 avg['global_step'] = trainer.global_step
+                # Wall-clock at this validation point: the x-axis for a
+                # convergence-vs-time comparison between model variants.
+                avg['elapsed_sec'] = time.time() - t0
                 train_logger.write(
                     avg,
                     text=f'[VAL EPOCH {epoch}] ' + _format_log(avg),
@@ -876,7 +895,8 @@ def main():
     np.random.seed(args.seed)
     summary = run_test_eval(trainer, test_loader, eval_logger,
                             global_step=trainer.global_step,
-                            n_trials=args.test_trials)
+                            n_trials=args.test_trials,
+                            elapsed_sec=time.time() - t0)
     if summary:
         print(f'[TRAIN] Final held-out test (avg of {args.test_trials} trials) | '
               f'mae={summary.get("test_mae_deg", float("nan")):.4f} | '

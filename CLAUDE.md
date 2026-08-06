@@ -226,6 +226,21 @@ The dedicated `normal/` subdirectory is required because `builder.load_models` g
 
 Logs land in `<session>/logs/`:
 - `train.jsonl` / `train.log`  — per-step loss, MAE, LR, grad norm, step seconds; per-epoch and per-validation summaries
+
+`elapsed_sec` (wall-clock since training began) is carried on every step
+record, epoch summary, validation summary and the final test summary. It is
+the x-axis for a convergence-vs-time comparison between model variants, which
+`epoch_sec` cannot supply on its own: `epoch_sec` is measured before the
+checkpoint save and the validation pass, so its cumulative sum under-counts
+real elapsed time. Deliberately *not* accumulated into the per-epoch averages
+(a mean of a monotonically increasing quantity is meaningless).
+
+For an A/B convergence comparison, note that `avg_loss` / `avg_mae_deg` on the
+epoch summary are computed on each model's **own** sampled pixels and are
+therefore *not* comparable across variants — use them as per-run diagnostics
+only. `val_*` and `test_*` are the cross-variant-valid metrics (see the A/B
+fairness contract above). Run comparison runs with `--patience 0` so both
+curves span the full `--epochs`.
 - `eval.jsonl` / `eval.log`    — the single final held-out test summary (mean loss + MAE)
 - `config.json`                — frozen CLI arguments for the run
 
