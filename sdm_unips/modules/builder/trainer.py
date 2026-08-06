@@ -33,6 +33,7 @@ un-accumulated run at the same effective batch size.
 import glob
 import math
 import os
+from collections import deque
 from contextlib import nullcontext
 
 import torch
@@ -40,6 +41,26 @@ import torch
 from modules.model import model
 from modules.model.model_utils import loadmodel, mode_change, get_n_params
 from modules.loss import losses
+
+
+class NonFiniteGradientAbort(RuntimeError):
+    """Too many optimizer steps were skipped for non-finite gradients.
+
+    Skipping a bad step protects the weights, but a model that never steps
+    never learns, and across a multi-day run that failure is *silent*: the loss
+    curve of a model receiving no updates looks like a model that has plateaued.
+    This aborts instead, so the run dies loudly and early rather than burning
+    days producing nothing.
+
+    Two independent guards raise it, because neither subsumes the other:
+
+    * `--max_consecutive_skips` — an unbroken run of skips. Fast to trip, so it
+      catches a hard breakage within seconds.
+    * `--max_skip_rate` over `--skip_rate_window` — the fraction of recent steps
+      skipped. Catches the case the consecutive counter is blind to: an
+      intermittent failure (say every other batch) that halves the effective
+      training run without ever producing two skips in a row.
+    """
 
 
 def _step_decay_with_warmup(optimizer, warmup_steps, steps_per_epoch,
@@ -121,11 +142,32 @@ class Trainer:
                   f'batch_size {args.batch_size} => effective batch '
                   f'{self.accum_steps * args.batch_size}')
         self._nan_reported = False
+        self._grad_nan_reported = False
+        # Non-finite-gradient skip policy (see `_note_skip` / `_check_skip_rate`).
+        self.max_consecutive_skips = int(getattr(args, 'max_consecutive_skips', 20))
+        self.max_skip_rate = float(getattr(args, 'max_skip_rate', 0.3))
+        self.skip_rate_window = max(1, int(getattr(args, 'skip_rate_window', 200)))
+        self.skipped_steps = 0        # cumulative over the run
+        self._consecutive_skips = 0
+        # Rolling 0/1 record of the last `skip_rate_window` OPTIMIZER steps. The
+        # rate guard stays disarmed until this is full, which doubles as the
+        # grace period: without it a single skip among the first two steps would
+        # read as a 50% rate and abort a healthy run instantly.
+        self._skip_window = deque(maxlen=self.skip_rate_window)
+        guards = []
+        if self.max_consecutive_skips > 0:
+            guards.append(f'{self.max_consecutive_skips} consecutive')
+        if self.max_skip_rate > 0:
+            guards.append(f'>{self.max_skip_rate:.0%} of the last '
+                          f'{self.skip_rate_window} steps')
+        print('[Trainer] Non-finite gradients skip the optimizer step; abort on '
+              + (' or '.join(guards) if guards else 'NOTHING (both guards disabled)'))
         self.detect_anomaly = bool(getattr(args, 'detect_anomaly', False))
         if self.detect_anomaly:
             print('[Trainer] torch.autograd anomaly detection ENABLED '
                   '(slow; raises at the first NaN/Inf op).')
             self._install_forward_nan_hooks()
+            self._install_grad_nan_hooks()
 
     def _install_forward_nan_hooks(self):
         """Print the FIRST leaf module whose forward output goes non-finite.
@@ -167,6 +209,170 @@ class Trainer:
                 module.register_forward_hook(make_hook(name))
                 n += 1
         print(f'[Trainer] forward NaN hooks installed on {n} leaf modules.')
+
+    def _install_grad_nan_hooks(self):
+        """Name the FIRST parameter whose gradient goes non-finite, in true
+        BACKWARD execution order.
+
+        `_report_bad_grads` below infers the origin from registration order,
+        which is only a proxy for the backward topology (the net is a DAG —
+        encoder, aggregation and regressor with skip paths — not a chain).
+        These per-parameter hooks fire exactly when each gradient is produced,
+        so the first one to see a non-finite value *is* the origin, with no
+        ordering assumption at all. One `isfinite` per parameter per step is far
+        too expensive to leave on, hence --detect_anomaly only.
+        """
+        self._grad_hook_nan_found = False
+
+        def make_hook(name):
+            def hook(grad):
+                if self._grad_hook_nan_found or torch.isfinite(grad).all():
+                    return grad
+                self._grad_hook_nan_found = True
+                print(f'[grad-nan] FIRST non-finite gradient in BACKWARD order: '
+                      f'{name}  ({int(torch.isnan(grad).sum())} NaN, '
+                      f'{int(torch.isinf(grad).sum())} Inf of {grad.numel()})')
+                print('[grad-nan] => created by the backward of an op between '
+                      'this parameter and the loss; every parameter reported '
+                      'after this one is downstream contamination.')
+                return grad
+            return hook
+
+        n = 0
+        for name, p in self.net.named_parameters():
+            if p.requires_grad:
+                p.register_hook(make_hook(name))
+                n += 1
+        print(f'[Trainer] gradient NaN hooks installed on {n} parameters.')
+
+    def _report_bad_grads(self, grad_norm):
+        """Localize a non-finite GRADIENT, called *before* the optimizer step.
+
+        Backward runs loss -> input, so a NaN born in some module's backward
+        contaminates every parameter UPSTREAM of it (earlier in the forward) and
+        leaves everything downstream — already differentiated — clean.
+        `named_parameters()` yields registration order, which follows the
+        forward, so the contaminated region ENDS at the origin. The old
+        `bad_params[:3]` printed the other end of that region, which is why it
+        always named the ConvNeXt stem regardless of where the NaN came from.
+        """
+        if self._grad_nan_reported:
+            return
+        self._grad_nan_reported = True
+        self._nan_reported = True   # suppress the redundant post-hoc weight scan
+
+        print(f'[grad-nan] non-finite gradient before optimizer step '
+              f'{self.global_step + 1} (total_norm={float(grad_norm):.4g}); '
+              'reported BEFORE the step, so the weights are still clean.')
+
+        stats = []   # (name, n_bad, numel, norm of the finite part)
+        for name, p in self.net.named_parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            finite = torch.isfinite(g)
+            gn = float(g[finite].norm()) if bool(finite.any()) else float('nan')
+            stats.append((name, int((~finite).sum()), g.numel(), gn))
+
+        bad = [s for s in stats if s[1] > 0]
+        if not bad:
+            # clip_grad_norm_ sums squares across all tensors; that sum can
+            # overflow to +Inf while every individual tensor is finite.
+            print('[grad-nan] every individual grad tensor is finite — the '
+                  'TOTAL norm overflowed while accumulating them. Largest '
+                  'per-tensor grad norms:')
+            for name, _, _, gn in sorted(stats, key=lambda s: -s[3])[:5]:
+                print(f'[grad-nan]   {name}: |g|={gn:.4g}')
+            return
+
+        print(f'[grad-nan] {len(bad)}/{len(stats)} grad tensors non-finite.')
+        print('[grad-nan] nearest the LOSS (origin end, most informative):')
+        for name, n_bad, numel, gn in reversed(bad[-3:]):
+            print(f'[grad-nan]   {name}: {n_bad}/{numel} bad, '
+                  f'finite-part |g|={gn:.4g}')
+
+        names = [s[0] for s in stats]
+        clean_after = [s for s in stats[names.index(bad[-1][0]) + 1:] if s[1] == 0]
+        if clean_after:
+            print('[grad-nan] first CLEAN grads past that point (differentiated '
+                  'earlier in backward, so the NaN is born between these and '
+                  'the block above):')
+            for name, _, _, gn in clean_after[:3]:
+                print(f'[grad-nan]   {name}: |g|={gn:.4g}')
+        else:
+            print('[grad-nan] nothing clean past that point: the NaN is born at '
+                  'or after the LAST parameter of the network — look at the '
+                  'loss and the unit-normalization in Net._decode_pixels.')
+
+        # A total wipeout still says something if it is broken down by stage.
+        by_mod = {}
+        for name, n_bad, _, _ in stats:
+            top = '.'.join(name.split('.')[:2])
+            b, t = by_mod.get(top, (0, 0))
+            by_mod[top] = (b + (1 if n_bad else 0), t + 1)
+        print('[grad-nan] per-submodule bad/total: '
+              + '  '.join(f'{k}={b}/{t}' for k, (b, t) in by_mod.items()))
+        if not self.detect_anomaly:
+            print('[grad-nan] re-run with --detect_anomaly for the exact '
+                  'backward-order origin and the raising op.')
+
+    def _note_skip(self, grad_norm):
+        """Record a skipped optimizer step; abort if they run consecutively.
+
+        One line per skip, deliberately: a run that skips 40% of its steps
+        without ever hitting the consecutive threshold is still broken, and the
+        only way to see that in a log read days later is for every skip to leave
+        a mark. `avg_grad_skipped` on each epoch summary is the same signal
+        aggregated (0.0 = healthy, 1.0 = nothing learned this epoch).
+        """
+        self.skipped_steps += 1
+        self._consecutive_skips += 1
+        # Rolling rate so far — reported even while the window is still filling,
+        # so a bad start is visible before the guard is armed to act on it.
+        seen = len(self._skip_window)
+        rate = (sum(self._skip_window) / seen) if seen else 0.0
+        print(f'[grad-skip] step {self.global_step + 1}: non-finite gradient '
+              f'(total_norm={float(grad_norm):.4g}) — optimizer step SKIPPED  '
+              f'[consecutive={self._consecutive_skips}'
+              f'/{self.max_consecutive_skips or "off"}  '
+              f'rate={rate:.1%} of last {seen}/{self.skip_rate_window}  '
+              f'total={self.skipped_steps}]')
+        if (self.max_consecutive_skips > 0
+                and self._consecutive_skips >= self.max_consecutive_skips):
+            raise NonFiniteGradientAbort(
+                f'{self._consecutive_skips} consecutive optimizer steps skipped '
+                f'for non-finite gradients (limit --max_consecutive_skips='
+                f'{self.max_consecutive_skips}); the model has received no '
+                f'update in that span, so training is aborting rather than '
+                f'silently learning nothing. See the [grad-nan] report above '
+                f'for the origin, and re-run with --detect_anomaly to get the '
+                f'exact op. Weights were never corrupted (the bad steps were '
+                f'skipped), so the last checkpoint is sound.')
+
+    def _check_skip_rate(self):
+        """Abort on a sustained skip *rate*, which the consecutive counter misses.
+
+        An intermittent failure — every other batch, say — never produces two
+        skips in a row, so `--max_consecutive_skips` never fires while half the
+        run silently evaporates. This measures a rolling window instead, and
+        stays disarmed until that window is full so the noisy opening steps
+        (and fp16's scale calibration) cannot trip it.
+        """
+        if self.max_skip_rate <= 0 or len(self._skip_window) < self.skip_rate_window:
+            return
+        rate = sum(self._skip_window) / self.skip_rate_window
+        if rate <= self.max_skip_rate:
+            return
+        raise NonFiniteGradientAbort(
+            f'{rate:.1%} of the last {self.skip_rate_window} optimizer steps '
+            f'were skipped for non-finite gradients, over the limit '
+            f'--max_skip_rate={self.max_skip_rate:.1%}; the run is only '
+            f'training at {1.0 - rate:.0%} of its nominal rate and the LR '
+            f'schedule has advanced regardless, so it is aborting rather than '
+            f'silently under-training. This guard is deliberately separate from '
+            f'--max_consecutive_skips: an intermittent NaN never trips a '
+            f'consecutive counter. See the [grad-nan] report for the origin. '
+            f'Weights were never corrupted, so the last checkpoint is sound.')
 
     def _autocast(self):
         if not self.amp_enabled:
@@ -222,11 +428,22 @@ class Trainer:
         # Scan parameters: NaN weights mean a PREVIOUS backward/step corrupted
         # the model (e.g. an exploding/NaN gradient), so the current forward NaNs
         # even with clean inputs. Clean weights + NaN loss => pure forward issue.
+        all_params = [name for name, _ in self.net.named_parameters()]
         bad_params = [name for name, p in self.net.named_parameters()
                       if not torch.isfinite(p).all()]
         if bad_params:
-            print(f'[nan-debug] {len(bad_params)} parameter tensors are NaN/Inf, '
-                  f'e.g. {bad_params[:3]}')
+            # Print the end of the contaminated region NEAREST THE LOSS, not
+            # `bad_params[:3]`: that is registration order, so the first entries
+            # are always the ConvNeXt stem no matter where the NaN came from.
+            # Weight corruption still can't localize as well as `_report_bad_grads`,
+            # which fires one step earlier on the gradients themselves.
+            print(f'[nan-debug] {len(bad_params)}/{len(all_params)} parameter '
+                  f'tensors are NaN/Inf; nearest the loss: {bad_params[-3:][::-1]}')
+            if len(bad_params) == len(all_params):
+                print('[nan-debug] EVERY parameter is corrupted — this is at '
+                      'least one optimizer step downstream of the origin, so '
+                      'these names carry no information about where it started. '
+                      'The `[grad-nan]` report from the failing step does.')
         if any_input_bad:
             print('[nan-debug] => NaN/Inf is in the INPUT data (loader bug), '
                   'not the forward pass.')
@@ -250,16 +467,56 @@ class Trainer:
         if self.amp_dtype == 'fp16':
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
-            self.scaler.step(self.optimizer)
+            # Post-unscale_, so this is the true gradient norm — the same test
+            # GradScaler applies internally to decide whether to skip. A handful
+            # of consecutive skips is NORMAL here at startup while the scale
+            # calibrates down from 65536, which is why the abort threshold is
+            # generous. No detailed [grad-nan] report: under loss scaling an
+            # overflow is a scale problem, not a numerics bug.
+            skipped = not bool(torch.isfinite(grad_norm))
+            if skipped:
+                self._note_skip(grad_norm)
+            self.scaler.step(self.optimizer)   # itself a no-op when non-finite
             self.scaler.update()
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
-            self.optimizer.step()
+            # Check BEFORE stepping. `optimizer.step()` with a NaN gradient
+            # writes NaN into that parameter, the next forward spreads it
+            # through every activation, and one step later all 373 tensors are
+            # non-finite — which is why a post-hoc weight scan could only ever
+            # report "everything is broken" and name whichever parameter was
+            # registered first. Clipping cannot rescue it either: clip_grad_norm_
+            # scales by total_norm, and NaN/NaN is NaN. The isfinite() costs no
+            # extra sync — train.py already calls .item() on grad_norm to log it.
+            skipped = not bool(torch.isfinite(grad_norm))
+            if skipped:
+                self._report_bad_grads(grad_norm)   # full detail, first time only
+                self._note_skip(grad_norm)          # may raise the abort
+            else:
+                self.optimizer.step()
 
+        if not skipped:
+            self._consecutive_skips = 0
+        # Record every optimizer step, skipped or not — the window's denominator
+        # is steps *attempted*, so the rate is meaningful. `_note_skip` above may
+        # already have aborted on the consecutive guard, which is the more urgent
+        # signal and trips far sooner.
+        self._skip_window.append(1.0 if skipped else 0.0)
+        self._check_skip_rate()
+        # The scheduler advances on skipped steps too. It is parameterized by
+        # `total_steps`, so freezing it would stretch the cosine tail past the
+        # end of the run and desynchronize the LR from --epochs; this is also
+        # the standard GradScaler + LRScheduler idiom. The skipped step simply
+        # contributes no update. Gradients are not zeroed here — `train_step`
+        # does that at the head of the next accumulation cycle, so the
+        # non-finite values cannot survive into it.
         self.scheduler.step()
         self.global_step += 1
         self._micro_in_cycle = 0
         log['stepped'] = True
+        # 0.0/1.0 per optimizer step, so `avg_grad_skipped` on the epoch summary
+        # reads directly as this epoch's skip rate.
+        log['grad_skipped'] = float(skipped)
         log['lr'] = self.optimizer.param_groups[0]['lr']
         log['grad_norm'] = (grad_norm.detach() if torch.is_tensor(grad_norm)
                             else float(grad_norm))

@@ -63,7 +63,9 @@ import torch
 sys.path.append('..')
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from modules.builder.trainer import Trainer, prune_checkpoints
+from modules.builder.trainer import (
+    NonFiniteGradientAbort, Trainer, prune_checkpoints,
+)
 from modules.io.dataloader.mixed import build_mixed_split, MixedEvalDataset
 
 
@@ -237,6 +239,23 @@ def build_argparser():
     p.add_argument('--lr_decay_every', type=int, default=10)
     p.add_argument('--lr_decay_gamma', type=float, default=0.8)
     p.add_argument('--grad_clip', type=float, default=1.0)
+    p.add_argument('--max_consecutive_skips', type=int, default=20,
+                   help='A non-finite gradient skips the optimizer step instead '
+                        'of corrupting the weights with it; abort once this many '
+                        'consecutive steps have been skipped, since a model that '
+                        'never steps never learns and that failure is otherwise '
+                        'silent. 0 disables this guard (skipping still happens).')
+    p.add_argument('--max_skip_rate', type=float, default=0.3,
+                   help='Second, independent abort guard: the fraction of the '
+                        'last --skip_rate_window optimizer steps that may be '
+                        'skipped for non-finite gradients. Catches what a '
+                        'consecutive counter cannot — an intermittent NaN that '
+                        'halves the effective run without ever skipping twice in '
+                        'a row. 0 disables.')
+    p.add_argument('--skip_rate_window', type=int, default=200,
+                   help='Optimizer steps in the --max_skip_rate rolling window. '
+                        'The guard stays disarmed until the window is full, so '
+                        'this doubles as its grace period.')
     p.add_argument('--amp', action='store_true',
                    help='Legacy alias: equivalent to --amp_dtype fp16')
     p.add_argument('--amp_dtype', default='bf16', choices=['bf16', 'fp16', 'none'])
@@ -578,6 +597,21 @@ def main():
     # to provide. Sync explicitly while profiling; skip it otherwise, since a
     # per-step sync costs real throughput in a production run.
     profile_sync = args.log_memory and device.type == 'cuda'
+
+    def _log_abort(exc, epoch):
+        """Record a non-finite-gradient abort in train.jsonl, then re-raise.
+
+        The exception alone would only reach stderr; after a multi-day run the
+        log files are what actually gets read, so the reason has to be in there
+        next to the last healthy step.
+        """
+        train_logger.write(
+            {'kind': 'abort', 'epoch': epoch,
+             'global_step': trainer.global_step,
+             'skipped_steps': trainer.skipped_steps, 'reason': str(exc)},
+            text=f'[ABORT] epoch {epoch}, step {trainer.global_step}: {exc}')
+        raise exc
+
     t0 = time.time()
     for epoch in range(args.epochs):
         epoch_t0 = time.time()
@@ -593,7 +627,10 @@ def main():
         for it, batch in enumerate(train_loader):
             data_wait = time.time() - iter_end
             step_t0 = time.time()
-            log = trainer.train_step(batch)  # MSE, MAE (+ lr, grad_norm on steps)
+            try:
+                log = trainer.train_step(batch)  # MSE, MAE (+ lr, grad_norm on steps)
+            except NonFiniteGradientAbort as exc:
+                _log_abort(exc, epoch)
             if profile_sync:
                 torch.cuda.synchronize()
             step_dt = time.time() - step_t0
@@ -642,7 +679,11 @@ def main():
 
         # Apply a short trailing accumulation cycle so the epoch's last
         # micro-batches are not discarded by the next cycle's zero_grad.
-        if trainer.flush_accum() is not None:
+        try:
+            flushed = trainer.flush_accum()
+        except NonFiniteGradientAbort as exc:
+            _log_abort(exc, epoch)
+        if flushed is not None:
             print(f'[TRAIN] epoch {epoch}: flushed a partial accumulation cycle '
                   f'({micro_per_epoch % accum_steps} micro-batches).')
 
@@ -651,6 +692,10 @@ def main():
             'epoch': epoch,
             'global_step': trainer.global_step,
             'epoch_sec': time.time() - epoch_t0,
+            # Cumulative over the run. Read alongside `avg_grad_skipped` below
+            # (this epoch's skip rate): a run can waste days at a 40% skip rate
+            # without ever tripping --max_consecutive_skips.
+            'skipped_steps': trainer.skipped_steps,
         }
         for k, vals in epoch_running.items():
             if vals:

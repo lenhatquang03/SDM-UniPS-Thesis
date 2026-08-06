@@ -87,6 +87,58 @@ cosine LR schedule still spans the full `--epochs`; patience only trims the
 unproductive tail, and `best.pt` already holds the best-val weights, so
 stopping early never costs the deliverable.
 
+**Non-finite gradients (skip + abort).** A non-finite `grad_norm` **skips the
+optimizer step** rather than writing NaN into the weights — the same policy
+`GradScaler` applies for fp16, extended to bf16/none where nothing else
+provides it. Clipping cannot substitute: `clip_grad_norm_` scales by
+`total_norm`, and `NaN/NaN` is `NaN`. The scheduler and `global_step` still
+advance on a skipped step, so the LR schedule stays aligned with
+`--epochs`; gradients are cleared by the next accumulation cycle's
+`zero_grad`.
+
+Because a model that never steps never learns — and its loss curve is
+indistinguishable from one that has plateaued — **two independent guards**
+abort the run with `NonFiniteGradientAbort`. Neither subsumes the other:
+
+- `--max_consecutive_skips` (default 20, 0 disables) — an unbroken run of
+  skips. Trips within seconds of a hard breakage. The default is generous
+  because fp16 legitimately skips a handful of steps at startup while
+  `GradScaler` calibrates its scale down from 65536.
+- `--max_skip_rate` (default 0.3, 0 disables) over `--skip_rate_window`
+  (default 200 optimizer steps) — the fraction of *recent* steps skipped,
+  compared strictly (`>`), so exactly 30% does not fire. This catches what a
+  consecutive counter is blind to: an intermittent NaN that halves the
+  effective run without ever skipping twice in a row. The window is rolling,
+  not cumulative, so a bad patch that genuinely recovers ages out, and a
+  mid-run degradation is caught rather than diluted by earlier healthy steps.
+  It stays **disarmed until the window is full**, which doubles as its grace
+  period — otherwise one skip in the first two steps would read as 50%.
+
+On a hard breakage the consecutive guard fires first by construction (20 steps
+vs a 200-step window). The abort is written to `train.jsonl` as
+`{"kind": "abort", ...}` before it propagates. Weights are never corrupted by a
+skipped step, so the last checkpoint is always sound.
+
+Every skip also prints a `[grad-skip]` line carrying the consecutive count and
+the rolling rate, and each epoch summary carries **`avg_grad_skipped`** (that
+epoch's skip rate, 0.0 = healthy, 1.0 = nothing learned) plus cumulative
+`skipped_steps`. Check `avg_grad_skipped` before trusting a loss curve: a run
+sitting just under `--max_skip_rate` never aborts but is still training at a
+fraction of its nominal rate, with the LR schedule advancing regardless.
+
+**Diagnosing where a NaN came from.** `Trainer._report_bad_grads` fires once,
+on the first non-finite gradient, *before* the optimizer step. Backward runs
+loss → input, so a NaN contaminates every parameter **upstream** of its origin
+and leaves everything downstream clean; `named_parameters()` is registration
+(forward) order, so the contaminated region **ends** at the origin. The report
+prints that end, the first clean gradients past it, and a per-submodule
+`bad/total` breakdown. `--detect_anomaly` additionally installs per-parameter
+backward hooks that name the first non-finite gradient in true backward order
+(no ordering assumption), alongside the existing forward hooks and
+`torch.autograd.detect_anomaly`. Note that a **post-hoc weight** scan cannot
+localize anything: one optimizer step after the origin, every parameter is
+NaN.
+
 **Reproducibility:** a run is reproducible for a fixed config — all RNGs are
 seeded from `--seed` (python/numpy/torch/cuda), cuDNN is pinned to
 deterministic kernels, and the DataLoaders seed their workers' numpy RNG
@@ -127,6 +179,8 @@ and their MAE is averaged with a scene-count-weighted (unbiased) mean.
 - `--warmup_epochs`: 5.0 (linear)
 - `--amp_dtype`: `bf16` (recommended on H100), `fp16` (legacy), or `none`
 - `--grad_clip`: 1.0
+- `--max_consecutive_skips`: 20 — `--max_skip_rate`: 0.3 over
+  `--skip_rate_window`: 200 (either 0 disables that guard) — see below
 - `--keep_last`: 3 (epoch checkpoints to retain; `best.pt` is kept separately)
 - `--resume`: warm-start from a `*.pytmodel` or `*.pt` checkpoint dir
 - `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
