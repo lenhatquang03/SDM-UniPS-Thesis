@@ -336,47 +336,56 @@ class JSONLLogger:
 # ---------------------------------------------------------------------------
 # Held-out test evaluation
 # ---------------------------------------------------------------------------
-def run_test_eval(
-        trainer: Trainer, test_loader: torch.utils.data.DataLoader, 
-        logger: JSONLLogger, global_step: int, n_trials: int
-) -> dict:
-    """Evaluate the held-out mixed test split and return its summary.
+def run_eval_pass(trainer: Trainer,
+                  loader: torch.utils.data.DataLoader) -> dict:
+    """Sweep an evaluation loader and return scene-count-weighted mean metrics.
 
-    Reuses the trainer's validation path (`val_step`), so the per-batch loss
-    and MAE are the same quantities the validation loop reports. The loader is
-    `MixedEvalDataset`, whose length is `n_scenes * n_trials`; a single sweep
-    therefore averages every scene over `n_trials` deterministic trials.
+    Used by BOTH the per-epoch validation and the final test report, so the two
+    numbers are the same estimator and are directly comparable.
 
-    Note the *aggregation* differs from the validation loop, so the two
-    headline numbers are close but not identical estimators:
+    Weighting by scene count rather than taking a plain mean over batches
+    matters whenever the split size is not a multiple of `--batch_size`: with
+    `drop_last=False` the final batch is short, and a per-batch mean
+    over-weights it (25 scenes at `--batch_size 8` gives the lone scene in the
+    last batch a weight of 1/4 instead of 1/25). That bias is fixed within a
+    run, but it couples the metric to the batch size, which would make two runs
+    of an A/B study comparable only if they were launched with identical
+    `--batch_size`.
 
-    - here, batches are weighted by their scene count, making the mean exactly
-      the per-(scene, trial) average (unbiased) even when the last batch is
-      short; the val loop takes a plain per-batch mean, which over-weights a
-      short final batch. The two coincide only when the split size is an exact
-      multiple of `--batch_size`.
-    - here, any non-finite value is dropped (`np.isfinite`); the val loop uses
-      `np.nanmean`, which drops NaN but propagates +/-inf.
-
-    Both gaps are small (sub-percent for realistic split sizes) and neither
-    affects `best.pt` selection, since the val loop's bias is a fixed
-    reweighting of a fixed batch partition and so is consistent across epochs.
+    Non-finite values are dropped rather than propagated: `np.nanmean` drops
+    NaN but lets a single +/-inf batch poison the whole average, which would
+    silently freeze `best.pt` selection for the rest of the run.
     """
+    trainer.begin_eval_pass()
     totals = {}  # key -> [weighted_sum, weight]
-    for test_batch in test_loader:
-        batch_size = int(test_batch[0].shape[0])
-        for k, v in trainer.val_step(test_batch).items():
-            # MAE and MSE from a batch
+    for batch in loader:
+        batch_size = int(batch[0].shape[0])
+        for k, v in trainer.val_step(batch).items():
             val = _to_scalar(v)
             if not np.isfinite(val):
                 continue  # skip a non-finite batch instead of poisoning the mean
             acc = totals.setdefault(k, [0.0, 0.0])
             acc[0] += val * batch_size
             acc[1] += batch_size
-    if not totals:
+    return {k: (s / w if w > 0 else float('nan')) for k, (s, w) in totals.items()}
+
+
+def run_test_eval(
+        trainer: Trainer, test_loader: torch.utils.data.DataLoader,
+        logger: JSONLLogger, global_step: int, n_trials: int
+) -> dict:
+    """Evaluate the held-out mixed test split and return its summary.
+
+    Reuses the trainer's validation path (`val_step`) and `run_eval_pass`'s
+    aggregation, so the test number is the same quantity, aggregated the same
+    way, as the validation number. The loader is `MixedEvalDataset`, whose
+    length is `n_scenes * n_trials`; a single sweep therefore averages every
+    scene over `n_trials` deterministic trials.
+    """
+    means = run_eval_pass(trainer, test_loader)
+    if not means:
         return {}
-    summary = {f'test_{k}': (s / w if w > 0 else float('nan'))
-               for k, (s, w) in totals.items()}
+    summary = {f'test_{k}': v for k, v in means.items()}
     summary['kind'] = 'test_summary'
     summary['global_step'] = global_step
     summary['n_trials'] = int(n_trials)
@@ -535,8 +544,19 @@ def main():
             'scenes. Increase --test_fraction or provide more scenes per source.'
         )
 
+    # Validation must be the SAME measurement every epoch and every run, or a
+    # val curve conflates model progress with render noise. `MixedTrainDataset`
+    # passes rng=None to the scene loaders, which falls back to the global
+    # np.random, so the val scenes would otherwise be re-rendered (new camera,
+    # new lights, new Dirichlet mix) on every epoch. One fixed trial per scene,
+    # seeded per index, pins them. Seed base is offset from the test set's so
+    # the two never share a draw pattern.
+    val_eval_set = MixedEvalDataset(args, val_set.scenes, n_trials=1,
+                                    seed=args.seed + 5_000_011,
+                                    subset_name='MixedValEval', noun='val-eval',
+                                    announce=False)
     val_loader = torch.utils.data.DataLoader(
-        val_set, batch_size=args.batch_size, shuffle=False,
+        val_eval_set, batch_size=args.batch_size, shuffle=False,
         pin_memory=(device.type == 'cuda'),
         drop_last=False, collate_fn=_collate,
         worker_init_fn=_seed_worker, generator=loader_gen,
@@ -565,6 +585,10 @@ def main():
     total_steps = steps_per_epoch * args.epochs
     print(f'[TRAIN] scenes: train = {len(train_set):,} | val = {len(val_set):,} | '
           f'test = {len(test_set):,} (x{args.test_trials} trials)')
+    print(f'[EVAL] Held-out evaluation is model-independent: renders pinned per '
+          f'scene (val x1 trial, test x{args.test_trials}) and pixel samples '
+          f'drawn outside the network, both seeded from --seed {args.seed}. '
+          f'Two runs differing only in the model are compared on identical data.')
     print(f'[TRAIN] micro-batches/epoch = {micro_per_epoch:,} | '
           f'optimizer steps/epoch = {steps_per_epoch:,} | '
           f'total steps = {total_steps:,} | '
@@ -698,9 +722,17 @@ def main():
             'skipped_steps': trainer.skipped_steps,
         }
         for k, vals in epoch_running.items():
-            if vals:
-                # Average MAE, MSE, lr, and grad_norm over all training batches
-                epoch_summary[f'avg_{k}'] = float(np.mean(vals))
+            # Average MAE, MSE, lr, and grad_norm over all training batches,
+            # ignoring non-finite entries. A skipped step reports an inf/NaN
+            # grad_norm BY DEFINITION (that is why it was skipped), and a plain
+            # np.mean would turn one such step into an inf/NaN `avg_grad_norm`
+            # for the whole epoch. Nothing is hidden by dropping them:
+            # `avg_grad_skipped` below reports the skip rate in its own right.
+            finite = [v for v in vals if np.isfinite(v)]
+            if finite:
+                epoch_summary[f'avg_{k}'] = float(np.mean(finite))
+            if len(finite) != len(vals):
+                epoch_summary[f'nonfinite_{k}'] = len(vals) - len(finite)
         if args.log_memory:
             # Peaks, not averages: the peak is what has to fit in VRAM, and the
             # averaged `avg_mem_peak_gib` above understates it badly.
@@ -743,17 +775,11 @@ def main():
 
         # Held-out validation drives best.pt selection (lower loss = better).
         if val_loader is not None and (epoch + 1) % args.val_every_epochs == 0:
-            v_logs = []
-            for vb in val_loader:
-                # MSEs and MAEs of all validation batches 
-                v_logs.append({k: _to_scalar(v)
-                                for k, v in trainer.val_step(vb).items()})
-            if v_logs:
-                # nanmean so a single non-finite val batch (already flagged by
-                # the trainer's nan-debug guard) doesn't poison the whole average
-                # and silently block best.pt selection.
-                avg = {f'val_{k}': float(np.nanmean([d[k] for d in v_logs]))
-                       for k in v_logs[0]}
+            # Same estimator as the final test report (see run_eval_pass):
+            # scene-count-weighted, non-finite values dropped.
+            means = run_eval_pass(trainer, val_loader)
+            if means:
+                avg = {f'val_{k}': v for k, v in means.items()}
                 avg['kind'] = 'val_summary'
                 avg['epoch'] = epoch
                 avg['global_step'] = trainer.global_step
@@ -780,6 +806,18 @@ def main():
                         print(f'[EARLY STOPPING]: No val improvement '
                               f'({epochs_no_improve}/{args.patience}) | '
                               f'best_val_loss={best_val_loss:.4f}')
+            else:
+                # Every val batch was non-finite. Say so in the log rather than
+                # skipping the epoch silently, which would look identical to a
+                # validation that never ran.
+                msg = (f'[VAL EPOCH {epoch}] no finite validation metrics; '
+                       f'best.pt selection skipped for this check.')
+                print(msg)
+                train_logger.write(
+                    {'kind': 'val_summary', 'epoch': epoch,
+                     'global_step': trainer.global_step, 'status': 'no_finite_metrics'},
+                    text=msg,
+                )
 
         prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',))
 

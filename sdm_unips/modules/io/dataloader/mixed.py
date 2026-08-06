@@ -305,8 +305,21 @@ class MixedTrainDataset(data.Dataset):
 
 
 class MixedEvalDataset(MixedTrainDataset):
-    """Deterministic, multi-trial wrapper over a fixed scene list for the final
-    held-out test evaluation.
+    """Deterministic, multi-trial wrapper over a fixed scene list, used for BOTH
+    held-out evaluations.
+
+    `MixedTrainDataset` passes `rng=None` to the scene loaders, which makes them
+    fall back to the global `np.random`: `augment=False` only disables the
+    horizontal flip, so the camera, the K lights and the Dirichlet mix are still
+    re-drawn on every access. For validation that means a *different render of
+    every scene each epoch*, and the val curve then mixes model progress with
+    render noise. This wrapper pins the draw instead:
+
+    - validation (`n_trials=1`): one fixed render per scene, identical every
+      epoch, every run and every model variant.
+    - test (`n_trials=3`): each trial is a different but fixed draw, so
+      averaging them cuts the variance of the K-image draw without bias, and
+      the three draws reproduce across runs.
 
     Length = len(scenes) * n_trials. For a flat index i, the trial = i // n_scenes 
     and the scene = i % n_scenes; that scene's random camera
@@ -325,9 +338,11 @@ class MixedEvalDataset(MixedTrainDataset):
     trainer's `val_step` path consumes it unchanged.
     """
 
-    def __init__(self, args, scenes, n_trials=3, seed=42):
+    def __init__(self, args, scenes, n_trials=3, seed=42,
+                 subset_name='MixedTestEval', noun='test-eval',
+                 announce: bool=True):
         super().__init__(args, augment=False, scenes=scenes,
-                         subset_name='MixedTestEval', noun='test-eval')
+                         subset_name=subset_name, noun=noun, announce=announce)
         self.n_trials = max(1, int(n_trials))
         self.n_scenes = len(self.scenes)
         self.eval_seed = int(seed)

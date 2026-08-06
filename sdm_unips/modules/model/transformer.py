@@ -182,9 +182,22 @@ class CommunicationBlock(nn.Module):
             attn_mode = 'Normal'
         self.dim_hidden = dim_hidden
         modules_enc = []
-        modules_enc.append(SAB(dim_input, dim_hidden, num_heads, ln=ln, attention_dropout = attention_dropout, dim_feedforward=dim_feedforward, attn_mode=attn_mode))
+        # Input-projection SAB
+        modules_enc.append(
+            SAB(
+                dim_input, dim_hidden, num_heads, 
+                ln=ln, attention_dropout = attention_dropout, 
+                dim_feedforward=dim_feedforward, attn_mode=attn_mode
+            )
+        )
+        # num_enc_sab SAB blocks
         for k in range(num_enc_sab):
-            modules_enc.append(SAB(dim_hidden, dim_hidden, num_heads, ln=ln, attention_dropout = attention_dropout, dim_feedforward=dim_feedforward, attn_mode=attn_mode))
+            modules_enc.append(
+                SAB(
+                    dim_hidden, dim_hidden, num_heads, 
+                    ln=ln, attention_dropout = attention_dropout, 
+                    dim_feedforward=dim_feedforward, attn_mode=attn_mode)
+                )
         self.enc = nn.Sequential(*modules_enc)
 
     def forward(self, x):

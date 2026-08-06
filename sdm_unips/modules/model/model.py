@@ -44,7 +44,14 @@ class ImageFeatureFusion(nn.Module):
    
         for i in range(len(in_channels)):
             if self.num_comm_enc[i] > 0:
-                attn.append(transformer.CommunicationBlock(in_channels[i], num_enc_sab = self.num_comm_enc[i], dim_hidden=in_channels[i], ln=True, dim_feedforward = in_channels[i], use_efficient_attention=use_efficient_attention))
+                attn.append(
+                    transformer.CommunicationBlock(
+                        in_channels[i], num_enc_sab = self.num_comm_enc[i], 
+                        dim_hidden=in_channels[i], 
+                        ln=True, dim_feedforward = in_channels[i], 
+                        use_efficient_attention=use_efficient_attention
+                    )
+                )
         self.comm = nn.Sequential(*attn)  
     
     def forward(self, glc, nImgArray):
@@ -226,7 +233,38 @@ class Net(nn.Module):
         return x_n / norm
 
 
-    def forward(self, I, M, nImgArray, decoder_resolution, canonical_resolution, training=False):
+    def sample_train_pixels(self, valid_ids, n_sample):
+        """Choose which `n_sample` pixels a TRAINING step decodes.
+
+        This is the pixel-sampling policy under study: the thesis' Models B/C
+        replace it while everything else stays fixed. It is therefore
+        deliberately the *only* place a training sample set is chosen, and it is
+        deliberately never reached during evaluation -- `forward` takes an
+        explicit `sample_ids`, which the val/test path always supplies. Without
+        that split, a new sampler would silently change *which pixels the metric
+        is computed on*, and a "better" val curve could be nothing more than an
+        easier pixel draw.
+
+        Baseline (Model A) = uniform over the mask, as in the paper: m random
+        pixels without replacement, falling back to with-replacement only when a
+        scene holds fewer than m valid pixels.
+        """
+        if valid_ids.numel() == 0:
+            # No valid pixels: emit a placeholder; loss masking discards them.
+            return torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
+        if valid_ids.numel() >= n_sample:
+            perm = torch.randperm(valid_ids.numel(), device=valid_ids.device)
+            return valid_ids[perm[:n_sample]]
+        rep = torch.randint(0, valid_ids.numel(), (n_sample,), device=valid_ids.device)
+        return valid_ids[rep]
+
+    def forward(self, I, M, nImgArray, decoder_resolution, canonical_resolution,
+                training=False, sample_ids=None):
+        """`sample_ids`: optional [B, m] long tensor of flat pixel indices at the
+        decoder resolution. When supplied (evaluation) it overrides
+        `sample_train_pixels` entirely, so every model variant is scored on
+        exactly the same pixels; when None (training) the model picks its own.
+        """
 
         decoder_resolution = decoder_resolution[0,0].cpu().numpy().astype(np.int32).item()
         canonical_resolution = canonical_resolution[0,0].cpu().numpy().astype(np.int32).item()
@@ -264,8 +302,13 @@ class Net(nn.Module):
             glc = smoothing(glc)
 
         if training:
-            """Training path: sample exactly `pixel_samples` pixels per batch element,
-            keep gradients, return only sampled per-pixel predictions + indices.
+            """Training path: decode exactly `pixel_samples` pixels per batch
+            element, keep gradients, return only the sampled per-pixel
+            predictions plus their indices.
+
+            Which pixels: `sample_ids` when the caller supplied them
+            (evaluation -- fixed across model variants), otherwise
+            `sample_train_pixels`, the policy under study.
             """
             pred_n_list, idx_list = [], []
             p = 0
@@ -274,18 +317,12 @@ class Net(nn.Module):
                 target = range(p, p + num_imgs)
                 p = p + num_imgs
 
-                m_ = M_dec[b, :, :, :].reshape(-1, H * W).permute(1, 0)
-                valid_ids = torch.nonzero(m_ > 0, as_tuple=False)[:, 0]
-                n_sample = self.pixel_samples
-                if valid_ids.numel() == 0:
-                    # no valid pixels: emit a placeholder so loss masking discards them
-                    ids = torch.zeros(n_sample, dtype=torch.long, device=I.device)
-                elif valid_ids.numel() >= n_sample:
-                    perm = torch.randperm(valid_ids.numel(), device=valid_ids.device)
-                    ids = valid_ids[perm[:n_sample]]
+                if sample_ids is not None:
+                    ids = sample_ids[b].to(device=I.device, dtype=torch.long)
                 else:
-                    rep = torch.randint(0, valid_ids.numel(), (n_sample,), device=valid_ids.device)
-                    ids = valid_ids[rep]
+                    m_ = M_dec[b, :, :, :].reshape(-1, H * W).permute(1, 0)
+                    valid_ids = torch.nonzero(m_ > 0, as_tuple=False)[:, 0]
+                    ids = self.sample_train_pixels(valid_ids, self.pixel_samples)
 
                 X_n = self._decode_pixels(glc, I_dec, target, ids, num_imgs, H, W, C)
                 pred_n_list.append(X_n)

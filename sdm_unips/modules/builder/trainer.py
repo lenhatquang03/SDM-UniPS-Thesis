@@ -143,6 +143,11 @@ class Trainer:
                   f'{self.accum_steps * args.batch_size}')
         self._nan_reported = False
         self._grad_nan_reported = False
+        # Evaluation pixel sampling: seeded per item from this base, counter
+        # reset by `begin_eval_pass()`. Offset from --seed so it cannot collide
+        # with the dataset's own per-scene render seeds.
+        self.eval_seed = int(getattr(args, 'seed', 42)) + 10_007
+        self._eval_item = 0
         # Non-finite-gradient skip policy (see `_note_skip` / `_check_skip_rate`).
         self.max_consecutive_skips = int(getattr(args, 'max_consecutive_skips', 20))
         self.max_skip_rate = float(getattr(args, 'max_skip_rate', 0.3))
@@ -388,16 +393,69 @@ class Trainer:
         n_imgs = n_imgs.to(self.device, non_blocking=True).long().reshape(-1, 1)
         return I, N, M, n_imgs
 
-    def _forward_losses(self, batch):
+    def begin_eval_pass(self):
+        """Reset the deterministic evaluation pixel sampler.
+
+        Call once before each validation / test sweep. Pixel sets are seeded
+        from a per-item counter that restarts here, so every sweep scores the
+        same pixels as every other sweep -- across epochs, across runs, and
+        across model variants.
+        """
+        self._eval_item = 0
+
+    @torch.no_grad()
+    def _eval_sample_ids(self, M, decoder_resolution):
+        """Pick evaluation pixels OUTSIDE the model, uniformly over the mask.
+
+        This is the other half of the A/B fairness contract (see
+        `Net.sample_train_pixels`). Evaluation must never route through the
+        model's own sampler: if it did, swapping in a saliency sampler would
+        change *which pixels the metric is computed on*, and the val curves of
+        two variants would no longer be measuring the same thing.
+
+        Determinism is per *item*, not per batch: the seed is `eval_seed +
+        item_index`, and items are visited in dataset order (the eval loaders
+        use `shuffle=False`), so the draw for a given scene is independent of
+        `--batch_size`, of the worker count, and of how much RNG the training
+        loop consumed beforehand. A CPU generator is used so the draw is also
+        independent of the device.
+        """
+        M_dec = torch.nn.functional.interpolate(
+            M, size=(decoder_resolution, decoder_resolution), mode='nearest')
+        B = M_dec.shape[0]
+        HW = decoder_resolution * decoder_resolution
+        m = int(self.args.pixel_samples)
+        out = torch.zeros(B, m, dtype=torch.long, device=M_dec.device)
+        gen = torch.Generator()   # CPU: same stream regardless of device
+        for b in range(B):
+            gen.manual_seed((self.eval_seed + self._eval_item) % (2 ** 31 - 1))
+            self._eval_item += 1
+            m_ = M_dec[b, :, :, :].reshape(-1, HW).permute(1, 0)
+            valid_ids = torch.nonzero(m_ > 0, as_tuple=False)[:, 0]
+            n_valid = int(valid_ids.numel())
+            if n_valid == 0:
+                continue          # leave zeros; loss masking discards them
+            if n_valid >= m:
+                sel = torch.randperm(n_valid, generator=gen)[:m]
+            else:
+                sel = torch.randint(0, n_valid, (m,), generator=gen)
+            out[b] = valid_ids[sel.to(valid_ids.device)]
+        return out
+
+    def _forward_losses(self, batch, deterministic_eval=False):
         I, N, M, n_imgs = self._move_batch(batch)
         H = I.shape[2]
         dec_res = torch.full((I.shape[0], 1), H, dtype=torch.long, device=self.device)
         can_res = torch.full((I.shape[0], 1), self.args.canonical_resolution,
                              dtype=torch.long, device=self.device)
 
+        # Training lets the model choose (that policy is what the thesis
+        # varies); evaluation hands the model a fixed, model-independent set.
+        sample_ids = self._eval_sample_ids(M, H) if deterministic_eval else None
+
         pred_n, sample_idx, _ = self.net(
             I, M, n_imgs, decoder_resolution=dec_res,
-            canonical_resolution=can_res, training=True,
+            canonical_resolution=can_res, training=True, sample_ids=sample_ids,
         )
 
         loss = losses.normal_loss(pred_n, N, M, sample_idx)
@@ -579,9 +637,13 @@ class Trainer:
 
     @torch.no_grad()
     def val_step(self, batch):
+        """One validation / test batch, scored on model-independent pixels.
+
+        `begin_eval_pass()` must have been called at the head of the sweep.
+        """
         self.net.eval()
         with self._autocast():
-            loss, log = self._forward_losses(batch)
+            loss, log = self._forward_losses(batch, deterministic_eval=True)
         if not torch.isfinite(loss):
             self._report_nan(batch)
         return log

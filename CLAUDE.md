@@ -69,16 +69,40 @@ or early stopping never biases the headline number), and it never influences
 checkpoint selection. There is no external benchmark; DiLiGenT is no longer
 used.
 
-Test and validation report the **same quantities** (identical `val_step`
-forward + loss path) but **aggregate them differently**, so treat them as
-close-but-not-identical estimators rather than exactly comparable numbers:
-`run_test_eval` takes a scene-count-weighted mean over batches and drops any
-non-finite value, while the per-epoch val loop takes a plain per-batch
-`np.nanmean` (short final batch over-weighted; NaN dropped but `±inf`
-propagates). The two coincide exactly only when the split size is a multiple
-of `--batch_size`. Neither gap affects `best.pt` selection — the val loop's
-bias is a fixed reweighting of a fixed batch partition, hence consistent
-across epochs.
+Test and validation report the **same quantities aggregated the same way** —
+both sweep `train.py:run_eval_pass`, which takes a scene-count-weighted mean
+over batches (so a short final batch is not over-weighted, and the metric does
+not depend on `--batch_size`) and drops any non-finite value rather than
+letting one `±inf` batch poison the average and silently freeze `best.pt`
+selection. The two numbers are therefore directly comparable; they differ only
+in which scenes they cover and in the number of trials per scene.
+
+**A/B fairness contract (Models A vs B/C).** The thesis varies the *pixel
+sampler*, so the evaluation is built to be invariant to it. Two guarantees,
+each in one place:
+
+1. **Fixed evaluation pixels.** `Trainer._eval_sample_ids` draws the val/test
+   pixel set **outside the network** — uniformly over the mask, seeded per
+   *item* (`eval_seed + item_index`, CPU generator), so the draw for a given
+   scene is independent of `--batch_size`, of the worker count, and of how much
+   RNG training consumed first. `Net.forward` accepts these as `sample_ids` and
+   then never calls its own sampler. `Trainer.begin_eval_pass()` resets the
+   item counter at the head of each sweep. Without this, a saliency sampler
+   would change *which pixels the metric is computed on*, and a "better" val
+   curve could be nothing but an easier pixel draw.
+2. **Fixed evaluation renders.** Both held-out splits are wrapped by
+   `MixedEvalDataset`, whose per-index seeding pins each scene's camera, K
+   lights and Dirichlet mix. This matters because `MixedTrainDataset` passes
+   `rng=None` to the scene loaders, which falls back to the global
+   `np.random`: `augment=False` disables only the horizontal flip, so val
+   scenes would otherwise be **re-rendered every epoch**. Val uses
+   `n_trials=1` (one fixed render per scene, identical every epoch and every
+   run); test uses `--test_trials` (each trial a *different* but fixed draw,
+   averaged for variance reduction — reproducible across runs).
+
+Net effect: two runs that differ only in the model are evaluated on byte-identical
+data. `Net.sample_train_pixels` is the single override point for a new sampler
+(training only); nothing else needs to change to keep the comparison fair.
 
 **Early stopping (safety cutoff):** `--patience` (default 10, in units of
 validation checks; 0 disables) stops training once val loss has not improved
@@ -315,8 +339,8 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 
 ### Data loading
 - Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).
-- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. The per-image normalization scalar and its PolarPS-only sidecar cache live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits); `dataio.py:build_train_dataset` / `build_val_dataset` / `build_test_dataset` are thin single-split accessors. K is fixed at 10 per scene.
-- Held-out test: the test third of the same mixed split, wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × --test_trials`, per-index-seeded so it is worker-count-independent and reproducible) and evaluated **once after the final epoch** via `train.py:run_test_eval` (reuses `Trainer.val_step`; scene-count-weighted mean over trials). No external benchmark is involved.
+- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. The per-image normalization scalar and its PolarPS-only sidecar cache live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is fixed at 10 per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
+- Held-out val and test: both wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × n_trials`, per-index-seeded so renders are worker-count-independent and reproducible). Val uses `n_trials=1` and runs every `--val_every_epochs`; test uses `--test_trials` and runs **once after the final epoch** via `train.py:run_test_eval`. Both sweep `train.py:run_eval_pass` → `Trainer.val_step` (scene-count-weighted mean, non-finite dropped). No external benchmark is involved.
 
 ## Environment
 
