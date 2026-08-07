@@ -35,6 +35,33 @@ a per-epoch `data_wait_share`. They exist to size `--batch_size` and
 much VRAM headroom is left, and `data_wait_share` says whether the GPU is
 starved by the loader (raise workers) or already saturated (do not).
 
+Resuming an interrupted run
+---------------------------
+A full run spans days, so a crash near the end must not cost the run. Every
+epoch checkpoint carries the complete run state — weights, optimizer moments,
+LR-schedule position, GradScaler scale, all RNG streams, and the loop's own
+epoch / best-val / patience / elapsed-time bookkeeping — and
+
+    python sdm_unips/train.py ... --resume auto
+
+picks up the newest one and continues at the next epoch. The same command
+launches a fresh run when no checkpoint exists yet, so it can be the one line
+in a relaunch script. Resume granularity is one epoch: an interrupted epoch is
+replayed from its start.
+
+Because the logs are append-only, that replay leaves the interrupted epoch's
+per-step records in `train.jsonl` followed by the same epoch again. Every
+record carries `resume_count` (0 for the original run) and a
+`{"kind": "resume"}` marker is written at the seam, so plots can drop the
+stale tail:
+
+    keep = [r for r in records if r['resume_count'] == max_resume_count_at(r['epoch'])]
+
+Only *per-step* records are affected. `epoch_summary`, `val_summary` and
+`test_summary` are written once per completed epoch and are gap-free, and
+`elapsed_sec` continues across the restart (it counts compute time and
+excludes downtime), so the convergence-vs-time curves need no filtering.
+
 Fitting a large effective batch on a small GPU
 ----------------------------------------------
 `--batch_size` is the micro-batch; `--accum_steps` micro-batches make one
@@ -64,7 +91,7 @@ sys.path.append('..')
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from modules.builder.trainer import (
-    NonFiniteGradientAbort, Trainer, prune_checkpoints,
+    NonFiniteGradientAbort, Trainer, find_latest_checkpoint, prune_checkpoints,
 )
 from modules.io.dataloader.mixed import build_mixed_split, MixedEvalDataset
 
@@ -172,7 +199,30 @@ def build_argparser():
                    help='Defaults to <session_name>/checkpoints')
     p.add_argument('--log_dir', default=None,
                    help='Defaults to <session_name>/logs')
-    p.add_argument('--resume', default=None)
+    p.add_argument('--resume', default=None,
+                   help='Continue an interrupted run. Accepts a checkpoint '
+                        'FILE, a checkpoint DIRECTORY (the highest-numbered '
+                        'epoch_*.pt in it is used, else final.pt), or the '
+                        'literal "auto" for <session>/checkpoints. A full '
+                        'training checkpoint restores model + optimizer + LR '
+                        'schedule + RNG + epoch/best/patience bookkeeping and '
+                        'continues at the next epoch; a bare *.pytmodel is a '
+                        'weights-only WARM START from epoch 0. Which one '
+                        'happened is printed at startup.')
+    p.add_argument('--resume_weights_only', action='store_true',
+                   help='Force the warm-start reading of a full checkpoint: '
+                        'take its weights but start a NEW run (fresh '
+                        'optimizer, LR schedule and epoch counter). Use this '
+                        'to seed a new experiment from an old run, NOT to '
+                        'continue one — continuing with a fresh optimizer '
+                        'throws away the moment estimates and restarts the '
+                        'schedule at the warmup LR.')
+    p.add_argument('--allow_config_change', action='store_true',
+                   help='Downgrade the resume config-compatibility errors to '
+                        'warnings. Required to resume with a different '
+                        '--seed / --*_fraction / --max_scenes / dataset root, '
+                        'which REDEFINES the train/val/test split and can move '
+                        'held-out test scenes into training.')
     p.add_argument('--log_every', type=int, default=10,
                    help='Optimizer steps between log records')
     p.add_argument('--log_memory', action='store_true',
@@ -318,19 +368,144 @@ def _format_log(log: dict) -> str:
 
 
 class JSONLLogger:
-    """Append-only JSONL + plain-text mirror logger."""
+    """Append-only JSONL + plain-text mirror logger.
 
-    def __init__(self, log_dir, filename_stem):
+    `defaults` are merged into every record. It carries `resume_count`, which
+    is what makes a resumed run's log unambiguous: the logs are append-only, so
+    after a crash the file holds the interrupted epoch's step records followed
+    by the same epoch replayed. Stamping the run generation lets a plot drop
+    the stale tail instead of showing `elapsed_sec` jumping backwards (see the
+    `resume` marker record and the note in CLAUDE.md).
+    """
+
+    def __init__(self, log_dir, filename_stem, defaults=None):
         os.makedirs(log_dir, exist_ok=True)
         self.jsonl_path = os.path.join(log_dir, f'{filename_stem}.jsonl')
         self.text_path = os.path.join(log_dir, f'{filename_stem}.log')
+        self.defaults = dict(defaults or {})
 
     def write(self, record, text=None):
         with open(self.jsonl_path, 'a') as f:
-            f.write(json.dumps(record) + '\n')
+            f.write(json.dumps({**self.defaults, **record}) + '\n')
         if text is not None:
             with open(self.text_path, 'a') as f:
                 f.write(text + '\n')
+
+
+# ---------------------------------------------------------------------------
+# Resume
+# ---------------------------------------------------------------------------
+# Changing any of these REDEFINES the deterministic scene-level split, so a
+# resumed run would train on a different partition than the one it started
+# from — potentially pulling held-out test scenes into training and
+# invalidating the headline number. Hard error unless --allow_config_change.
+SPLIT_CRITICAL_ARGS = (
+    'seed', 'val_fraction', 'test_fraction', 'max_scenes',
+    'hdlong_dir', 'polarps_dir', 'train_dir',
+)
+# Changing these keeps the split intact but bends the optimization mid-run:
+# the LR lambda is rebuilt from the NEW args while the scheduler's step count
+# comes from the old run, so the LR curve has a kink at the resume point.
+# Legal (extending --epochs is a real use case), but it must be visible.
+SCHEDULE_SENSITIVE_ARGS = (
+    'epochs', 'lr', 'weight_decay', 'lr_schedule', 'warmup_epochs',
+    'min_lr_ratio', 'lr_decay_every', 'lr_decay_gamma', 'batch_size',
+    'accum_steps', 'pixel_samples', 'train_resolution',
+    'canonical_resolution', 'amp_dtype', 'grad_clip',
+)
+
+
+def resolve_resume_path(spec, ckpt_dir):
+    """Turn `--resume` into a concrete checkpoint file.
+
+    Accepts a file, a directory, or "auto" (= this session's checkpoint dir).
+    Directories resolve through `find_latest_checkpoint`, which orders
+    `epoch_*.pt` NUMERICALLY — the old code globbed and took element [0], so
+    which of best/epoch/final it picked was down to filesystem order.
+
+    "auto" returns None when the session has no checkpoints yet, so the same
+    command can be used to launch a run and to relaunch it after a crash. Any
+    other spec that resolves to nothing raises: an explicit path that is not
+    there is a typo, and silently training from scratch for two days is the
+    worst possible response to a typo.
+    """
+    auto = spec in ('auto', 'last')
+    if auto:
+        spec = ckpt_dir
+        if find_latest_checkpoint(spec) is None:
+            print(f'[RESUME] --resume auto: no checkpoint in {spec} yet; '
+                  f'starting a fresh run.')
+            return None
+    if os.path.isdir(spec):
+        path = find_latest_checkpoint(spec)
+        if path is None:
+            # A directory of released weights is a legitimate warm start.
+            weights = sorted(glob.glob(os.path.join(spec, '*.pytmodel')))
+            if len(weights) == 1:
+                return weights[0]
+            if len(weights) > 1:
+                raise RuntimeError(
+                    f'--resume {spec}: no epoch_*.pt/final.pt and '
+                    f'{len(weights)} *.pytmodel files — ambiguous. Name the '
+                    f'file explicitly.')
+            raise RuntimeError(
+                f'--resume {spec}: no checkpoint found (looked for '
+                f'epoch_*.pt, final.pt, *.pytmodel).')
+        return path
+    if os.path.isfile(spec):
+        return spec
+    raise RuntimeError(f'--resume {spec}: no such file or directory.')
+
+
+def check_resume_compat(prev_args, args, allow_change):
+    """Compare the checkpoint's arguments against this invocation's.
+
+    Split-defining differences abort; schedule-shaping ones warn. Silence here
+    would be the expensive failure mode: a two-day run that finishes and
+    reports a test number computed on scenes it was trained on.
+    """
+    if not prev_args:
+        print('[RESUME] WARNING: checkpoint carries no argument snapshot '
+              '(pre-v2 format); cannot verify that the data split and LR '
+              'schedule match. Verify --seed / --*_fraction / --max_scenes by '
+              'hand against the original run.')
+        return
+
+    def diff(keys):
+        out = []
+        for k in keys:
+            if k not in prev_args:
+                continue
+            now = getattr(args, k, None)
+            if now != prev_args[k]:
+                out.append(f'  {k}: checkpoint={prev_args[k]!r} now={now!r}')
+        return out
+
+    split_diffs = diff(SPLIT_CRITICAL_ARGS)
+    sched_diffs = diff(SCHEDULE_SENSITIVE_ARGS)
+
+    if split_diffs:
+        msg = ('resume config mismatch on split-defining arguments:\n'
+               + '\n'.join(split_diffs)
+               + '\nThese determine the deterministic train/val/test partition, '
+                 'so resuming with them changed trains on a DIFFERENT split '
+                 'than the checkpoint did — held-out test scenes can end up in '
+                 'training and the final number becomes meaningless. Re-run '
+                 'with the original values, or pass --allow_config_change if '
+                 'this is deliberate.')
+        if not allow_change:
+            raise RuntimeError('[RESUME] ' + msg)
+        print('[RESUME] WARNING (--allow_config_change): ' + msg)
+
+    if sched_diffs:
+        print('[RESUME] WARNING: optimization arguments differ from the '
+              'checkpoint:\n' + '\n'.join(sched_diffs)
+              + '\nThe LR schedule is rebuilt from the NEW values while its '
+                'step count comes from the old run, so the LR curve bends at '
+                'the resume point. Intentional when extending --epochs; '
+                'otherwise re-run with the original values.')
+    if not split_diffs and not sched_diffs:
+        print('[RESUME] config matches the checkpoint.')
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +656,12 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # Resolve --resume before the (slow) dataset scan so a typo'd path fails in
+    # a second rather than after the scene pool has been enumerated.
+    resume_path = resolve_resume_path(args.resume, ckpt_dir) if args.resume else None
+    if resume_path:
+        print(f'[RESUME] checkpoint = {resume_path}')
+
     print(f'[TRAIN] Device = {device}  Session = {args.session_name}')
     print(f'[TRAIN] Dataset = mixed (hdlong + PolarPS) | Automatic Mixed Precision (AMP) = {args.amp_dtype}  '
           f'Epochs = {args.epochs} | Batch size = {args.batch_size} '
@@ -601,19 +782,80 @@ def main():
     trainer = Trainer(args, device, total_steps=total_steps,
                        steps_per_epoch=steps_per_epoch)
 
-    train_logger = JSONLLogger(log_dir, 'train')
-    eval_logger = JSONLLogger(log_dir, 'eval')
-
-    # Store the run arguments
-    with open(os.path.join(log_dir, 'config.json'), 'w') as f:
-        json.dump({k: v for k, v in sorted(vars(args).items())
-                   if isinstance(v, (str, int, float, bool, type(None)))},
-                  f, indent=2)
-
+    # ---- Resume ---------------------------------------------------------
+    # After the Trainer is fully built: restoring optimizer/scheduler state
+    # requires them to exist. Returns None for a weights-only warm start.
     best_val_loss = float('inf')
     best_path = os.path.join(ckpt_dir, 'best.pt')
     epochs_no_improve = 0   # consecutive validation checks without improvement
     stopped_early = False
+    start_epoch = 0
+    resume_count = 0
+    prior_elapsed_sec = 0.0
+
+    resume_state = None
+    if resume_path:
+        resume_state = trainer.resume_from(
+            resume_path, weights_only=args.resume_weights_only)
+    if resume_state is not None:
+        check_resume_compat(resume_state.get('args'), args,
+                            args.allow_config_change)
+        start_epoch = int(resume_state.get('epoch', -1)) + 1
+        best_val_loss = float(resume_state.get('best_val_loss', float('inf')))
+        epochs_no_improve = int(resume_state.get('epochs_no_improve', 0))
+        # Continue the wall clock instead of restarting it: t0 is rewound below
+        # by this amount so `elapsed_sec` stays monotonic across the restart
+        # and remains a valid x-axis for the convergence-vs-time comparison.
+        # Downtime is excluded by construction — it is compute time, not
+        # calendar time.
+        prior_elapsed_sec = float(resume_state.get('elapsed_sec', 0.0))
+        resume_count = int(resume_state.get('resume_count', 0)) + 1
+        # Same generator object the loaders already hold, so mutating its
+        # state here still governs the next epoch's shuffle permutation.
+        gen_state = resume_state.get('loader_gen')
+        if gen_state is not None:
+            loader_gen.set_state(gen_state.cpu())
+            print('[RESUME] DataLoader shuffle generator restored.')
+        # Last, so it is not clobbered by the numpy draws that building the
+        # datasets above consumed.
+        trainer.restore_rng(resume_state.get('rng'))
+        print(f'[RESUME] continuing at epoch {start_epoch}/{args.epochs} | '
+              f'best_val_loss={best_val_loss:.4f} | '
+              f'epochs_no_improve={epochs_no_improve} | '
+              f'prior elapsed={prior_elapsed_sec:.0f}s | run #{resume_count}')
+        if start_epoch >= args.epochs:
+            print(f'[RESUME] the checkpoint has already completed all '
+                  f'{args.epochs} epochs; skipping training and going straight '
+                  f'to the final held-out test evaluation.')
+
+    # `resume_count` on every record distinguishes the replayed tail of an
+    # interrupted epoch from the run that actually produced the weights.
+    log_defaults = {'resume_count': resume_count}
+    train_logger = JSONLLogger(log_dir, 'train', defaults=log_defaults)
+    eval_logger = JSONLLogger(log_dir, 'eval', defaults=log_defaults)
+
+    # Store the run arguments. A resumed run writes its own file rather than
+    # overwriting the original run's record of how it was launched.
+    config_name = 'config.json' if resume_count == 0 else f'config_resume_{resume_count}.json'
+    with open(os.path.join(log_dir, config_name), 'w') as f:
+        json.dump({k: v for k, v in sorted(vars(args).items())
+                   if isinstance(v, (str, int, float, bool, type(None)))},
+                  f, indent=2)
+
+    if resume_state is not None:
+        # Marker record: without it, a reader of the append-only train.jsonl
+        # sees a step counter that jumps and an epoch that repeats, with no
+        # indication of why.
+        train_logger.write(
+            {'kind': 'resume', 'epoch': start_epoch,
+             'global_step': trainer.global_step,
+             'checkpoint': resume_path,
+             'best_val_loss': best_val_loss,
+             'epochs_no_improve': epochs_no_improve,
+             'elapsed_sec': prior_elapsed_sec},
+            text=f'[RESUME] run #{resume_count} from {resume_path} at epoch '
+                 f'{start_epoch}, global_step {trainer.global_step}')
+
     # Run-wide high-water marks, carried across the per-epoch peak resets.
     run_peak = {'mem_peak_gib': 0.0, 'mem_reserved_peak_gib': 0.0,
                 'host_rss_gib': 0.0}
@@ -640,8 +882,29 @@ def main():
             text=f'[ABORT] epoch {epoch}, step {trainer.global_step}: {exc}')
         raise exc
 
-    t0 = time.time()
-    for epoch in range(args.epochs):
+    # Rewound by the elapsed time of the run(s) that came before, so
+    # `elapsed_sec` continues rather than restarting at 0 (see the resume
+    # block above).
+    t0 = time.time() - prior_elapsed_sec
+
+    def _loop_state(epoch):
+        """The training loop's own bookkeeping, to travel with the checkpoint.
+
+        Without these, a resumed run restarts the epoch counter at 0, forgets
+        the best val loss (so `best.pt` gets overwritten by a worse model),
+        resets the early-stopping counter, and restarts the wall clock.
+        """
+        return {
+            'epoch': epoch,              # last COMPLETED epoch
+            'best_val_loss': best_val_loss,
+            'epochs_no_improve': epochs_no_improve,
+            'elapsed_sec': time.time() - t0,
+            'resume_count': resume_count,
+            'loader_gen': loader_gen.get_state(),
+        }
+
+    last_epoch_done = start_epoch - 1
+    for epoch in range(start_epoch, args.epochs):
         epoch_t0 = time.time()
         epoch_running = {}
         last_ckpt_step = -1
@@ -708,8 +971,13 @@ def main():
                     and trainer.global_step % args.ckpt_every == 0
                     and trainer.global_step != last_ckpt_step):
                 last_ckpt_step = trainer.global_step
-                path = trainer.save(ckpt_dir, tag=f'step_{trainer.global_step}')
-                print(f'[CHECKPOINT] Step checkpoint saved {path}')
+                # `epoch - 1` as the completed epoch: this is a MID-epoch
+                # snapshot, so resuming from it restarts the current epoch from
+                # the top rather than skipping it.
+                step_path = trainer.save(
+                    ckpt_dir, tag=f'step_{trainer.global_step}',
+                    state=_loop_state(epoch - 1))
+                print(f'[CHECKPOINT] Step checkpoint saved {step_path}')
 
             iter_end = time.time()
 
@@ -785,11 +1053,16 @@ def main():
             text=f'[EPOCH {epoch} DONE] ' + _format_log(epoch_summary),
         )
 
-        # Save end-of-epoch checkpoint.
-        path = trainer.save(ckpt_dir, tag=f'epoch_{epoch}')
-        print(f'[CHECKPOINT] Epoch checkpoint saved: {path}')
+        last_epoch_done = epoch
 
         # Held-out validation drives best.pt selection (lower loss = better).
+        #
+        # Validation runs BEFORE the epoch checkpoint is written, deliberately:
+        # the checkpoint carries `best_val_loss` and the early-stopping counter,
+        # and both are decided here. Saving first would persist the pre-check
+        # values, so a resume from that file would let a worse epoch overwrite
+        # best.pt and would silently reset patience.
+        improved = False
         if val_loader is not None and (epoch + 1) % args.val_every_epochs == 0:
             # Same estimator as the final test report (see run_eval_pass):
             # scene-count-weighted, non-finite values dropped.
@@ -810,15 +1083,7 @@ def main():
                 if avg_val_loss < best_val_loss - args.min_delta:
                     best_val_loss = avg_val_loss
                     epochs_no_improve = 0
-                    shutil.copyfile(path, best_path)
-                    legacy = os.path.join(ckpt_dir, 'normal.pytmodel')
-                    if os.path.isfile(legacy):
-                        shutil.copyfile(
-                            legacy,
-                            os.path.join(ckpt_dir, 'best_normal.pytmodel'),
-                        )
-                    print(f'[BEST] Epoch {epoch} | '
-                          f'val_loss={avg_val_loss:.4f} → {best_path}')
+                    improved = True   # best.pt is copied after the save below
                 else:
                     epochs_no_improve += 1
                     if args.patience > 0:
@@ -837,6 +1102,22 @@ def main():
                      'global_step': trainer.global_step, 'status': 'no_finite_metrics'},
                     text=msg,
                 )
+
+        # Save the end-of-epoch checkpoint, now that best_val_loss and the
+        # patience counter reflect this epoch's validation. This is the file
+        # `--resume` will pick up from.
+        path = trainer.save(ckpt_dir, tag=f'epoch_{epoch}',
+                            state=_loop_state(epoch))
+        print(f'[CHECKPOINT] Epoch checkpoint saved: {path}')
+
+        if improved:
+            shutil.copyfile(path, best_path)
+            legacy = os.path.join(ckpt_dir, 'normal.pytmodel')
+            if os.path.isfile(legacy):
+                shutil.copyfile(
+                    legacy, os.path.join(ckpt_dir, 'best_normal.pytmodel'))
+            print(f'[BEST] Epoch {epoch} | '
+                  f'val_loss={best_val_loss:.4f} → {best_path}')
 
         prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',))
 
@@ -858,7 +1139,7 @@ def main():
             )
             break
 
-    final = trainer.save(ckpt_dir, tag='final')
+    final = trainer.save(ckpt_dir, tag='final', state=_loop_state(last_epoch_done))
     reason = 'early-stopped' if stopped_early else 'completed all epochs'
     print(f'[TRAIN] DONE ({reason}) | Final checkpoint: {final} | '
           f'best_val_loss={best_val_loss:.4f}')

@@ -206,14 +206,86 @@ and their MAE is averaged with a scene-count-weighted (unbiased) mean.
 - `--max_consecutive_skips`: 20 — `--max_skip_rate`: 0.3 over
   `--skip_rate_window`: 200 (either 0 disables that guard) — see below
 - `--keep_last`: 3 (epoch checkpoints to retain; `best.pt` is kept separately)
-- `--resume`: warm-start from a `*.pytmodel` or `*.pt` checkpoint dir
+- `--resume`: continue an interrupted run (`auto`, a checkpoint dir, or a
+  file) — see **Resuming** below. `--resume_weights_only` forces a
+  weights-only warm start; `--allow_config_change` downgrades the split-config
+  guard to a warning
 - `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
 
 The final test evaluation runs automatically after the last epoch on the
 held-out `--test_fraction` split, averaged over `--test_trials` deterministic
 trials.
 
-Checkpoints are written to `<session>/checkpoints/`. Each save also drops a bare-`state_dict` `normal.pytmodel` copy (overwritten every save, so it tracks the *latest* weights); each `best.pt` update additionally copies it to `best_normal.pytmodel`. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned (`final.pt` and `step_*.pt` are never auto-pruned).
+Checkpoints are written to `<session>/checkpoints/`. Each save also drops a bare-`state_dict` `normal.pytmodel` copy (overwritten every save, so it tracks the *latest* weights); each `best.pt` update additionally copies it to `best_normal.pytmodel`. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned (`final.pt` and `step_*.pt` are never auto-pruned), **ordered by parsed epoch number** — sorting the filenames as strings put `epoch_10.pt` before `epoch_7.pt`, so from epoch 10 onward the newest checkpoint was deleted the moment it was written.
+
+Every save is atomic (`torch.save` to `*.tmp`, then `os.replace`): the file most likely to be half-written when a machine dies is the newest one, which is exactly the one `--resume` picks.
+
+The epoch checkpoint is written **after** that epoch's validation, not before. It carries `best_val_loss` and the early-stopping counter, both of which the validation check decides; saving first would persist the pre-check values, so a resume from that file would let a worse epoch overwrite `best.pt` and would silently reset patience. The cost is that a crash *during* validation loses that epoch.
+
+## Resuming an interrupted run
+
+A run spans days, so a crash near the end must not cost the run:
+
+```bash
+python sdm_unips/train.py ... --resume auto     # same command that launched it
+```
+
+`--resume` accepts `auto` (this session's `checkpoints/`), any checkpoint
+directory, or a specific file. A directory resolves to its highest-numbered
+`epoch_*.pt`, else `final.pt`; **never `best.pt`**, which is a *selection*
+artifact and normally lags the training frontier. `auto` on a session with no
+checkpoints starts a fresh run, so the same command works for launch and
+relaunch; any other unresolvable path is a hard error (a typo must not silently
+train from scratch for two days).
+
+Two modes, chosen by inspecting the file and **printed at startup**:
+
+- **full resume** — the checkpoint has an `optimizer` entry. Model, optimizer
+  moments, LR-schedule position, GradScaler scale, non-finite-skip counters,
+  every RNG stream (python / numpy / torch / cuda / the DataLoader shuffle
+  generator), and the loop's epoch, `best_val_loss`, patience counter and
+  `elapsed_sec` are all restored; training continues at the next epoch.
+- **warm start** — a bare `*.pytmodel` `state_dict`, or `--resume_weights_only`.
+  Weights only (`strict=False`), fresh optimizer, epoch 0. For seeding a *new*
+  experiment from old weights.
+
+Restoring only the weights — which is what `--resume` used to do — is worse
+than useless for continuing a run: a fresh AdamW has no moment estimates and a
+fresh `LambdaLR` restarts at step 0, so the first resumed step lands at the
+warmup LR with no gradient history. (It was in fact worse still: the old code
+passed a full training checkpoint to `loadmodel(..., strict=False)`, whose
+top-level keys are `model`/`optimizer`/… rather than parameter names, so
+`strict=False` swallowed all of them and **loaded nothing at all** while
+printing "Loading pretrained model".)
+
+**Config guard.** The checkpoint stores its own `args`. Resuming with a
+different `--seed`, `--val_fraction`, `--test_fraction`, `--max_scenes` or
+dataset root **aborts**: those redefine the deterministic scene-level split, so
+the resumed run would train on a different partition and could pull held-out
+test scenes into training. `--allow_config_change` downgrades it to a warning.
+Differences in schedule-shaping args (`--epochs`, `--lr`, `--batch_size`, …)
+only warn — the LR lambda is rebuilt from the new values while the step count
+comes from the old run, so the LR curve bends at the resume point. That is
+intentional when extending `--epochs`, and must be visible otherwise.
+
+**Granularity is one epoch.** An interrupted epoch is replayed from its start;
+mid-epoch resume would require fast-forwarding the sampler to a specific
+micro-batch. A `step_*.pt` checkpoint (`--ckpt_every`) is resumable but
+restarts its epoch from the top, so `global_step` overshoots `total_steps` by
+the partial epoch — harmless, since cosine clamps its progress to 1.0 and the
+loop is epoch-driven.
+
+**Effect on the A/B graphs.** `epoch_summary`, `val_summary` and
+`test_summary` are written once per *completed* epoch, so they are gap-free and
+free of duplicates, and `elapsed_sec` continues across a restart (`t0` is
+rewound by the stored elapsed time — it measures compute time and excludes
+downtime). The convergence-vs-time curves therefore need no special handling.
+The one artifact is in **per-step** records: the logs are append-only, so the
+interrupted epoch's steps remain, followed by the replayed epoch, and raw
+`elapsed_sec` rewinds at that seam. Every record carries `resume_count`
+(0 for the original run) and a `{"kind": "resume", ...}` marker is written at
+the seam, so the stale tail is a one-line filter. Each resumed run also writes
+`config_resume_<n>.json` rather than overwriting the original `config.json`.
 
 After the final epoch, `train.py:export_for_inference` publishes the weights the test number was reported on to `<session>/checkpoints/normal/normal.pytmodel` — `best_normal.pytmodel` when a best was recorded, else `normal.pytmodel` (the final-epoch weights). Inference then runs directly against the training output:
 

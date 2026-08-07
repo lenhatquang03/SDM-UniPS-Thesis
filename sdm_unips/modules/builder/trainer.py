@@ -28,19 +28,54 @@ size, which `drop_last=True` prevents on the train loader).
 `global_step`, the scheduler, and `--log_every` / `--ckpt_every` all count
 *optimizer* steps, not micro-batches, so the LR schedule is identical to an
 un-accumulated run at the same effective batch size.
+
+Resuming an interrupted run
+---------------------------
+A thesis run spans days, so a crash at epoch 50 must not cost 50 epochs.
+`save` therefore writes the *entire* run state — weights, optimizer moments,
+scheduler position, GradScaler scale, skip counters, every RNG stream, and the
+training loop's own bookkeeping (epoch, best val loss, patience counter,
+elapsed seconds) — and `resume_from` restores all of it.
+
+Restoring only the weights, which is what this file used to do, is worse than
+useless for a mid-run restart: a fresh AdamW has no moment estimates and a
+fresh LambdaLR restarts at step 0, so the first resumed step lands at the
+warmup LR with no gradient history and undoes much of what the run had
+learned.
+
+Two distinct modes, chosen by inspecting the file:
+
+* **full resume** — the checkpoint carries an `optimizer` entry, so it came
+  from `Trainer.save`. Everything is restored and training continues at the
+  next epoch.
+* **warm start** — a bare `state_dict` (`*.pytmodel`, e.g. the upstream
+  released weights). Weights only, `strict=False`, fresh optimizer, epoch 0.
+
+Which one happened is printed loudly, because silently warm-starting a run
+that was meant to resume looks like normal training until the loss curve is
+read days later.
 """
 
 import glob
 import math
 import os
+import random
+import re
 from collections import deque
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 
 from modules.model import model
-from modules.model.model_utils import loadmodel, mode_change, get_n_params
+from modules.model.model_utils import mode_change, get_n_params
 from modules.loss import losses
+
+
+# Bumped when the checkpoint payload changes shape. `resume_from` accepts
+# older versions and fills in what it can, so a run started before a format
+# change can still be resumed.
+CHECKPOINT_FORMAT_VERSION = 2
 
 
 class NonFiniteGradientAbort(RuntimeError):
@@ -95,12 +130,10 @@ class Trainer:
         self.net.with_grad()
         print(f"[Trainer] Target = Normal  Params = {get_n_params(self.net):,}")
 
-        if getattr(args, 'resume', None):
-            ckpt_paths = (glob.glob(os.path.join(args.resume, '*.pytmodel'))
-                          + glob.glob(os.path.join(args.resume, '*.pt')))
-            if ckpt_paths:
-                print(f'[Trainer] Resuming weights from {ckpt_paths[0]}')
-                self.net = loadmodel(self.net, ckpt_paths[0], strict=False)
+        # NOTE: resuming is NOT done here. It has to happen after the optimizer
+        # and scheduler exist, or their state cannot be restored — which is
+        # exactly the bug this used to have. `train.py` calls `resume_from`
+        # once construction is complete.
 
         self.optimizer = torch.optim.AdamW(
             [p for p in self.net.parameters() if p.requires_grad],
@@ -648,24 +681,199 @@ class Trainer:
             self._report_nan(batch)
         return log
 
-    def save(self, ckpt_dir, tag):
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _atomic_save(payload, path):
+        """`torch.save` to a temp file, then rename over the target.
+
+        A rename within one filesystem is atomic, so an interrupted save can
+        never leave a truncated `.pt` behind. That matters more here than
+        usual: the file most likely to be half-written when a machine dies is
+        the newest one, which is precisely the one `--resume` will pick.
+        """
+        tmp = path + '.tmp'
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+
+    def _capture_rng(self):
+        """Snapshot every RNG stream the training loop draws from.
+
+        Without this, a resumed run re-derives its data order and pixel
+        samples from wherever the RNGs happen to sit, so an interrupted run is
+        no longer the same experiment as an uninterrupted one. Kept on CPU:
+        `torch.load(map_location=cuda)` would otherwise hand `set_rng_state` a
+        CUDA tensor and raise.
+        """
+        return {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'cuda': (torch.cuda.get_rng_state_all()
+                     if torch.cuda.is_available() else None),
+        }
+
+    def restore_rng(self, rng):
+        """Reinstate the RNG streams captured by `_capture_rng`.
+
+        Call immediately before the training loop, once the datasets and
+        loaders have been constructed — building them consumes numpy draws,
+        which would otherwise overwrite what was just restored.
+        """
+        if not rng:
+            return
+        try:
+            random.setstate(rng['python'])
+            np.random.set_state(rng['numpy'])
+            torch.set_rng_state(rng['torch'].cpu())
+            cuda_states = rng.get('cuda')
+            if cuda_states and torch.cuda.is_available():
+                if len(cuda_states) == torch.cuda.device_count():
+                    torch.cuda.set_rng_state_all([s.cpu() for s in cuda_states])
+                else:
+                    # Resumed on a host with a different GPU count: seed what
+                    # exists rather than raising. The run stays valid, it is
+                    # just no longer bit-identical to the original.
+                    print(f'[Trainer] RNG: checkpoint holds {len(cuda_states)} '
+                          f'CUDA state(s) but this host has '
+                          f'{torch.cuda.device_count()}; restoring device 0 only.')
+                    torch.cuda.set_rng_state(cuda_states[0].cpu(), 0)
+            print('[Trainer] RNG streams restored (python/numpy/torch/cuda).')
+        except (KeyError, TypeError, RuntimeError) as exc:
+            print(f'[Trainer] WARNING: could not restore RNG state ({exc}). '
+                  f'Training continues, but the resumed data order will differ '
+                  f'from an uninterrupted run.')
+
+    def _args_snapshot(self):
+        """JSON-ish copy of the run's arguments, for the resume compat check."""
+        return {k: v for k, v in vars(self.args).items()
+                if isinstance(v, (str, int, float, bool, type(None)))}
+
+    def save(self, ckpt_dir, tag, state=None):
+        """Write a complete, resumable checkpoint.
+
+        `state` carries the *training loop's* bookkeeping (epoch,
+        best_val_loss, patience counter, elapsed seconds, DataLoader shuffle
+        generator). The Trainer does not own those, but they have to travel
+        with the optimizer state: without them a resumed run restarts the
+        schedule at epoch 0, forgets its best val loss, and overwrites
+        `best.pt` with a worse model.
+        """
         os.makedirs(ckpt_dir, exist_ok=True)
         path = os.path.join(ckpt_dir, f'{tag}.pt')
-        torch.save({
-            'global_step': self.global_step,
+        payload = {
+            'format_version': CHECKPOINT_FORMAT_VERSION,
             'target': self.target,
+            'global_step': self.global_step,
             'model': self.net.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'scaler': self.scaler.state_dict() if self.scaler is not None else None,
-        }, path)
+            'trainer_state': {
+                'global_step': self.global_step,
+                'skipped_steps': self.skipped_steps,
+                'consecutive_skips': self._consecutive_skips,
+                'skip_window': list(self._skip_window),
+                'micro_in_cycle': self._micro_in_cycle,
+            },
+            'rng': self._capture_rng(),
+            'args': self._args_snapshot(),
+            'loop_state': dict(state) if state else None,
+        }
+        self._atomic_save(payload, path)
         # Drop-in copy for the inference Builder.
         legacy = os.path.join(ckpt_dir, f'{self.target}.pytmodel')
-        torch.save(self.net.state_dict(), legacy)
+        self._atomic_save(self.net.state_dict(), legacy)
         return path
 
+    def resume_from(self, path, weights_only=False):
+        """Restore a run from `path`. Returns the loop state, or None.
+
+        A returned dict means a **full resume** happened and the caller must
+        continue from `state['epoch'] + 1`. `None` means only weights were
+        loaded (**warm start**) and the caller starts from scratch at epoch 0.
+
+        `weights_only=True` forces the warm-start reading of a full
+        checkpoint — for deliberately beginning a *new* run from a previous
+        run's weights, where inheriting stale optimizer moments and an
+        already-finished LR schedule would be wrong.
+        """
+        # weights_only=False is explicit: newer torch defaults it to True and
+        # would reject the RNG/args payload, which is not a plain tensor dict.
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        is_full = (isinstance(ckpt, dict) and 'model' in ckpt
+                   and 'optimizer' in ckpt)
+        if not is_full or weights_only:
+            sd = ckpt['model'] if (isinstance(ckpt, dict) and 'model' in ckpt) else ckpt
+            missing, unexpected = self.net.load_state_dict(sd, strict=False)
+            why = ('forced by --resume_weights_only' if (is_full and weights_only)
+                   else 'file holds weights only, no optimizer state')
+            print(f'[Trainer] WARM START from {path} ({why}).')
+            print(f'[Trainer]   weights loaded | missing={len(missing)} '
+                  f'unexpected={len(unexpected)} | optimizer, LR schedule and '
+                  f'epoch counter all start FRESH at 0.')
+            if len(missing) > 0:
+                # strict=False is what makes a warm start possible at all, but
+                # it is also what silently loaded *nothing* when this code was
+                # handed a full training checkpoint. Report what actually landed.
+                print(f'[Trainer]   WARNING: {len(missing)} parameter tensors '
+                      f'were absent from the file and keep their random init, '
+                      f'e.g. {missing[:3]}')
+            return None
+
+        self.net.load_state_dict(ckpt['model'])
+        self.optimizer.load_state_dict(ckpt['optimizer'])
+        self.scheduler.load_state_dict(ckpt['scheduler'])
+        if ckpt.get('scaler') is not None and self.scaler is not None:
+            self.scaler.load_state_dict(ckpt['scaler'])
+
+        ts = ckpt.get('trainer_state') or {}
+        self.global_step = int(ts.get('global_step', ckpt.get('global_step', 0)))
+        self.skipped_steps = int(ts.get('skipped_steps', 0))
+        self._consecutive_skips = int(ts.get('consecutive_skips', 0))
+        self._skip_window = deque(ts.get('skip_window', []),
+                                  maxlen=self.skip_rate_window)
+        # NOT restored from the checkpoint: a resume always begins at an epoch
+        # boundary with no accumulated gradients in flight, so the next
+        # micro-batch must open a fresh cycle (and `zero_grad`). Carrying a
+        # stale count over would make the first cycle short and let it step on
+        # a partial effective batch.
+        self._micro_in_cycle = 0
+
+        loop = dict(ckpt.get('loop_state') or {})
+        if 'epoch' not in loop:
+            # Pre-v2 checkpoint, or a step_* one saved mid-epoch. global_step
+            # counts optimizer steps, so integer division recovers how many
+            # epochs completed.
+            done = self.global_step // max(1, self.steps_per_epoch)
+            loop['epoch'] = done - 1        # `epoch` means "last COMPLETED epoch"
+            print(f'[Trainer] checkpoint carries no loop state; inferring '
+                  f'{done} completed epoch(s) from global_step='
+                  f'{self.global_step}. best_val_loss and the early-stopping '
+                  f'counter restart from scratch, so best.pt can be overwritten '
+                  f'by a worse epoch.')
+        loop['rng'] = ckpt.get('rng')
+        loop['args'] = ckpt.get('args') or {}
+        loop['path'] = path
+        loop['format_version'] = int(ckpt.get('format_version', 1))
+
+        print(f'[Trainer] FULL RESUME from {path}')
+        print(f'[Trainer]   model + optimizer + scheduler + scaler restored | '
+              f'global_step={self.global_step} | '
+              f'lr={self.optimizer.param_groups[0]["lr"]:.3e} | '
+              f'skipped_steps={self.skipped_steps}')
+        return loop
+
     def load(self, path):
-        ckpt = torch.load(path, map_location=self.device)
+        """Load weights + optimizer/scheduler for the final test evaluation.
+
+        Distinct from `resume_from`: this is the end-of-run `best.pt` load,
+        which only needs the model in the right state and deliberately does
+        NOT touch the loop's epoch / best-val bookkeeping.
+        """
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.net.load_state_dict(ckpt['model'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
@@ -674,12 +882,40 @@ class Trainer:
         self.global_step = ckpt.get('global_step', 0)
 
 
+def _epoch_index(path):
+    """Epoch number encoded in an `epoch_<n>.pt` filename, or -1."""
+    m = re.search(r'epoch_(\d+)\.pt$', os.path.basename(path))
+    return int(m.group(1)) if m else -1
+
+
+def find_latest_checkpoint(ckpt_dir):
+    """Newest resumable checkpoint in `ckpt_dir`, or None.
+
+    Highest-numbered `epoch_*.pt` first, then `final.pt`. `best.pt` is
+    deliberately never chosen: it is a *selection* artifact and normally lags
+    the training frontier, so resuming from it would silently replay epochs.
+    """
+    epochs = glob.glob(os.path.join(ckpt_dir, 'epoch_*.pt'))
+    if epochs:
+        return max(epochs, key=_epoch_index)
+    final = os.path.join(ckpt_dir, 'final.pt')
+    return final if os.path.isfile(final) else None
+
+
 def prune_checkpoints(ckpt_dir, keep_last=3, protect=()):
     """Delete `epoch_*.pt` checkpoints except the most recent `keep_last` and
     anything in `protect` (e.g. {'best'}). The legacy `<target>.pytmodel` and
     explicit step checkpoints are never auto-deleted.
+
+    Ordering is by the parsed epoch NUMBER, not by filename. Sorting the paths
+    as strings put `epoch_10.pt` before `epoch_7.pt`
+    (['epoch_10.pt', 'epoch_11.pt', 'epoch_7.pt', 'epoch_8.pt', 'epoch_9.pt']),
+    so from epoch 10 onward the newest checkpoint was deleted the moment it was
+    written and the disk froze at epochs 7/8/9 — which would have made
+    `--resume` replay the same epoch forever.
     """
-    paths = sorted(glob.glob(os.path.join(ckpt_dir, 'epoch_*.pt')))
+    paths = sorted(glob.glob(os.path.join(ckpt_dir, 'epoch_*.pt')),
+                   key=_epoch_index)
     if len(paths) <= keep_last:
         return
     keep = set(paths[-keep_last:])
