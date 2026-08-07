@@ -231,8 +231,17 @@ def build_argparser():
                         'seconds each step spent WAITING on the DataLoader. '
                         'Off by default to keep train.jsonl lean; turn it on '
                         'when tuning --batch_size / --num_workers.')
-    p.add_argument('--ckpt_every', type=int, default=0,
-                   help='Step interval for extra checkpoints. 0 disables.')
+    p.add_argument('--ckpt_every', type=int, default=1000,
+                   help='Optimizer-step interval for mid-epoch checkpoints '
+                        '(0 disables). On by default because an epoch on the '
+                        'full pool is hours long and --resume granularity is '
+                        'one epoch: without this, a crash loses everything '
+                        'since the last epoch boundary. Rotated to '
+                        '--keep_last_steps, so it cannot fill the disk.')
+    p.add_argument('--keep_last_steps', type=int, default=2,
+                   help='Mid-epoch step_*.pt checkpoints to retain. These are '
+                        'crash insurance only (resuming from one replays its '
+                        'epoch from the top), so a small number is enough.')
     p.add_argument('--val_every_epochs', type=int, default=1)
     p.add_argument('--patience', type=int, default=10,
                    help='Early-stopping patience, counted in validation checks: '
@@ -306,7 +315,33 @@ def build_argparser():
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=0.05)
     p.add_argument('--warmup_epochs', type=float, default=5.0)
-    p.add_argument('--lr_schedule', default='cosine', choices=['cosine', 'step'])
+    p.add_argument('--lr_schedule', default='cosine',
+                   choices=['cosine', 'step', 'wsd'],
+                   help='cosine: warmup -> cosine anneal over --epochs. Its LR '
+                        'at every step depends on the TOTAL length, so a '
+                        'resume with a different --epochs retroactively '
+                        're-shapes steps already taken. wsd: warmup -> '
+                        'constant -> decay over the last --decay_fraction, '
+                        'which is extendable — the LR does not depend on the '
+                        'endpoint until the decay starts, so the run length '
+                        'can be decided from the val curve (see --decay_now).')
+    p.add_argument('--decay_fraction', type=float, default=0.2,
+                   help='wsd only: LENGTH of the decay ramp as a fraction of '
+                        'the planned run (--epochs x steps/epoch). The ramp '
+                        'ends at min_lr_ratio x --lr.')
+    p.add_argument('--decay_from_step', type=int, default=0,
+                   help='wsd only: optimizer step at which the decay BEGINS '
+                        '(0 = derive it so the ramp lands exactly at the end '
+                        'of --epochs). Set it explicitly to reproduce a decay '
+                        'point chosen for another model variant — Models B/C '
+                        'must share Model A\'s schedule for the A/B '
+                        'comparison to be valid.')
+    p.add_argument('--decay_now', action='store_true',
+                   help='wsd only, resume only: begin the decay at the step '
+                        'the checkpoint resumes from, and truncate --epochs so '
+                        'the run ends when the ramp does. The one-flag form of '
+                        '"the val curve has plateaued, anneal and finish" — no '
+                        'arithmetic, and no step already taken changes its LR.')
     p.add_argument('--min_lr_ratio', type=float, default=0.01)
     p.add_argument('--lr_decay_every', type=int, default=10)
     p.add_argument('--lr_decay_gamma', type=float, default=0.8)
@@ -389,6 +424,37 @@ def _format_log(log: dict) -> str:
                      if isinstance(v, (int, float)) or torch.is_tensor(v))
 
 
+def _fmt_duration(seconds):
+    """`123456.7` -> `1d 10h 17m`. Days matter here: a run is not hours long."""
+    if not np.isfinite(seconds) or seconds < 0:
+        return '?'
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f'{d}d {h}h {m}m'
+    if h:
+        return f'{h}h {m}m'
+    return f'{m}m'
+
+
+def _eta(done_steps, total_steps, elapsed_sec):
+    """(remaining_seconds, finish_epoch_seconds) from MEASURED throughput.
+
+    Deliberately measured rather than assumed: `total_steps` on its own says
+    nothing about wall clock, and the whole reason a 40-epoch run on the full
+    pool turned out to be ~10 days was that nothing ever converted steps into
+    time until the run was already going. Returns (None, None) before there is
+    enough signal to divide by.
+    """
+    if done_steps <= 0 or elapsed_sec <= 0 or total_steps <= done_steps:
+        return None, None
+    sec_per_step = elapsed_sec / done_steps
+    remaining = (total_steps - done_steps) * sec_per_step
+    return remaining, time.time() + remaining
+
+
 class JSONLLogger:
     """Append-only JSONL + plain-text mirror logger.
 
@@ -438,6 +504,9 @@ SPLIT_CRITICAL_ARGS = (
 # Legal (extending --epochs is a real use case), but it must be visible.
 SCHEDULE_SENSITIVE_ARGS = (
     'epochs', 'lr', 'weight_decay', 'lr_schedule', 'warmup_epochs',
+    # Deliberately here and NOT in SPLIT_CRITICAL_ARGS: branching the WSD decay
+    # at resume is the intended use of these, so they must warn, never abort.
+    'decay_fraction', 'decay_from_step',
     'min_lr_ratio', 'lr_decay_every', 'lr_decay_gamma', 'batch_size',
     'accum_steps', 'pixel_samples', 'train_resolution',
     'canonical_resolution', 'amp_dtype', 'grad_clip',
@@ -818,6 +887,19 @@ def main():
           f'total steps = {total_steps:,} | '
           f'effective batch = {args.batch_size * accum_steps}')
 
+    # Reject a decay point inside warmup before the Trainer silently clamps it.
+    if args.lr_schedule == 'wsd':
+        warmup_steps = int(args.warmup_epochs * steps_per_epoch)
+        if 0 < args.decay_from_step < warmup_steps:
+            raise SystemExit(
+                f'--decay_from_step {args.decay_from_step} falls inside warmup '
+                f'(0..{warmup_steps}). The decay cannot begin before the LR has '
+                f'finished rising; lower --warmup_epochs or raise the step.')
+        if not 0.0 < args.decay_fraction <= 1.0:
+            raise SystemExit('--decay_fraction must be in (0, 1].')
+    elif args.decay_now:
+        raise SystemExit('--decay_now requires --lr_schedule wsd.')
+
     trainer = Trainer(args, device, total_steps=total_steps,
                        steps_per_epoch=steps_per_epoch)
 
@@ -862,6 +944,24 @@ def main():
               f'best_val_loss={best_val_loss:.4f} | '
               f'epochs_no_improve={epochs_no_improve} | '
               f'prior elapsed={prior_elapsed_sec:.0f}s | run #{resume_count}')
+        # Branch the decay HERE, after the scheduler state is restored: the
+        # branch point is the resumed `global_step`, which does not exist until
+        # the checkpoint has been read.
+        if args.decay_now:
+            d_start, d_end = trainer.set_decay_from(trainer.global_step)
+            # End the run when the ramp does. Rounded UP to an epoch boundary
+            # because the loop is epoch-driven and cannot stop mid-epoch; the
+            # few extra steps run at the floor LR, which is harmless.
+            args.epochs = max(start_epoch + 1,
+                              math.ceil(d_end / steps_per_epoch))
+            total_steps = steps_per_epoch * args.epochs
+            trainer.total_steps = total_steps
+            print(f'[RESUME] --decay_now: decay branches at step {d_start} '
+                  f'(lr {trainer.lr_at(d_start):.3e}) and ramps over '
+                  f'{trainer.decay_len:,} steps to {trainer.lr_at(d_end):.3e} '
+                  f'at step {d_end}. --epochs truncated to {args.epochs} '
+                  f'(total_steps = {total_steps:,}). Steps already taken keep '
+                  f'the LR they were taken at.')
         if start_epoch >= args.epochs:
             print(f'[RESUME] the checkpoint has already completed all '
                   f'{args.epochs} epochs; skipping training and going straight '
@@ -942,6 +1042,15 @@ def main():
             'loader_gen': loader_gen.get_state(),
         }
 
+    # ETA baseline. Separate from `t0` so the estimate reflects TRAINING
+    # throughput only: t0 is rewound across a resume and (on a fresh run) its
+    # elapsed time still carries the scene-check and dataset construction,
+    # neither of which recurs per step. `_eta` divides by measured steps, so a
+    # one-off startup cost folded in here would inflate every estimate.
+    eta_t0 = time.time()
+    eta_step0 = trainer.global_step
+    eta_first_printed = False
+
     last_epoch_done = start_epoch - 1
     for epoch in range(start_epoch, args.epochs):
         epoch_t0 = time.time()
@@ -1004,6 +1113,34 @@ def main():
                 train_logger.write(scalar_log, text=text)
                 print(text)
 
+            # First ETA, ~100 optimizer steps in: early enough to abort a run
+            # whose length is unacceptable before it has cost anything, late
+            # enough that the worker-pool warmup has washed out. Refined on
+            # every epoch summary from then on.
+            if not eta_first_printed and trainer.global_step - eta_step0 >= 100:
+                eta_first_printed = True
+                measured = trainer.global_step - eta_step0
+                remaining, finish = _eta(measured,
+                                         total_steps - eta_step0,
+                                         time.time() - eta_t0)
+                if remaining is not None:
+                    sec_per_step = (time.time() - eta_t0) / measured
+                    msg = (f'[ETA] {sec_per_step:.2f}s/optimizer-step measured '
+                           f'over {measured} steps => '
+                           f'{sec_per_step * steps_per_epoch / 3600:.2f}h/epoch '
+                           f'(training only, excludes validation) | '
+                           f'{total_steps - trainer.global_step:,} steps left '
+                           f'=> {_fmt_duration(remaining)} | finish ~'
+                           f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(finish))}')
+                    print(msg)
+                    train_logger.write(
+                        {'kind': 'eta', 'epoch': epoch,
+                         'global_step': trainer.global_step,
+                         'sec_per_step': sec_per_step,
+                         'eta_sec': remaining,
+                         'eta_finish_unix': finish},
+                        text=msg)
+
             # `stepped` guards against re-saving the same step for every
             # micro-batch of an accumulation cycle.
             if (args.ckpt_every > 0 and stepped
@@ -1016,6 +1153,12 @@ def main():
                 step_path = trainer.save(
                     ckpt_dir, tag=f'step_{trainer.global_step}',
                     state=_loop_state(epoch - 1))
+                # Rotate immediately rather than at the epoch boundary: an
+                # epoch is thousands of steps, so waiting would let the whole
+                # epoch's worth of full checkpoints pile up first.
+                prune_checkpoints(ckpt_dir, keep_last=args.keep_last,
+                                  protect=('best',),
+                                  keep_last_steps=args.keep_last_steps)
                 print(f'[CHECKPOINT] Step checkpoint saved {step_path}')
 
             iter_end = time.time()
@@ -1044,6 +1187,20 @@ def main():
             # without ever tripping --max_consecutive_skips.
             'skipped_steps': trainer.skipped_steps,
         }
+        # Refined ETA, from FULL epoch cycles measured since the baseline —
+        # training plus the validation and checkpointing between them, which
+        # `epoch_sec` excludes and which is why summing `epoch_sec` under-counts
+        # a run's real length. It under-counts by the current epoch's own
+        # validation (this record is written before it) and converges as epochs
+        # accumulate.
+        epochs_done = epoch - start_epoch + 1
+        epochs_left = args.epochs - (epoch + 1)
+        sec_per_epoch = (time.time() - eta_t0) / max(1, epochs_done)
+        epoch_summary['sec_per_epoch_cycle'] = sec_per_epoch
+        if epochs_left > 0:
+            epoch_summary['eta_sec'] = sec_per_epoch * epochs_left
+            epoch_summary['eta_finish_unix'] = (
+                time.time() + epoch_summary['eta_sec'])
         for k, vals in epoch_running.items():
             # Average MAE, MSE, lr, and grad_norm over all training batches,
             # ignoring non-finite entries. A skipped step reports an inf/NaN
@@ -1091,6 +1248,13 @@ def main():
             epoch_summary,
             text=f'[EPOCH {epoch} DONE] ' + _format_log(epoch_summary),
         )
+        if epochs_left > 0:
+            finish = epoch_summary['eta_finish_unix']
+            print(f'[ETA] {epochs_left} epoch(s) left at '
+                  f'{sec_per_epoch / 3600:.2f}h per full cycle => '
+                  f'{_fmt_duration(epoch_summary["eta_sec"])} remaining | '
+                  f'finish ~'
+                  f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(finish))}')
 
         last_epoch_done = epoch
 
@@ -1158,7 +1322,8 @@ def main():
             print(f'[BEST] Epoch {epoch} | '
                   f'val_loss={best_val_loss:.4f} → {best_path}')
 
-        prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',))
+        prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',),
+                          keep_last_steps=args.keep_last_steps)
 
         # Early stopping (option 1): a safety cutoff that leaves the cosine
         # schedule spanning --epochs but bails once val loss plateaus.

@@ -120,6 +120,35 @@ def _cosine_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01)
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _wsd_with_warmup(optimizer, warmup_steps, bounds, min_lr_ratio=0.01):
+    """Warmup-Stable-Decay: linear warmup -> CONSTANT lr -> decay to
+    `min_lr_ratio`.
+
+    Unlike cosine, the LR at step `s` does not depend on the total length of
+    the run until the decay begins, so the run is genuinely extendable: a
+    resume may lengthen or shorten `--epochs` without retroactively changing
+    the LR of any step already taken. That is the whole reason this schedule
+    exists here -- see the note in CLAUDE.md on why a cosine cycle whose
+    length does not match the actual run underperforms.
+
+    `bounds` is a MUTABLE dict {'start', 'end'} rather than two captured ints,
+    so `Trainer.set_decay_from` can branch the decay at an arbitrary step on a
+    resume without rebuilding the scheduler (rebuilding would lose the restored
+    `last_epoch`). The closure reads it on every call.
+    """
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        start, end = bounds['start'], bounds['end']
+        if step < start:
+            return 1.0                      # stable phase: LR does not move
+        if step >= end:
+            return min_lr_ratio
+        progress = (step - start) / max(1, end - start)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 class Trainer:
     def __init__(self, args, device, total_steps, steps_per_epoch):
         self.args = args
@@ -140,10 +169,30 @@ class Trainer:
             lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay,
         )
         warmup_steps = int(args.warmup_epochs * steps_per_epoch)
+        self.warmup_steps = warmup_steps
+        self.min_lr_ratio = float(getattr(args, 'min_lr_ratio', 0.01))
+        # Populated only by the wsd branch; None means "this schedule has no
+        # branchable decay", which is what `set_decay_from` refuses to touch.
+        self._decay_bounds = None
+        self.decay_len = 0
         if args.lr_schedule == 'cosine':
             self.scheduler = _cosine_with_warmup(
                 self.optimizer, warmup_steps, total_steps,
-                min_lr_ratio=float(getattr(args, 'min_lr_ratio', 0.01)),
+                min_lr_ratio=self.min_lr_ratio,
+            )
+        elif args.lr_schedule == 'wsd':
+            # Length of the decay ramp, as a fraction of the planned run. The
+            # START is either explicit (--decay_from_step) or derived so the
+            # ramp lands exactly at the end of --epochs.
+            self.decay_len = max(1, int(round(
+                float(getattr(args, 'decay_fraction', 0.2)) * total_steps)))
+            explicit = int(getattr(args, 'decay_from_step', 0) or 0)
+            start = explicit if explicit > 0 else max(
+                warmup_steps, total_steps - self.decay_len)
+            self._decay_bounds = {'start': start, 'end': start + self.decay_len}
+            self.scheduler = _wsd_with_warmup(
+                self.optimizer, warmup_steps, self._decay_bounds,
+                min_lr_ratio=self.min_lr_ratio,
             )
         else:
             self.scheduler = _step_decay_with_warmup(
@@ -164,6 +213,8 @@ class Trainer:
         print(f'[Trainer] AMP = {self.amp_dtype}  Enabled = {self.amp_enabled}  '
               f'schedule = {args.lr_schedule}  warmup_steps = {warmup_steps}  '
               f'total_steps = {total_steps}')
+        if self._decay_bounds is not None:
+            self._print_decay_plan(total_steps, steps_per_epoch)
 
         self.total_steps = total_steps
         self.steps_per_epoch = steps_per_epoch
@@ -206,6 +257,62 @@ class Trainer:
                   '(slow; raises at the first NaN/Inf op).')
             self._install_forward_nan_hooks()
             self._install_grad_nan_hooks()
+
+    # -- WSD decay branch ---------------------------------------------------
+
+    def _print_decay_plan(self, total_steps, steps_per_epoch):
+        b = self._decay_bounds
+        spe = max(1, steps_per_epoch)
+        print(f'[Trainer] WSD: warmup 0->{self.warmup_steps} '
+              f'(epoch {self.warmup_steps / spe:.2f}) | constant lr to step '
+              f'{b["start"]} (epoch {b["start"] / spe:.2f}) | decay '
+              f'{self.decay_len} steps to step {b["end"]} '
+              f'(epoch {b["end"] / spe:.2f}), ending at '
+              f'{self.min_lr_ratio:g} x lr')
+        if b['end'] > total_steps:
+            # Not fatal, but the run would stop mid-ramp and never reach
+            # min_lr, which is exactly the annealed endpoint the schedule
+            # exists to produce.
+            print(f'[Trainer] WARNING: the decay ends at step {b["end"]} but '
+                  f'the run is only {total_steps} steps. The LR will be cut '
+                  f'off at {self.lr_at(total_steps):.3e} instead of reaching '
+                  f'{self.min_lr_ratio * self.args.lr:.3e}. Raise --epochs to '
+                  f'>= {math.ceil(b["end"] / spe)} or lower --decay_fraction.')
+        elif b['end'] < total_steps:
+            print(f'[Trainer] NOTE: {total_steps - b["end"]} steps '
+                  f'({(total_steps - b["end"]) / spe:.2f} epochs) run at the '
+                  f'floor lr after the decay completes.')
+
+    def lr_at(self, step):
+        """The LR this schedule would produce at `step` (for reporting)."""
+        lam = self.scheduler.lr_lambdas[0]
+        return float(self.args.lr) * float(lam(step))
+
+    def set_decay_from(self, step):
+        """Branch the WSD decay so it begins at `step` and runs `decay_len`.
+
+        Called on a resume with --decay_now. This is the operation cosine
+        cannot express: it changes only the FUTURE of the schedule, leaving
+        every step already taken at the LR it was actually taken at, so the
+        resumed run is a legitimate continuation rather than a re-shaping.
+
+        Returns the new (start, end). The LR is re-applied to the optimizer
+        immediately, so the first resumed step does not run one step behind at
+        the restored constant-phase LR.
+        """
+        if self._decay_bounds is None:
+            raise ValueError('--decay_now requires --lr_schedule wsd '
+                             f'(this run uses {self.args.lr_schedule}).')
+        start = max(int(step), self.warmup_steps)
+        self._decay_bounds['start'] = start
+        self._decay_bounds['end'] = start + self.decay_len
+        lam = self.scheduler.lr_lambdas[0]
+        scale = float(lam(self.scheduler.last_epoch))
+        for group, base in zip(self.optimizer.param_groups,
+                               self.scheduler.base_lrs):
+            group['lr'] = base * scale
+        self.scheduler._last_lr = [g['lr'] for g in self.optimizer.param_groups]
+        return start, self._decay_bounds['end']
 
     def _install_forward_nan_hooks(self):
         """Print the FIRST leaf module whose forward output goes non-finite.
@@ -888,42 +995,80 @@ def _epoch_index(path):
     return int(m.group(1)) if m else -1
 
 
+def _step_index(path):
+    """Optimizer step encoded in a `step_<n>.pt` filename, or -1."""
+    m = re.search(r'step_(\d+)\.pt$', os.path.basename(path))
+    return int(m.group(1)) if m else -1
+
+
 def find_latest_checkpoint(ckpt_dir):
     """Newest resumable checkpoint in `ckpt_dir`, or None.
 
-    Highest-numbered `epoch_*.pt` first, then `final.pt`. `best.pt` is
-    deliberately never chosen: it is a *selection* artifact and normally lags
-    the training frontier, so resuming from it would silently replay epochs.
+    The most recently WRITTEN of {newest `epoch_*.pt`, newest `step_*.pt`},
+    then `final.pt`. `best.pt` is deliberately never chosen: it is a
+    *selection* artifact and normally lags the training frontier, so resuming
+    from it would silently replay epochs.
+
+    `step_*.pt` is included because with `--ckpt_every` on by default it is the
+    newest state on disk after a mid-epoch crash, and ignoring it would throw
+    away every step since the last epoch boundary — hours, on the full pool —
+    which is the entire reason those checkpoints are written. It is never a
+    worse choice than the epoch checkpoint it follows: both carry the same
+    `loop_state` epoch (a step checkpoint stores `epoch - 1`, so its epoch is
+    replayed from the top either way), but the step file's model and optimizer
+    are further along.
+
+    Chosen by mtime rather than by parsed number because the two series are not
+    comparable numerically, and mtime correctly prefers a fresh epoch
+    checkpoint over a `step_*.pt` left behind by an earlier resume generation.
     """
+    candidates = []
     epochs = glob.glob(os.path.join(ckpt_dir, 'epoch_*.pt'))
     if epochs:
-        return max(epochs, key=_epoch_index)
+        candidates.append(max(epochs, key=_epoch_index))
+    steps = glob.glob(os.path.join(ckpt_dir, 'step_*.pt'))
+    if steps:
+        candidates.append(max(steps, key=_step_index))
+    if candidates:
+        return max(candidates, key=os.path.getmtime)
     final = os.path.join(ckpt_dir, 'final.pt')
     return final if os.path.isfile(final) else None
 
 
-def prune_checkpoints(ckpt_dir, keep_last=3, protect=()):
-    """Delete `epoch_*.pt` checkpoints except the most recent `keep_last` and
-    anything in `protect` (e.g. {'best'}). The legacy `<target>.pytmodel` and
-    explicit step checkpoints are never auto-deleted.
+def prune_checkpoints(ckpt_dir, keep_last=3, protect=(), keep_last_steps=None):
+    """Rotate `epoch_*.pt` (and, when `keep_last_steps` is set, `step_*.pt`).
 
-    Ordering is by the parsed epoch NUMBER, not by filename. Sorting the paths
-    as strings put `epoch_10.pt` before `epoch_7.pt`
+    Keeps the most recent `keep_last` epoch checkpoints and anything in
+    `protect` (e.g. {'best'}). `final.pt` and the legacy `<target>.pytmodel`
+    are never touched.
+
+    `step_*.pt` is rotated separately and only when `keep_last_steps` is not
+    None: it is mid-epoch crash insurance, so a handful is enough, and with
+    `--ckpt_every` on by default an unrotated series would fill the disk (one
+    full checkpoint carries the model plus both AdamW moments). Passing None
+    preserves the historical never-delete behaviour for callers that want it.
+
+    Ordering is by the parsed epoch/step NUMBER, not by filename. Sorting the
+    paths as strings put `epoch_10.pt` before `epoch_7.pt`
     (['epoch_10.pt', 'epoch_11.pt', 'epoch_7.pt', 'epoch_8.pt', 'epoch_9.pt']),
     so from epoch 10 onward the newest checkpoint was deleted the moment it was
     written and the disk froze at epochs 7/8/9 — which would have made
     `--resume` replay the same epoch forever.
     """
-    paths = sorted(glob.glob(os.path.join(ckpt_dir, 'epoch_*.pt')),
-                   key=_epoch_index)
-    if len(paths) <= keep_last:
-        return
-    keep = set(paths[-keep_last:])
-    for name in protect:
-        keep.add(os.path.join(ckpt_dir, f'{name}.pt'))
-    for p in paths:
-        if p not in keep and os.path.isfile(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+    protected = {os.path.join(ckpt_dir, f'{name}.pt') for name in protect}
+
+    def rotate(pattern, key, keep_n):
+        paths = sorted(glob.glob(os.path.join(ckpt_dir, pattern)), key=key)
+        if len(paths) <= keep_n:
+            return
+        keep = set(paths[len(paths) - keep_n:]) | protected
+        for p in paths:
+            if p not in keep and os.path.isfile(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    rotate('epoch_*.pt', _epoch_index, keep_last)
+    if keep_last_steps is not None:
+        rotate('step_*.pt', _step_index, max(0, int(keep_last_steps)))

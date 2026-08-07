@@ -104,6 +104,50 @@ Net effect: two runs that differ only in the model are evaluated on byte-identic
 data. `Net.sample_train_pixels` is the single override point for a new sampler
 (training only); nothing else needs to change to keep the comparison fair.
 
+**LR schedule — why `wsd` and not `cosine`.** A cosine schedule's LR at step
+`s` is a function of `s / total_steps`, so it must know the endpoint in
+advance, and a cycle length that does not match the actual run costs final
+loss (Chinchilla, Hoffmann et al. 2022, App. B). That makes "train a while,
+measure throughput, then decide the length" *lossy*: resuming with a different
+`--epochs` rebuilds the lambda from the new value while the scheduler's step
+count comes from the old run, so every step already taken is retroactively
+re-priced (at step 46,359 of the thesis config, shortening 40 → 16 epochs
+moves that step's LR by ×0.73) and the resulting curve has a kink nobody can
+reproduce without replaying the exact kill point.
+
+`--lr_schedule wsd` (warmup → **stable** → decay) removes the coupling: the LR
+does not depend on the endpoint until the decay begins, so the run is
+genuinely extendable and the decision of when to stop can be made *from the
+val curve* rather than committed before the first step.
+
+- `--decay_fraction` (0.2) is the **length** of the decay ramp, as a fraction
+  of the planned run. It is not a stopping rule.
+- `--decay_from_step` is where the ramp **begins**; 0 derives it so the ramp
+  lands exactly at the end of `--epochs`. Left alone, the run is therefore
+  fully hands-off and finishes annealed exactly like a cosine run — watching
+  the curve is *optional*, not required.
+- `--decay_now` (resume only) begins the ramp at the step being resumed from
+  and truncates `--epochs` so the run ends when the ramp does (rounded up to
+  an epoch boundary, since the loop is epoch-driven). This is the one-flag
+  form of "val has plateaued, anneal and finish", and it is **continuous in
+  LR** — the stable phase sits at exactly `1.0 × --lr`, which is where the
+  cosine ramp starts, so nothing jumps and no step already taken changes.
+
+`--decay_fraction` and `--decay_from_step` are in `SCHEDULE_SENSITIVE_ARGS`,
+not `SPLIT_CRITICAL_ARGS`: changing them at resume is the intended use, so
+they warn rather than abort.
+
+Note that WSD is a more aggressive schedule in aggregate — it holds the peak
+LR for ~80% of the run where cosine averages about half of it. Watch
+`grad_norm` and `avg_grad_skipped` over the few hundred steps after warmup
+ends.
+
+**A/B use.** Whatever decay point Model A ends up with, pin it for B and C
+with an explicit `--decay_from_step` + the same `--epochs`. Choosing it from
+A's val curve is legitimate — it is one shared hyperparameter chosen once, not
+a per-model tune — but all three variants must run the identical schedule for
+the comparison to mean anything.
+
 **Early stopping (safety cutoff):** `--patience` (default 10, in units of
 validation checks; 0 disables) stops training once val loss has not improved
 by more than `--min_delta` (default 0.0) for that many consecutive checks. The
@@ -295,13 +339,17 @@ match meaningful rather than coincidental.
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
 - K is `--k_per_scene` (default 10), enforced in `HdlongLoader` / `PolarPSLoader` and as the pool's validity threshold.
 - `--lr`: 1e-4 — `--weight_decay`: 0.05
-- `--lr_schedule`: `cosine` (1e-4 → 1e-4·`min_lr_ratio` over the full run) or `step`
+- `--lr_schedule`: `wsd` (recommended), `cosine`, or `step` — see **LR
+  schedule** below
+- `--decay_fraction`: 0.2 — `--decay_from_step`: 0 — `--decay_now` (wsd only)
 - `--warmup_epochs`: 5.0 (linear)
 - `--amp_dtype`: `bf16` (recommended on H100), `fp16` (legacy), or `none`
 - `--grad_clip`: 1.0
 - `--max_consecutive_skips`: 20 — `--max_skip_rate`: 0.3 over
   `--skip_rate_window`: 200 (either 0 disables that guard) — see below
 - `--keep_last`: 3 (epoch checkpoints to retain; `best.pt` is kept separately)
+  — `--ckpt_every`: 1000 optimizer steps, `--keep_last_steps`: 2 (mid-epoch
+  crash insurance; see **Checkpoints** below)
 - `--resume`: continue an interrupted run (`auto`, a checkpoint dir, or a
   file) — see **Resuming** below. `--resume_weights_only` forces a
   weights-only warm start; `--allow_config_change` downgrades the split-config
@@ -312,7 +360,25 @@ The final test evaluation runs automatically after the last epoch on the
 held-out `--test_fraction` split, averaged over `--test_trials` deterministic
 trials.
 
-Checkpoints are written to `<session>/checkpoints/`. Each save also drops a bare-`state_dict` `normal.pytmodel` copy (overwritten every save, so it tracks the *latest* weights); each `best.pt` update additionally copies it to `best_normal.pytmodel`. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned (`final.pt` and `step_*.pt` are never auto-pruned), **ordered by parsed epoch number** — sorting the filenames as strings put `epoch_10.pt` before `epoch_7.pt`, so from epoch 10 onward the newest checkpoint was deleted the moment it was written.
+Checkpoints are written to `<session>/checkpoints/`. Each save also drops a bare-`state_dict` `normal.pytmodel` copy (overwritten every save, so it tracks the *latest* weights); each `best.pt` update additionally copies it to `best_normal.pytmodel`. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned (`final.pt` is never auto-pruned), **ordered by parsed epoch number** — sorting the filenames as strings put `epoch_10.pt` before `epoch_7.pt`, so from epoch 10 onward the newest checkpoint was deleted the moment it was written.
+
+**Mid-epoch checkpoints.** `--ckpt_every` (default 1000 optimizer steps, 0
+disables) writes `step_*.pt`, because resume granularity is one epoch and an
+epoch on the full pool is hours long — without it a crash discards everything
+since the last epoch boundary. They are rotated to `--keep_last_steps`
+(default 2) **immediately after each write**, not at the epoch boundary: an
+epoch is thousands of steps, so waiting would let a whole epoch's worth of
+full checkpoints (model + both AdamW moments each) accumulate first.
+
+`find_latest_checkpoint` picks the most recently *written* of {newest
+`epoch_*.pt`, newest `step_*.pt`}, so `--resume auto` actually uses that
+insurance. A `step_*.pt` is never a worse choice than the epoch checkpoint
+preceding it — both carry the same `loop_state` epoch (a step checkpoint
+stores `epoch - 1`, so its epoch replays from the top either way) but its
+model and optimizer are further along. Selection is by mtime, not by parsed
+number, because the two series are not numerically comparable and mtime
+correctly prefers a fresh epoch checkpoint over a `step_*.pt` left by an
+earlier resume generation.
 
 Every save is atomic (`torch.save` to `*.tmp`, then `os.replace`): the file most likely to be half-written when a machine dies is the newest one, which is exactly the one `--resume` picks.
 
@@ -327,8 +393,9 @@ python sdm_unips/train.py ... --resume auto     # same command that launched it
 ```
 
 `--resume` accepts `auto` (this session's `checkpoints/`), any checkpoint
-directory, or a specific file. A directory resolves to its highest-numbered
-`epoch_*.pt`, else `final.pt`; **never `best.pt`**, which is a *selection*
+directory, or a specific file. A directory resolves to the most recently
+written of {highest-numbered `epoch_*.pt`, highest-numbered `step_*.pt`}, else
+`final.pt`; **never `best.pt`**, which is a *selection*
 artifact and normally lags the training frontier. `auto` on a session with no
 checkpoints starts a fresh run, so the same command works for launch and
 relaunch; any other unresolvable path is a hard error (a typo must not silently
@@ -394,6 +461,25 @@ The dedicated `normal/` subdirectory is required because `builder.load_models` g
 
 Logs land in `<session>/logs/`:
 - `train.jsonl` / `train.log`  — per-step loss, MAE, LR, grad norm, step seconds; per-epoch and per-validation summaries
+
+**ETA (always on).** `total_steps` alone says nothing about wall clock, which
+is how a 40-epoch run on the full 51.5k-scene pool turned out to be ~10 days
+without anyone noticing until it was already running. Two records now convert
+steps into time from **measured** throughput:
+
+- `{"kind": "eta", ...}` — printed once, ~100 optimizer steps in. Early enough
+  to kill a run whose length is unacceptable before it has cost anything, late
+  enough that the worker-pool warmup has washed out. Carries `sec_per_step`,
+  the implied hours/epoch, `eta_sec` and `eta_finish_unix`.
+- `sec_per_epoch_cycle`, `eta_sec`, `eta_finish_unix` on every epoch summary,
+  measured over **full epoch cycles** (training *plus* the validation and
+  checkpointing between them) rather than `epoch_sec`, which excludes both and
+  therefore under-counts a run's real length when summed.
+
+Both measure from a baseline taken at the top of the epoch loop, not from
+`t0`: `t0` is rewound across a resume and on a fresh run still carries the
+scene-check and dataset construction, neither of which recurs per step, so
+folding it in would inflate every estimate.
 
 `elapsed_sec` (wall-clock since training began) is carried on every step
 record, epoch summary, validation summary and the final test summary. It is
