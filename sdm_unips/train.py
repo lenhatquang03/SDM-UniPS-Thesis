@@ -256,6 +256,28 @@ def build_argparser():
     p.add_argument('--train_resolution', type=int, default=512)
     p.add_argument('--max_scenes', type=int, default=8000,
                    help='Cap the training set size. 0 = no cap.')
+    p.add_argument('--k_per_scene', type=int, default=10,
+                   help='Images drawn per scene (K). Doubles as the minimum a '
+                        'scene must supply to enter the pool, so changing it '
+                        'changes which scenes qualify -- and therefore the '
+                        'split. Treated as split-critical on --resume.')
+    p.add_argument('--scene_manifest', default=None,
+                   help='Reuse a previously written scene_manifest.json '
+                        'instead of rescanning. Point Models B and C at Model '
+                        "A's manifest so all three provably train on the same "
+                        'pool regardless of filesystem drift. A resumed run '
+                        "reuses its own session's manifest automatically.")
+    p.add_argument('--strict_scenes', action='store_true',
+                   help='Abort if ANY discovered scene fails validation, '
+                        'instead of skipping it. Off by default: a handful of '
+                        'malformed scenes is a data-quality fact, not a reason '
+                        'to refuse to train.')
+    p.add_argument('--max_bad_scene_frac', type=float, default=0.05,
+                   help='Abort if more than this fraction of discovered scenes '
+                        'fail validation (0 disables). A large fraction means '
+                        'a half-mounted dataset or a wrong --k_per_scene, and '
+                        'training on the remainder would look exactly like a '
+                        'normal run on a fraction of the data.')
 
     # Optimization (thesis recipe defaults) ------------------------------
     p.add_argument('--epochs', type=int, default=60)
@@ -402,6 +424,13 @@ class JSONLLogger:
 SPLIT_CRITICAL_ARGS = (
     'seed', 'val_fraction', 'test_fraction', 'max_scenes',
     'hdlong_dir', 'polarps_dir', 'train_dir',
+    # K decides which scenes can supply a sample, so it decides the pool.
+    'k_per_scene',
+    # Digest of the validated scene pool, set by `_validate_pool`. The split is
+    # a permutation over scene POSITIONS, so a pool that gained or lost even
+    # one scene produces a different split -- and a checkpoint resumed against
+    # it would have trained on scenes that are now held-out test.
+    'scene_pool_fingerprint',
 )
 # Changing these keeps the split intact but bends the optimization mid-run:
 # the LR lambda is rebuilt from the NEW args while the scheduler's step count
@@ -493,6 +522,14 @@ def check_resume_compat(prev_args, args, allow_change):
                  'training and the final number becomes meaningless. Re-run '
                  'with the original values, or pass --allow_config_change if '
                  'this is deliberate.')
+        if any(d.strip().startswith('scene_pool_fingerprint') for d in split_diffs):
+            msg += ('\nThe fingerprint covers the validated scene POOL, so it '
+                    'moved because scenes appeared, vanished, or changed '
+                    'validity since the checkpoint was written (a repaired '
+                    'scene, a partially-mounted dataset, a different '
+                    '--k_per_scene). Pass --scene_manifest pointing at the '
+                    "original run's scene_manifest.json to reproduce the exact "
+                    'pool, or start a fresh run.')
         if not allow_change:
             raise RuntimeError('[RESUME] ' + msg)
         print('[RESUME] WARNING (--allow_config_change): ' + msg)
@@ -769,7 +806,9 @@ def main():
     steps_per_epoch = max(1, math.ceil(micro_per_epoch / accum_steps))
     total_steps = steps_per_epoch * args.epochs
     print(f'[TRAIN] scenes: train = {len(train_set):,} | val = {len(val_set):,} | '
-          f'test = {len(test_set):,} (x{args.test_trials} trials)')
+          f'test = {len(test_set):,} (x{args.test_trials} trials) | '
+          f'K = {args.k_per_scene} | '
+          f'pool fingerprint = {getattr(args, "scene_pool_fingerprint", "?")}')
     print(f'[EVAL] Held-out evaluation is model-independent: renders pinned per '
           f'scene (val x1 trial, test x{args.test_trials}) and pixel samples '
           f'drawn outside the network, both seeded from --seed {args.seed}. '

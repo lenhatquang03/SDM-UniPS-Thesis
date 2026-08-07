@@ -21,7 +21,6 @@ divide each image by its (cached) foreground max intensity, matching the
 inference-time normalization in `realdata.py`.
 """
 
-import glob
 import os
 import re
 
@@ -29,6 +28,7 @@ import cv2
 import numpy as np
 
 from .scale_cache import masked_scale, read_scales, write_scales
+from .scene_check import usable_light_dirs
 
 os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
 
@@ -54,9 +54,10 @@ class PolarPSLoader:
         data_workspace, h, w, numberOfImages.
     """
 
-    def __init__(self, train_resolution=512, outdir='.'):
+    def __init__(self, train_resolution=512, outdir='.', k=10):
         self.train_resolution = int(train_resolution)
         self.outdir = outdir
+        self.k = max(1, int(k))
         # Per-scene {rel_path: foreground_scale} caches, memoized so the sidecar
         # is read from disk at most once per scene per worker.
         self._scales_by_dir = {}
@@ -77,8 +78,9 @@ class PolarPSLoader:
         return False
 
     def _sample_K(self, total_available):
-        # Fixed K=10 renders per scene (capped by what's actually on disk).
-        return min(10, total_available)
+        # K renders per scene (capped by what's actually on disk; startup
+        # validation guarantees >= K, so the cap is defensive only).
+        return min(self.k, total_available)
 
     def load(self, scene_dir, augment=True, rng=None):
         rng = rng if rng is not None else np.random
@@ -97,17 +99,17 @@ class PolarPSLoader:
         # Normalization
         N = (n_vec * mask[..., None]) / (mag[..., None] + 1e-12)
 
-        # Randomply sample 10 images/scene
-        # There should only be 1 sub-directory
-        subdirs = sorted(d for d in glob.glob(os.path.join(scene_dir, '*'))
-                         if os.path.isdir(d))
-        if not subdirs:
+        # Randomly sample K images/scene, drawing ONLY from light dirs that
+        # actually hold an S0.exr. `usable_light_dirs` is the same helper the
+        # startup validator uses, so "this scene passed validation" and "every
+        # draw here succeeds" cannot drift apart. Without the filter, a scene
+        # with 31 of 32 lights intact would pass validation and still fail
+        # roughly one read in 32.
+        img_subdir, light_dirs = usable_light_dirs(scene_dir)
+        if img_subdir is None:
             raise RuntimeError(f'No image sub-directory in {scene_dir}')
-        img_subdir = subdirs[0]
-        light_dirs = sorted(d for d in glob.glob(os.path.join(img_subdir, 'light-*'))
-                            if os.path.isdir(d))
         if not light_dirs:
-            raise RuntimeError(f'No light-* dirs under {img_subdir}')
+            raise RuntimeError(f'No light-*/S0.exr under {img_subdir}')
 
         K = self._sample_K(len(light_dirs))
         chosen = rng.permutation(len(light_dirs))[:K]

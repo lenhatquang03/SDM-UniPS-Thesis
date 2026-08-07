@@ -41,6 +41,7 @@ import cv2
 import numpy as np
 
 from .scale_cache import masked_scale
+from .scene_check import usable_cam_dirs
 
 # Required for OpenCV EXR support.
 os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
@@ -85,13 +86,15 @@ class HdlongLoader:
         - (row_min, row_max, col_min, col_max: The bounding box fed to the network
     """
 
-    def __init__(self, train_resolution=512, outdir='.'):
+    def __init__(self, train_resolution=512, outdir='.', k=10):
         self.train_resolution = int(train_resolution)
         self.outdir = outdir
+        self.k = max(1, int(k))
 
     def _sample_K(self, total_available):
-        # Fixed 10 rendered images per scene.
-        return min(10, total_available)
+        # K rendered images per scene (capped by what's on disk; startup
+        # validation guarantees >= K, so the cap is defensive only).
+        return min(self.k, total_available)
 
     def load(self, scene_dir, augment=True, rng=None):
         rng = rng if rng is not None else np.random
@@ -100,12 +103,19 @@ class HdlongLoader:
         self.objname = re.split(r'\\|/', scene_dir)[-1]
         self.data_workspace = f'{self.outdir}/results/{self.objname}'
 
-        # For each scene, randomly choose one camera
-        cam_dirs = sorted(d for d in glob.glob(os.path.join(scene_dir, 'cam_*'))
-                          if os.path.isdir(d))
+        # For each scene, randomly choose one camera -- but only among cameras
+        # that are actually complete (mask + normal + >= K each of
+        # point/dir/env). `usable_cam_dirs` is the same helper the startup
+        # validator uses, so "this scene passed validation" and "every draw
+        # here succeeds" cannot drift apart. Drawing from ALL cam_* dirs would
+        # make a scene with 1 good camera out of 3 fail two reads in three,
+        # despite validating cleanly.
+        cam_dirs = usable_cam_dirs(scene_dir, self.k)
         if not cam_dirs:
-            raise RuntimeError(f'No cam_* subdirectories in {scene_dir}')
-        # Shuffle all camera dirs
+            raise RuntimeError(
+                f'No usable cam_* subdirectory in {scene_dir} '
+                f'(need binary_mask.exr + local_normal.exr and >= {self.k} '
+                f'each of point/dir/env images)')
         cam_dir = cam_dirs[rng.randint(0, len(cam_dirs))]
 
         # Extract different lighting condition means

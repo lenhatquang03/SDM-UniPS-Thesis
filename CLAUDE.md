@@ -163,10 +163,29 @@ backward hooks that name the first non-finite gradient in true backward order
 localize anything: one optimizer step after the origin, every parameter is
 NaN.
 
-**Reproducibility:** a run is reproducible for a fixed config — all RNGs are
+**Reproducibility:** an *uninterrupted* run is reproducible for a fixed config
+— all RNGs are
 seeded from `--seed` (python/numpy/torch/cuda), cuDNN is pinned to
 deterministic kernels, and the DataLoaders seed their workers' numpy RNG
-(`worker_init_fn`) with a seeded shuffle `generator`. The test evaluation is
+(`worker_init_fn`) with a seeded shuffle `generator`.
+
+A **resumed** run is not bit-identical to an uninterrupted one, by design
+decision (verified 2026-08-07). `--resume` restores the RNG streams and the
+shuffle `generator`, so the model-side draws continue exactly, but
+`persistent_workers=True` seeds each worker's numpy RNG **once**, at the first
+epoch, from a `base_seed` drawn off the shuffle generator; those RNGs then
+evolve inside the worker processes across epochs. A resumed run spawns fresh
+workers mid-schedule and draws a new `base_seed`, so its shuffle permutation
+and per-scene random renders (Dirichlet mix, camera, K-image draw) diverge from
+what the uninterrupted run would have seen — same distribution, different
+sample. `persistent_workers=False` would close the gap (every epoch would then
+consume the generator identically) at the cost of respawning workers each
+epoch; deliberately not done, because it changes no reported number: val and
+test go through `MixedEvalDataset` + `Trainer._eval_sample_ids`, both seeded
+per *item* and independent of all of this, so the A/B contract and the headline
+test figure are untouched.
+
+The test evaluation is
 strongly reproducible: `MixedEvalDataset` seeds each scene's random
 camera/lights from its flat index (independent of worker count), and the
 final eval re-seeds torch so the model's pixel sampling is fixed too. To cut
@@ -174,10 +193,87 @@ the variance of the random K-image draw, each test scene is rendered
 `--test_trials` times (default 3), each trial a different fixed K-image draw,
 and their MAE is averaged with a scene-count-weighted (unbiased) mean.
 
+**Malformed scenes (validated before the split).** Discovery admits a
+directory on a single marker file (`normal.exr` / `light_means.config`), which
+is far less than the loaders need — a directory carrying only the marker enters
+the pool, is assigned to a split, and raises the first time the sampler reaches
+it, potentially days in. `modules/io/dataloader/scene_check.py` therefore
+validates the whole pool at startup, **before the `--max_scenes` cap and before
+the split**, so both operate on a fully readable pool and the val/test
+fractions and the hdlong:PolarPS ratio stay exact.
+
+A scene is valid iff it can supply one sample of K (`--k_per_scene`) images:
+
+- **PolarPS** — `normal.exr`, plus ≥K `light-*` dirs holding an `S0.exr` under
+  `sorted(subdirs)[0]`. That first material-mix directory specifically, because
+  it is the only one `PolarPSLoader.load` ever reads.
+- **hdlong** — `light_means.config`, plus ≥1 `cam_*` dir with
+  `binary_mask.exr`, `local_normal.exr` and `min(#point, #dir, #env) ≥ K`.
+
+Checks are stat-only (no EXR decode — decoding one image per scene across ~18k
+scenes would take hours) and run on a thread pool, since each lookup on a
+network mount is a round trip. `ThreadPoolExecutor.map` preserves input order,
+which the split depends on.
+
+**The validator and the loaders share their definition of "usable"**, via
+`usable_cam_dirs` / `usable_light_dirs` in `scene_check.py`. This is not
+tidiness: the rule is "≥1 usable camera", so a scene with one good camera out
+of three passes — and would still fail two reads in three if `HdlongLoader`
+kept drawing from all `cam_*`. The loaders draw only from what those helpers
+return, so "passed validation" and "every read succeeds" cannot drift apart.
+
+**Corrupt file contents** cannot be caught by a stat check, so
+`MixedTrainDataset._get_with_fallback` also steps forward to the next scene on
+any read failure, logging once per scene per worker. The substitution is a pure
+function of the scene list and the failing index — no RNG, no model state — so
+an A/B pair still sees identical data. The failing scene is **not** removed
+from the pool: the split is a permutation over scene *positions*, so dropping
+one mid-run would reshuffle everything. More than 8 consecutive failures raises
+instead (that is an unmounted dataset, not a few bad files). Per-worker counts
+are not aggregated into the epoch summary — workers are separate processes and
+that would require widening the batch tuple — so grep `[SceneSkip]` in the log.
+
+**Pool identity across runs.** The split is a permutation over pool *positions*,
+so a pool that gains or loses even one scene relands every surviving scene:
+empirically, removing 1 scene of 20 moved 4 of the other 19, and ~75% of a
+freshly-permuted test split turns out to be old-train scenes. Three mechanisms
+keep this from silently corrupting an A/B comparison:
+
+- `<session>/logs/scene_manifest.json` — the validated pool, plus every
+  rejected scene with its reason (the record of what was excluded).
+- `args.scene_pool_fingerprint` (sha1 of the ordered valid list) in
+  `config.json` and in every checkpoint, and **split-critical** on `--resume`:
+  a mismatch aborts, exactly as a changed `--seed` does.
+- `--scene_manifest PATH` — reuse a pinned pool. Point Models B and C at Model
+  A's manifest so all three provably train on the same split regardless of
+  filesystem drift; missing scenes in a reused manifest are a hard error, never
+  a silent drop. A **resumed run reuses its own session's manifest
+  automatically**, so a repaired scene between launches cannot change the split
+  underneath it (and startup skips the scan).
+
+Both the manifest and the fingerprint describe scenes **relative to their
+dataset root** (`scene_check.relative_to_roots`, posix separators), never by
+absolute path. Absolute paths would make both machine-specific: training Model
+B on a second box that mounts the datasets elsewhere would produce a different
+fingerprint for the *same* pool — the resume/A-B guard flagging a difference
+that does not exist — and Model A's manifest could not be reused there at all.
+With relative paths a fresh scan at a different mount point yields the
+identical fingerprint (verified), and `read_manifest` rebases a manifest onto
+the current roots, so differing roots are a rebase rather than an error. A
+uniform root change also leaves discovery order untouched (all paths share the
+prefix), so the split itself is unchanged — which is what makes the fingerprint
+match meaningful rather than coincidental.
+
 **Key training flags** (defaults shown are thesis values):
 - `--hdlong_dir`, `--polarps_dir`: roots for the two mixed sources (either or both)
 - `--train_dir`: auto-detect root (scenes classified into hdlong/polarps by on-disk markers)
 - `--max_scenes`: cap on the **combined** scene pool before the split (thesis uses 8000)
+- `--k_per_scene`: 10 — images drawn per scene, and the minimum a scene must
+  supply to enter the pool. Split-critical: raising it shrinks the pool
+- `--scene_manifest`: reuse a pinned scene list instead of rescanning
+- `--strict_scenes`: abort if any scene fails validation (default: skip it)
+- `--max_bad_scene_frac`: 0.05 — abort if more than this fraction fails
+  validation (0 disables); catches a half-mounted dataset or a wrong `--k_per_scene`
 - `--val_fraction`: held-out fraction for validation (default 0.1)
 - `--test_fraction`: held-out fraction for the final test report (default 0.1)
 - `--test_trials`: deterministic K-image draws per test scene, averaged (default 3; keep small)
@@ -197,7 +293,7 @@ and their MAE is averaged with a scene-count-weighted (unbiased) mean.
   batches raise OOM instead of consuming the whole card. Worth setting when
   the GPU also drives a display.
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
-- K is fixed at 10 per scene inside `HdlongLoader` / `PolarPSLoader`.
+- K is `--k_per_scene` (default 10), enforced in `HdlongLoader` / `PolarPSLoader` and as the pool's validity threshold.
 - `--lr`: 1e-4 — `--weight_decay`: 0.05
 - `--lr_schedule`: `cosine` (1e-4 → 1e-4·`min_lr_ratio` over the full run) or `step`
 - `--warmup_epochs`: 5.0 (linear)
@@ -426,7 +522,7 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 
 ### Data loading
 - Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).
-- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. The per-image normalization scalar and its PolarPS-only sidecar cache live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is fixed at 10 per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
+- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `modules/io/dataloader/scene_check.py` validates the pool before the split and owns the shared "usable unit" helpers the loaders draw from. The per-image normalization scalar and its PolarPS-only sidecar cache live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is `--k_per_scene` (default 10) per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
 - Held-out val and test: both wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × n_trials`, per-index-seeded so renders are worker-count-independent and reproducible). Val uses `n_trials=1` and runs every `--val_every_epochs`; test uses `--test_trials` and runs **once after the final epoch** via `train.py:run_test_eval`. Both sweep `train.py:run_eval_pass` → `Trainer.val_step` (scene-count-weighted mean, non-finite dropped). No external benchmark is involved.
 
 ## Environment
