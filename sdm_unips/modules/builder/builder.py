@@ -48,10 +48,21 @@ class builder():
             testdata=None,
             max_image_resolution=None,
             ):
+        """Recover normal maps for every object in `testdata`.
+
+        Returns one record per object, in iteration order:
+            {'objname', 'normal', 'normal_gt', 'error_map', 'mae'}
+        `normal` is the full-canvas float32 prediction in RGB, `error_map` the
+        per-pixel angular error in **degrees, unclamped** (the `error.png`
+        written below is clamped to 90 and rescaled for 8-bit display), and
+        `normal_gt` / `error_map` / `mae` are None when no ground truth was
+        found. The return value is additive -- `main.py` ignores it.
+        """
 
         testdata.max_image_resolution = max_image_resolution
         test_data_loader = torch.utils.data.DataLoader(testdata, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
+        results = []
         for batch_test in test_data_loader:
             I, N, M, nImgArray, roi = self.separate_batch(batch_test)
             roi = roi[0].numpy()
@@ -100,15 +111,25 @@ class builder():
                 nout = np.zeros((h_, w_, 3), np.float32)
                 nout[r_s:r_e, c_s:c_e, :] = nml
 
+                record = {'objname': testdata.data.objname, 'normal': nout,
+                          'normal_gt': None, 'error_map': None, 'mae': None}
+
                 if torch.sum(N) > 0:
                     n_true = N.permute(0, 2, 3, 1).squeeze().cpu().numpy()
                     mask = np.float32(np.abs(1 - np.sqrt(np.sum(n_true * n_true, axis=2))) < 0.5)
                     mae, emap = compute_mae.compute_mae_np(nout, n_true, mask=mask)
                     print(f"Mean Angular Error (MAE) is {mae:.3f}\n")
                     emap = emap.squeeze()
+                    # Capture before the display clamp below rewrites emap in place.
+                    record['normal_gt'] = n_true
+                    record['error_map'] = emap.copy()
+                    record['mae'] = float(mae)
                     thresh = 90
                     emap[emap >= thresh] = thresh
                     emap = emap / thresh
                     cv2.imwrite(f'{testdata.data.data_workspace}/error.png', 255 * emap)
 
                 cv2.imwrite(f'{testdata.data.data_workspace}/normal.png', 255 * (0.5 * (1 + nout[:, :, ::-1])))
+                results.append(record)
+
+        return results
