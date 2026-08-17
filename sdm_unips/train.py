@@ -342,6 +342,27 @@ def build_argparser():
                         'the run ends when the ramp does. The one-flag form of '
                         '"the val curve has plateaued, anneal and finish" — no '
                         'arithmetic, and no step already taken changes its LR.')
+    p.add_argument('--auto_decay', action='store_true',
+                   help='wsd only: begin the decay automatically, IN PROCESS, '
+                        'once held-out val loss has stopped improving over the '
+                        'RUNNING BEST by --auto_decay_rel for '
+                        '--auto_decay_patience consecutive checks (floored at '
+                        '--auto_decay_min_epoch). The one-flag form of the '
+                        'manual cancel-and-relaunch-with---decay_now loop. OFF '
+                        'by default: Model A was trained without it, so leaving '
+                        'it off keeps B/C on an identical code path.')
+    p.add_argument('--auto_decay_rel', type=float, default=0.01,
+                   help='--auto_decay: relative improvement over the running '
+                        'best, (best - cur) / |best|, below which a validation '
+                        'check counts as flat.')
+    p.add_argument('--auto_decay_patience', type=int, default=2,
+                   help='--auto_decay: consecutive flat validation checks '
+                        'required to fire.')
+    p.add_argument('--auto_decay_min_epoch', type=int, default=8,
+                   help='--auto_decay: floor, in COMPLETED epochs, before the '
+                        'trigger may fire. 8 means the check labelled '
+                        '[VAL EPOCH 7] is the earliest that can trigger; it '
+                        'guards against a noise-flat pair early in the run.')
     p.add_argument('--min_lr_ratio', type=float, default=0.01)
     p.add_argument('--lr_decay_every', type=int, default=10)
     p.add_argument('--lr_decay_gamma', type=float, default=0.8)
@@ -507,6 +528,8 @@ SCHEDULE_SENSITIVE_ARGS = (
     # Deliberately here and NOT in SPLIT_CRITICAL_ARGS: branching the WSD decay
     # at resume is the intended use of these, so they must warn, never abort.
     'decay_fraction', 'decay_from_step',
+    'auto_decay', 'auto_decay_rel', 'auto_decay_patience',
+    'auto_decay_min_epoch',
     'min_lr_ratio', 'lr_decay_every', 'lr_decay_gamma', 'batch_size',
     'accum_steps', 'pixel_samples', 'train_resolution',
     'canonical_resolution', 'amp_dtype', 'grad_clip',
@@ -897,8 +920,13 @@ def main():
                 f'finished rising; lower --warmup_epochs or raise the step.')
         if not 0.0 < args.decay_fraction <= 1.0:
             raise SystemExit('--decay_fraction must be in (0, 1].')
-    elif args.decay_now:
-        raise SystemExit('--decay_now requires --lr_schedule wsd.')
+        if args.auto_decay and args.auto_decay_patience < 1:
+            raise SystemExit('--auto_decay_patience must be >= 1.')
+    else:
+        if args.decay_now:
+            raise SystemExit('--decay_now requires --lr_schedule wsd.')
+        if args.auto_decay:
+            raise SystemExit('--auto_decay requires --lr_schedule wsd.')
 
     trainer = Trainer(args, device, total_steps=total_steps,
                        steps_per_epoch=steps_per_epoch)
@@ -913,6 +941,8 @@ def main():
     start_epoch = 0
     resume_count = 0
     prior_elapsed_sec = 0.0
+    auto_decay_flat = 0        # consecutive val checks flat against the best
+    auto_decay_fired = False   # the ramp has been branched; never branch twice
 
     resume_state = None
     if resume_path:
@@ -931,6 +961,11 @@ def main():
         # calendar time.
         prior_elapsed_sec = float(resume_state.get('elapsed_sec', 0.0))
         resume_count = int(resume_state.get('resume_count', 0)) + 1
+        # Absent from every pre-v3 checkpoint, hence the defaults: a run that
+        # predates --auto_decay resumes with the trigger disarmed, which is
+        # also what --auto_decay being off would give it.
+        auto_decay_flat = int(resume_state.get('auto_decay_flat', 0))
+        auto_decay_fired = bool(resume_state.get('auto_decay_fired', False))
         # Same generator object the loaders already hold, so mutating its
         # state here still governs the next epoch's shuffle permutation.
         gen_state = resume_state.get('loader_gen')
@@ -947,8 +982,41 @@ def main():
         # Branch the decay HERE, after the scheduler state is restored: the
         # branch point is the resumed `global_step`, which does not exist until
         # the checkpoint has been read.
-        if args.decay_now:
+        if resume_state.get('sched_restored'):
+            # The ramp came back from the checkpoint, so re-deriving --epochs
+            # is what keeps the loop from running past the end of it at the
+            # floor LR. For a ramp that ends exactly at --epochs x steps/epoch
+            # this is a no-op; for one branched by --decay_now or --auto_decay
+            # it restores the truncation that run had applied.
+            d_end = int(resume_state['decay_end'])
+            args.decay_from_step = int(resume_state['decay_start'])
+            auto_decay_fired = True
+            args.epochs = max(start_epoch + 1,
+                              math.ceil(d_end / steps_per_epoch))
+            total_steps = steps_per_epoch * args.epochs
+            trainer.total_steps = total_steps
+            print(f'[RESUME] branched decay restored | --epochs set to '
+                  f'{args.epochs} so the run ends with the ramp '
+                  f'(total_steps = {total_steps:,}).')
+            if args.decay_now:
+                # Re-branching here is the failure that makes a run on an
+                # unstable machine non-terminating: every restart would move
+                # the ramp forward to the new global_step and re-heat the LR to
+                # its peak, so the decay could never complete.
+                print(f'[RESUME] --decay_now IGNORED: this checkpoint already '
+                      f'carries a branched decay (steps '
+                      f'{resume_state["decay_start"]} -> {d_end}). Re-branching '
+                      f'would restart the ramp at step {trainer.global_step} '
+                      f'and put the LR back to {trainer.args.lr:.3e}.')
+        elif args.decay_now:
             d_start, d_end = trainer.set_decay_from(trainer.global_step)
+            # Record the branch point in the args too, so `_args_snapshot`
+            # carries it into the checkpoint and the existing
+            # SCHEDULE_SENSITIVE_ARGS guard starts reporting decay-point
+            # changes instead of comparing 0 against 0. `sched_state` is what
+            # actually drives the restore; this is the human-readable trace.
+            args.decay_from_step = d_start
+            auto_decay_fired = True
             # End the run when the ramp does. Rounded UP to an epoch boundary
             # because the loop is epoch-driven and cannot stop mid-epoch; the
             # few extra steps run at the floor LR, which is harmless.
@@ -1040,6 +1108,11 @@ def main():
             'elapsed_sec': time.time() - t0,
             'resume_count': resume_count,
             'loader_gen': loader_gen.get_state(),
+            # --auto_decay's counter, so a restart mid-plateau does not hand
+            # the trigger a clean slate and defer the ramp by another
+            # --auto_decay_patience checks.
+            'auto_decay_flat': auto_decay_flat,
+            'auto_decay_fired': auto_decay_fired,
         }
 
     # ETA baseline. Separate from `t0` so the estimate reflects TRAINING
@@ -1052,6 +1125,12 @@ def main():
     eta_first_printed = False
 
     last_epoch_done = start_epoch - 1
+    # `range` is evaluated ONCE, so --auto_decay truncating `args.epochs`
+    # mid-loop cannot shorten it — the loop needs its own stopping point.
+    # `loop_end_epoch` is the last epoch this process can possibly run, which
+    # is what tells the trigger whether the ramp it just started will fit.
+    loop_end_epoch = args.epochs - 1
+    stop_after_epoch = None
     for epoch in range(start_epoch, args.epochs):
         epoch_t0 = time.time()
         epoch_running = {}
@@ -1283,6 +1362,73 @@ def main():
                     text=f'[VAL EPOCH {epoch}] ' + _format_log(avg),
                 )
                 avg_val_loss = avg.get('val_loss', float('inf'))
+
+                # --- --auto_decay ----------------------------------------
+                # Evaluated BEFORE best_val_loss is updated below, so `best`
+                # here is the running best over all PREVIOUS checks. Comparing
+                # against the running best rather than the previous check is
+                # what stops a sawtooth (down 5%, up 5%, down 5%) from
+                # deferring the ramp indefinitely: every other check would
+                # otherwise read as a large improvement and reset the counter.
+                if (args.auto_decay and not auto_decay_fired
+                        and math.isfinite(avg_val_loss)
+                        and math.isfinite(best_val_loss)):
+                    rel = (best_val_loss - avg_val_loss) / abs(best_val_loss)
+                    if rel < args.auto_decay_rel:
+                        auto_decay_flat += 1
+                    else:
+                        auto_decay_flat = 0
+                    floor_ok = (epoch + 1) >= args.auto_decay_min_epoch
+                    print(f'[AUTO-DECAY] epoch {epoch} | rel improvement over '
+                          f'best {rel * 100:+.2f}% (< '
+                          f'{args.auto_decay_rel * 100:.2f}% counts as flat) | '
+                          f'flat {auto_decay_flat}/{args.auto_decay_patience} | '
+                          f'floor {"met" if floor_ok else "not met"} '
+                          f'({epoch + 1}/{args.auto_decay_min_epoch} epochs)')
+                    if auto_decay_flat >= args.auto_decay_patience and floor_ok:
+                        d_start, d_end = trainer.set_decay_from(
+                            trainer.global_step)
+                        args.decay_from_step = d_start
+                        auto_decay_fired = True
+                        # At least one more epoch, then end when the ramp does.
+                        args.epochs = max(epoch + 2,
+                                          math.ceil(d_end / steps_per_epoch))
+                        total_steps = steps_per_epoch * args.epochs
+                        trainer.total_steps = total_steps
+                        stop_after_epoch = args.epochs - 1
+                        msg = (f'[AUTO-DECAY] FIRED at epoch {epoch}: decay '
+                               f'branches at step {d_start} '
+                               f'(lr {trainer.lr_at(d_start):.3e}) and ramps '
+                               f'over {trainer.decay_len:,} steps to '
+                               f'{trainer.lr_at(d_end):.3e} at step {d_end}. '
+                               f'--epochs set to {args.epochs}. Steps already '
+                               f'taken keep the LR they were taken at.')
+                        print(msg)
+                        train_logger.write(
+                            {'kind': 'decay_trigger', 'epoch': epoch,
+                             'global_step': trainer.global_step,
+                             'decay_start': d_start, 'decay_end': d_end,
+                             'decay_len': trainer.decay_len,
+                             'epochs': args.epochs,
+                             'best_val_loss': best_val_loss,
+                             'val_loss': avg_val_loss,
+                             'rel_improvement': rel,
+                             'flat_checks': auto_decay_flat},
+                            text=msg,
+                        )
+                        if stop_after_epoch > loop_end_epoch:
+                            print(
+                                f'[AUTO-DECAY] WARNING: the ramp needs epochs '
+                                f'up to {stop_after_epoch} but this process '
+                                f'can only reach {loop_end_epoch}. It will be '
+                                f'cut short at step '
+                                f'{(loop_end_epoch + 1) * steps_per_epoch} '
+                                f'(lr '
+                                f'{trainer.lr_at((loop_end_epoch + 1) * steps_per_epoch):.3e}'
+                                f'). Relaunch with --resume auto to finish it — '
+                                f'the branch is stored in the checkpoint.')
+                # --- end --auto_decay ------------------------------------
+
                 if avg_val_loss < best_val_loss - args.min_delta:
                     best_val_loss = avg_val_loss
                     epochs_no_improve = 0
@@ -1339,6 +1485,23 @@ def main():
                  'global_step': trainer.global_step,
                  'best_val_loss': best_val_loss,
                  'epochs_no_improve': epochs_no_improve},
+                text=msg,
+            )
+            break
+
+        # --auto_decay truncated the run to end with the ramp. `range` above
+        # was fixed at the original --epochs, so the stop has to happen here.
+        # Placed after the checkpoint save so the last epoch is on disk.
+        if stop_after_epoch is not None and epoch >= stop_after_epoch:
+            msg = (f'[AUTO-DECAY] decay ramp complete at epoch {epoch} '
+                   f'(step {trainer.global_step}, '
+                   f'lr {trainer.lr_at(trainer.global_step):.3e}); ending the '
+                   f'run | best_val_loss={best_val_loss:.4f}')
+            print(msg)
+            train_logger.write(
+                {'kind': 'decay_complete', 'epoch': epoch,
+                 'global_step': trainer.global_step,
+                 'best_val_loss': best_val_loss},
                 text=msg,
             )
             break

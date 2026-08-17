@@ -75,7 +75,7 @@ from modules.loss import losses
 # Bumped when the checkpoint payload changes shape. `resume_from` accepts
 # older versions and fills in what it can, so a run started before a format
 # change can still be resumed.
-CHECKPOINT_FORMAT_VERSION = 2
+CHECKPOINT_FORMAT_VERSION = 3
 
 
 class NonFiniteGradientAbort(RuntimeError):
@@ -175,6 +175,11 @@ class Trainer:
         # branchable decay", which is what `set_decay_from` refuses to touch.
         self._decay_bounds = None
         self.decay_len = 0
+        # True once `set_decay_from` has moved the ramp off the point the args
+        # derive. Only a BRANCHED ramp has to be persisted: a derived one is a
+        # pure function of the args and rebuilds identically, and restoring it
+        # would break the extendability that is the whole point of wsd.
+        self._decay_branched = False
         if args.lr_schedule == 'cosine':
             self.scheduler = _cosine_with_warmup(
                 self.optimizer, warmup_steps, total_steps,
@@ -306,6 +311,13 @@ class Trainer:
         start = max(int(step), self.warmup_steps)
         self._decay_bounds['start'] = start
         self._decay_bounds['end'] = start + self.decay_len
+        # Mark it so `save` persists the resolved endpoints. Without this the
+        # branch lives only in the closure's `bounds` dict and dies with the
+        # process: LambdaLR.state_dict() carries `last_epoch`/`_last_lr` and
+        # stores None for a lambda that is a plain function, so a resume would
+        # rebuild `bounds` from args that never recorded the branch and the LR
+        # would jump back to the constant phase.
+        self._decay_branched = True
         lam = self.scheduler.lr_lambdas[0]
         scale = float(lam(self.scheduler.last_epoch))
         for group, base in zip(self.optimizer.param_groups,
@@ -852,6 +864,46 @@ class Trainer:
                   f'Training continues, but the resumed data order will differ '
                   f'from an uninterrupted run.')
 
+    def _sched_state(self):
+        """The RESOLVED decay endpoints, when the ramp has been branched.
+
+        `args` cannot express this on its own: `--decay_from_step` would pin
+        `start`, but `decay_len` is derived from `--epochs`, which `--decay_now`
+        truncates — so a faithful relaunch off the resumed config would rebuild
+        a shorter ramp. Storing both endpoints as integers makes the restore
+        independent of `--epochs` and `--decay_fraction` entirely.
+
+        None for a derived (unbranched) ramp, which is reproducible from args
+        and must stay extendable.
+        """
+        if self._decay_bounds is None or not self._decay_branched:
+            return None
+        return {'decay_start': int(self._decay_bounds['start']),
+                'decay_end': int(self._decay_bounds['end']),
+                'branched': True}
+
+    def restore_decay_bounds(self, start, end):
+        """Re-apply persisted decay endpoints and the LR they imply.
+
+        Mirrors the tail of `set_decay_from`: the optimizer's LR is refreshed
+        immediately so the first resumed step does not run one step behind at
+        the pre-restore value.
+        """
+        if self._decay_bounds is None:
+            return None
+        start, end = int(start), int(end)
+        self._decay_bounds['start'] = start
+        self._decay_bounds['end'] = end
+        self.decay_len = max(1, end - start)
+        self._decay_branched = True
+        lam = self.scheduler.lr_lambdas[0]
+        scale = float(lam(self.scheduler.last_epoch))
+        for group, base in zip(self.optimizer.param_groups,
+                               self.scheduler.base_lrs):
+            group['lr'] = base * scale
+        self.scheduler._last_lr = [g['lr'] for g in self.optimizer.param_groups]
+        return start, end
+
     def _args_snapshot(self):
         """JSON-ish copy of the run's arguments, for the resume compat check."""
         return {k: v for k, v in vars(self.args).items()
@@ -885,6 +937,7 @@ class Trainer:
                 'micro_in_cycle': self._micro_in_cycle,
             },
             'rng': self._capture_rng(),
+            'sched_state': self._sched_state(),
             'args': self._args_snapshot(),
             'loop_state': dict(state) if state else None,
         }
@@ -962,6 +1015,22 @@ class Trainer:
                   f'counter restart from scratch, so best.pt can be overwritten '
                   f'by a worse epoch.')
         loop['rng'] = ckpt.get('rng')
+        # A BRANCHED decay ramp is authoritative over whatever the current
+        # args would derive: --epochs and --decay_fraction on the relaunch are
+        # irrelevant once the endpoints are known.
+        sched = ckpt.get('sched_state') or {}
+        loop['sched_restored'] = False
+        if sched.get('branched') and self._decay_bounds is not None:
+            s, e = self.restore_decay_bounds(sched['decay_start'],
+                                             sched['decay_end'])
+            loop['sched_restored'] = True
+            loop['decay_start'] = s
+            loop['decay_end'] = e
+            print(f'[Trainer]   decay ramp restored from the checkpoint: '
+                  f'steps {s} -> {e} (lr {self.lr_at(s):.3e} -> '
+                  f'{self.lr_at(e):.3e}); --epochs / --decay_fraction on this '
+                  f'launch do not reshape it.')
+
         loop['args'] = ckpt.get('args') or {}
         loop['path'] = path
         loop['format_version'] = int(ckpt.get('format_version', 1))

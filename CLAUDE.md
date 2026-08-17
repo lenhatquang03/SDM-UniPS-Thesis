@@ -133,9 +133,54 @@ val curve* rather than committed before the first step.
   LR** — the stable phase sits at exactly `1.0 × --lr`, which is where the
   cosine ramp starts, so nothing jumps and no step already taken changes.
 
+- `--auto_decay` (**off by default**, wsd only) fires the same branch
+  **in process**, with no cancel-and-relaunch, once held-out val loss stops
+  improving. It is the automated form of watching the curve by hand, and
+  Model A was trained without it — leaving it off keeps B/C on a byte-identical
+  code path.
+
 `--decay_fraction` and `--decay_from_step` are in `SCHEDULE_SENSITIVE_ARGS`,
 not `SPLIT_CRITICAL_ARGS`: changing them at resume is the intended use, so
 they warn rather than abort.
+
+**The auto-decay rule.** A check is *flat* when the relative improvement over
+the **running best**, `(best − cur) / |best|`, is below `--auto_decay_rel`
+(0.01); the ramp branches after `--auto_decay_patience` (2) consecutive flat
+checks, but never before `--auto_decay_min_epoch` (8) completed epochs — so
+`[VAL EPOCH 7]` is the earliest check that can trigger. The floor absorbs an
+early noise-flat pair; the two-check requirement absorbs a single bad render.
+
+The comparison is against the running best and **not** against the previous
+check, because a sawtooth defeats the latter: a curve alternating 0.0300 /
+0.0285 shows a *+5% improvement* on every other check, resetting the counter
+forever while the model plateaus. Against the best, both halves of the
+oscillation read as flat and the rule fires. Model A's observed history
+(0.1072 → 0.0236, then 0.0255 at epoch 8) does **not** fire under this rule —
+one flat check, not two — which matches the decision that was taken manually.
+
+Firing truncates `--epochs` so the run ends with the ramp. Note that the epoch
+loop's `range()` is fixed at entry, so the truncation is enforced by a separate
+break; if the ramp needs more epochs than the launch allowed, a warning is
+printed and `--resume auto` finishes it (the branch is in the checkpoint — see
+below).
+
+**Branched ramps are persisted.** A ramp moved by `--decay_now` or
+`--auto_decay` exists only in the scheduler closure —
+`LambdaLR.state_dict()` stores `last_epoch`/`_last_lr` and `None` for a lambda
+that is a plain function — so it cannot be rebuilt from `args`, and
+`--decay_from_step` alone is not enough (`decay_len` derives from `--epochs`,
+which the branch truncates). Checkpoints therefore carry
+`sched_state = {decay_start, decay_end, branched}`, and a resume restores those
+endpoints **authoritatively**, ignoring whatever `--epochs` and
+`--decay_fraction` the relaunch passes. Without it a mid-ramp resume put the LR
+back to the full `--lr`; re-passing `--decay_now` re-branched at the new step,
+so on a machine that crashes during the decay the ramp could never complete.
+Re-passing `--decay_now` against a branched checkpoint is now an announced
+no-op.
+
+A **derived** ramp (`--decay_from_step 0`, never branched) is deliberately
+*not* persisted: it is a pure function of the args, rebuilds identically, and
+pinning it would destroy the extendability WSD exists for.
 
 Note that WSD is a more aggressive schedule in aggregate — it holds the peak
 LR for ~80% of the run where cosine averages about half of it. Watch
@@ -146,7 +191,11 @@ ends.
 with an explicit `--decay_from_step` + the same `--epochs`. Choosing it from
 A's val curve is legitimate — it is one shared hyperparameter chosen once, not
 a per-model tune — but all three variants must run the identical schedule for
-the comparison to mean anything.
+the comparison to mean anything. `--auto_decay` is therefore a *discovery*
+tool, not a per-run setting: let it fire once, read `decay_start` out of the
+`{"kind": "decay_trigger", ...}` record, then pin every variant with an
+explicit `--decay_from_step` and matching `--epochs`. Leaving it enabled on
+B and C would let each variant pick its own schedule and confound the result.
 
 **Early stopping (safety cutoff):** `--patience` (default 10, in units of
 validation checks; 0 disables) stops training once val loss has not improved
@@ -342,6 +391,8 @@ match meaningful rather than coincidental.
 - `--lr_schedule`: `wsd` (recommended), `cosine`, or `step` — see **LR
   schedule** below
 - `--decay_fraction`: 0.2 — `--decay_from_step`: 0 — `--decay_now` (wsd only)
+- `--auto_decay` (off) — `--auto_decay_rel`: 0.01 — `--auto_decay_patience`: 2
+  — `--auto_decay_min_epoch`: 8. In-process decay trigger; see **LR schedule**
 - `--warmup_epochs`: 5.0 (linear)
 - `--amp_dtype`: `bf16` (recommended on H100), `fp16` (legacy), or `none`
 - `--grad_clip`: 1.0
