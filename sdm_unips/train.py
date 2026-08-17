@@ -237,7 +237,7 @@ def build_argparser():
                         'verdict comes from an external benchmark '
                         '(eval_diligent.py) while validation still selects '
                         'best.pt.')
-    p.add_argument('--test_trials', type=int, default=3,
+    p.add_argument('--test_trials', type=int, default=5,
                    help='Number of deterministic trials (independent K-image '
                         'draws) per test scene; their MAE is averaged for an '
                         'unbiased, low-variance test number (keep small, e.g. 3).')
@@ -314,7 +314,7 @@ def build_argparser():
     # Data ---------------------------------------------------------------
     # K is fixed at 10 per scene inside HdlongLoader / PolarPSLoader.
     p.add_argument('--train_resolution', type=int, default=512)
-    p.add_argument('--max_scenes', type=int, default=8000,
+    p.add_argument('--max_scenes', type=int, default=0,
                    help='Cap the training set size. 0 = no cap.')
     p.add_argument('--k_per_scene', type=int, default=10,
                    help='Images drawn per scene (K). Doubles as the minimum a '
