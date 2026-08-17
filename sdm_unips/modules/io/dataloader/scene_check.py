@@ -48,6 +48,21 @@ not reuse Model A's pool when trained elsewhere.
 Relative paths make the fingerprint answer the question actually being asked —
 "is this the same *set of scenes*?" — independently of where the dataset is
 mounted, and let `read_manifest` rebase a manifest onto the current roots.
+
+Several roots per flag
+----------------------
+`--hdlong_dir` and `--polarps_dir` each accept more than one root (MerlMix is
+structurally an hdlong dataset, so it is added as a second `--hdlong_dir`
+rather than as a new loader). Each root therefore needs its OWN key, or two
+scenes named `SCENE_0001` under two different roots would collapse to the same
+`(kind, root_key, relpath)` triple — a fingerprint collision, and a manifest
+that rebases both onto whichever root came first.
+
+Keys are `hdlong_dir`, `hdlong_dir#1`, `hdlong_dir#2`, ... — the FIRST root of
+each flag keeps the bare key it had when the flag was single-valued, so a
+single-root run produces a byte-identical fingerprint and manifest to the
+pre-multi-root code. Model A's `scene_manifest.json` stays reusable and its
+checkpoints stay resumable; no manifest version bump is needed.
 """
 
 import hashlib
@@ -62,11 +77,55 @@ DEFAULT_MANIFEST_NAME = 'scene_manifest.json'
 
 # Root arguments a scene can live under. `train_dir` is last so that a more
 # specific root wins when it is nested inside it (see `relative_to_roots`).
-ROOT_KEYS = ('hdlong_dir', 'polarps_dir', 'train_dir')
+ROOT_ARGS = ('hdlong_dir', 'polarps_dir', 'train_dir')
 
 
 def _norm(path):
     return os.path.normpath(os.path.abspath(path)) if path else None
+
+
+def as_roots(value):
+    """Normalize a root argument to a de-duplicated list of paths.
+
+    `--hdlong_dir` / `--polarps_dir` are `nargs='+'`, so they arrive as lists,
+    but a checkpoint written before that change carries a plain string and
+    `--train_dir` is still single-valued. Accepting both keeps those paths
+    working without a special case at every call site.
+
+    Duplicates within one flag are dropped (first occurrence wins): passing the
+    same root twice would otherwise enter every one of its scenes into the pool
+    twice, and land the copies in different splits.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, os.PathLike)):
+        value = [value]
+    out, seen = [], set()
+    for v in value:
+        if not v:
+            continue
+        p = os.fspath(v)
+        ap = _norm(p)
+        if ap in seen:
+            print(f'[SceneCheck] ignoring duplicate dataset root {p!r}.')
+            continue
+        seen.add(ap)
+        out.append(p)
+    return out
+
+
+def build_roots(args):
+    """Ordered `{root_key: path}` for every dataset root this run was given.
+
+    The first root of each flag keeps the bare flag name as its key, so
+    single-root runs hash and rebase exactly as they did before multi-root
+    support existed (see the module docstring).
+    """
+    roots = {}
+    for base in ROOT_ARGS:
+        for i, root in enumerate(as_roots(getattr(args, base, None))):
+            roots[base if i == 0 else f'{base}#{i}'] = root
+    return roots
 
 
 def relative_to_roots(path, roots):
@@ -74,7 +133,9 @@ def relative_to_roots(path, roots):
 
     The LONGEST matching root wins, because `--train_dir` may be a parent of
     `--hdlong_dir` / `--polarps_dir` and the more specific root is the one that
-    will still resolve if the tree is reorganized.
+    will still resolve if the tree is reorganized. Ties (the same path given to
+    two flags) are broken by `roots` insertion order, which `build_roots` fixes,
+    so the result is deterministic either way.
 
     A scene under no configured root falls back to `('', abspath)`. That keeps
     it usable, at the cost of being machine-specific — which is honest, since
@@ -82,8 +143,8 @@ def relative_to_roots(path, roots):
     """
     ap = _norm(path)
     best = None
-    for key in ROOT_KEYS:
-        root = _norm(roots.get(key))
+    for key, value in roots.items():
+        root = _norm(value)
         if not root:
             continue
         if ap == root or ap.startswith(root + os.sep):
@@ -101,9 +162,14 @@ def resolve_from_roots(root_key, rel, roots):
         return rel                      # stored absolute; nothing to rebase
     base = roots.get(root_key)
     if not base:
+        flag, _, idx = root_key.partition('#')
+        detail = (f'--{flag.replace("_dir", "")}_dir'
+                  + (f' root #{int(idx) + 1}' if idx else ''))
         raise RuntimeError(
-            f'manifest references scenes under --{root_key.replace("_dir", "")}'
-            f'_dir, but that flag was not given for this run.')
+            f'manifest references scenes under {detail}, but this run was not '
+            f'given it. Roots are matched positionally, so the roots must be '
+            f'passed in the same order and count as the run that wrote the '
+            f'manifest; this run has: {sorted(roots) or "none"}.')
     return os.path.normpath(os.path.join(_norm(base), rel.replace('/', os.sep)))
 
 
@@ -270,12 +336,27 @@ def scene_fingerprint(scenes, roots):
     Hashed over root-RELATIVE paths, so the same dataset mounted at a different
     point on another machine yields the same fingerprint. Hashing absolute
     paths would make every cross-machine comparison look like a pool change.
+
+    Which root a scene came from is folded in as the root key's `#n` SUFFIX
+    only. Two roots of the same flag routinely hold identically-named scenes
+    (`hdlong/SCENE_0001` and `merlmix/SCENE_0001`), and without the suffix they
+    hash identically — so a pool of both would be indistinguishable from a pool
+    holding one of them twice. Hashing the suffix rather than the whole key is
+    what keeps a SINGLE-root pool hashing exactly as it did before multi-root
+    support existed (the first root's suffix is empty and contributes nothing),
+    which matters because the fingerprint is split-critical on `--resume`:
+    changing it would make every existing checkpoint refuse to continue.
     """
     h = hashlib.sha1()
     for kind, path in scenes:
         root_key, rel = relative_to_roots(path, roots)
+        _flag, _sep, suffix = root_key.partition('#')
         h.update(kind.encode())
         h.update(b'\0')
+        if suffix:
+            h.update(b'#')
+            h.update(suffix.encode())
+            h.update(b'\0')
         h.update(rel.encode())
         h.update(b'\0')
     return h.hexdigest()[:16]

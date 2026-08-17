@@ -62,6 +62,37 @@ Only *per-step* records are affected. `epoch_summary`, `val_summary` and
 `elapsed_sec` continues across the restart (it counts compute time and
 excludes downtime), so the convergence-vs-time curves need no filtering.
 
+Fine-tuning an existing model on further data
+---------------------------------------------
+`--pretrained PATH` starts a NEW run from an existing checkpoint's weights —
+fresh optimizer, fresh LR schedule, epoch 0, `best_val_loss` reset. It is
+distinct from `--resume`, which continues *this* run, and the two compose:
+
+    python sdm_unips/train.py --session_name modelA_merlmix \
+        --hdlong_dir /data/MerlMix \
+        --pretrained modelA_full/checkpoints/best.pt --resume auto \
+        --test_fraction 0 --lr 2e-5 --warmup_epochs 0.5
+
+`--pretrained` applies on the first launch and is superseded by the resumed
+weights on every relaunch, so that one command survives a crash. Use a lower
+`--lr` than the original run: the pretrained recipe's peak LR would undo the
+weights before they learn anything from the new data.
+
+`--test_fraction 0` drops the held-out test split while keeping validation, for
+an experiment whose verdict comes from an external benchmark (`eval_diligent.py`
+against `<session>/checkpoints`) rather than from the synthetic test split.
+Validation has no such switch — it is what selects `best.pt`, so `--val_fraction`
+must be > 0.
+
+Several roots per source
+------------------------
+`--hdlong_dir` and `--polarps_dir` each take one or more roots and pool them
+into a single source. MerlMix has hdlong's exact layout and marker file, so it
+is an extra `--hdlong_dir` root rather than a new dataset kind. Root order is
+part of the pool identity (the split is a permutation over pool positions), so
+it must stay fixed across runs that are meant to be comparable; the pool
+fingerprint records which order was used.
+
 Fitting a large effective batch on a small GPU
 ----------------------------------------------
 `--batch_size` is the micro-batch; `--accum_steps` micro-batches make one
@@ -91,9 +122,11 @@ sys.path.append('..')
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from modules.builder.trainer import (
-    NonFiniteGradientAbort, Trainer, find_latest_checkpoint, prune_checkpoints,
+    NonFiniteGradientAbort, Trainer, find_latest_checkpoint, jsonable_args,
+    prune_checkpoints,
 )
 from modules.io.dataloader.mixed import build_mixed_split, MixedEvalDataset
+from modules.io.dataloader.scene_check import as_roots
 
 
 def _seed_worker(worker_id):
@@ -178,19 +211,32 @@ def build_argparser():
 
     # I/O ----------------------------------------------------------------
     p.add_argument('--session_name', default='train_run')
-    p.add_argument('--hdlong_dir', default=None,
-                   help='Root of hdlong-complexv1 (scenes have light_means.config)')
-    p.add_argument('--polarps_dir', default=None,
-                   help='Root of PolarPS (scenes have normal.exr)')
+    p.add_argument('--hdlong_dir', nargs='+', default=None,
+                   help='One or more roots of hdlong-structured data (scenes '
+                        'have light_means.config). MerlMix shares that layout, '
+                        'so it is added here as an extra root rather than as a '
+                        'new dataset kind; all roots are pooled into a single '
+                        '"hdlong" source for the cap and the split. Root ORDER '
+                        'is part of the pool identity (the split permutes pool '
+                        'positions), so keep it stable across runs.')
+    p.add_argument('--polarps_dir', nargs='+', default=None,
+                   help='One or more roots of PolarPS (scenes have normal.exr); '
+                        'pooled into a single "polarps" source, as above.')
     p.add_argument('--train_dir', default=None,
                    help='Auto-detect root: scenes are classified into hdlong/polarps '
                         'by their on-disk markers.')
     p.add_argument('--val_fraction', type=float, default=0.1,
                    help='Held-out fraction of the mixed pool for validation '
-                        '(scene-level split, split proportionally per source).')
+                        '(scene-level split, split proportionally per source). '
+                        'Must be > 0: validation is what selects best.pt, so a '
+                        'run cannot opt out of it.')
     p.add_argument('--test_fraction', type=float, default=0.1,
                    help='Held-out fraction of the mixed pool for the final '
-                        'test report (scene-level, proportional per source).')
+                        'test report (scene-level, proportional per source). '
+                        '0 skips the test split: use it for an experiment whose '
+                        'verdict comes from an external benchmark '
+                        '(eval_diligent.py) while validation still selects '
+                        'best.pt.')
     p.add_argument('--test_trials', type=int, default=3,
                    help='Number of deterministic trials (independent K-image '
                         'draws) per test scene; their MAE is averaged for an '
@@ -206,17 +252,22 @@ def build_argparser():
                         'literal "auto" for <session>/checkpoints. A full '
                         'training checkpoint restores model + optimizer + LR '
                         'schedule + RNG + epoch/best/patience bookkeeping and '
-                        'continues at the next epoch; a bare *.pytmodel is a '
-                        'weights-only WARM START from epoch 0. Which one '
-                        'happened is printed at startup.')
-    p.add_argument('--resume_weights_only', action='store_true',
-                   help='Force the warm-start reading of a full checkpoint: '
-                        'take its weights but start a NEW run (fresh '
-                        'optimizer, LR schedule and epoch counter). Use this '
-                        'to seed a new experiment from an old run, NOT to '
-                        'continue one — continuing with a fresh optimizer '
-                        'throws away the moment estimates and restarts the '
-                        'schedule at the warmup LR.')
+                        'continues at the next epoch. To START a new run from '
+                        "another run's weights, use --pretrained instead.")
+    p.add_argument('--pretrained', default=None,
+                   help='FINE-TUNE: initialize the weights from this '
+                        'checkpoint (a best.pt/final.pt, a bare *.pytmodel, or '
+                        'a checkpoint DIRECTORY, which resolves to its best.pt '
+                        '— the selected model, unlike --resume which never '
+                        'picks best.pt) and start a NEW run — fresh '
+                        'optimizer, fresh LR schedule, epoch 0, best_val_loss '
+                        'reset. This is how a converged model is continued on '
+                        'further data. Tensors are matched by name and shape '
+                        'and the counts are printed; loading nothing is an '
+                        'error, never a silent train-from-scratch. Combine '
+                        'with --resume auto: --pretrained applies on the first '
+                        'launch and is superseded by the resumed weights on '
+                        'every relaunch, so one command survives crashes.')
     p.add_argument('--allow_config_change', action='store_true',
                    help='Downgrade the resume config-compatibility errors to '
                         'warnings. Required to resume with a different '
@@ -243,7 +294,7 @@ def build_argparser():
                         'crash insurance only (resuming from one replays its '
                         'epoch from the top), so a small number is enough.')
     p.add_argument('--val_every_epochs', type=int, default=1)
-    p.add_argument('--patience', type=int, default=10,
+    p.add_argument('--patience', type=int, default=0,
                    help='Early-stopping patience, counted in validation checks: '
                         'stop once val loss has not improved for this many '
                         'consecutive checks. 0 disables (train the full '
@@ -287,26 +338,27 @@ def build_argparser():
                         'a half-mounted dataset or a wrong --k_per_scene, and '
                         'training on the remainder would look exactly like a '
                         'normal run on a fraction of the data.')
+    
 
     # Optimization (thesis recipe defaults) ------------------------------
-    p.add_argument('--epochs', type=int, default=60)
-    p.add_argument('--batch_size', type=int, default=8,
+    p.add_argument('--epochs', type=int, default=16)
+    p.add_argument('--batch_size', type=int, default=2,
                    help='MICRO-batch size (scenes per forward pass). The '
                         'effective batch is --batch_size x --accum_steps.')
-    p.add_argument('--accum_steps', type=int, default=1,
+    p.add_argument('--accum_steps', type=int, default=4,
                    help='Gradient accumulation: number of micro-batches per '
                         'optimizer step. Use it to keep the recipe effective '
                         'batch of 8 on a GPU that cannot hold it in one pass '
                         '(e.g. --batch_size 2 --accum_steps 4). The LR '
                         'schedule counts optimizer steps, so it is unchanged.')
-    p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--num_workers', type=int, default=8)
     p.add_argument('--prefetch_factor', type=int, default=2,
                    help='Batches each worker prefetches. In-flight host memory '
                         'is roughly num_workers x prefetch_factor x batch_size '
                         'x 36 MB (K=10 at 512x512), and it passes through '
                         '/dev/shm — raise only if data-wait is nonzero AND '
                         'shm has room. Ignored when --num_workers 0.')
-    p.add_argument('--max_vram_gib', type=float, default=0.0,
+    p.add_argument('--max_vram_gib', type=float, default=20.0,
                    help='Hard cap on CUDA memory for this process (0 = no '
                         'cap). Allocations beyond it raise OOM instead of '
                         'consuming the whole card — worth setting on a GPU '
@@ -314,8 +366,8 @@ def build_argparser():
                         'take down the desktop session.')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=0.05)
-    p.add_argument('--warmup_epochs', type=float, default=5.0)
-    p.add_argument('--lr_schedule', default='cosine',
+    p.add_argument('--warmup_epochs', type=float, default=2.0)
+    p.add_argument('--lr_schedule', default='wsd',
                    choices=['cosine', 'step', 'wsd'],
                    help='cosine: warmup -> cosine anneal over --epochs. Its LR '
                         'at every step depends on the TOTAL length, so a '
@@ -504,6 +556,11 @@ class JSONLLogger:
 # ---------------------------------------------------------------------------
 # Resume
 # ---------------------------------------------------------------------------
+# Root arguments that are lists (nargs='+') on this version and were plain
+# strings before it. `check_resume_compat` normalizes both sides through
+# `as_roots` so an old checkpoint does not read as a split change.
+ROOT_LIST_ARGS = ('hdlong_dir', 'polarps_dir', 'train_dir')
+
 # Changing any of these REDEFINES the deterministic scene-level split, so a
 # resumed run would train on a different partition than the one it started
 # from — potentially pulling held-out test scenes into training and
@@ -578,6 +635,55 @@ def resolve_resume_path(spec, ckpt_dir):
     raise RuntimeError(f'--resume {spec}: no such file or directory.')
 
 
+def resolve_pretrained_path(spec):
+    """Turn `--pretrained` into a concrete weights file.
+
+    Directory resolution deliberately differs from `--resume`'s. `--resume`
+    must never pick `best.pt` — it is a *selection* artifact that normally lags
+    the training frontier, so continuing from it would silently discard epochs.
+    `--pretrained` wants exactly the opposite: fine-tuning starts from the model
+    that was *chosen*, so `best.pt` is preferred, then `final.pt`, then the
+    newest epoch checkpoint, and last the exported `normal/normal.pytmodel`
+    (which a session directory always carries, but which says nothing about
+    which epoch produced it beyond "the one that was published").
+
+    A file is taken as given. Anything unresolvable raises: a typo that quietly
+    trains from random init for days is the failure this whole path exists to
+    prevent.
+    """
+    if spec in ('auto', 'last'):
+        raise SystemExit(
+            '--pretrained needs an explicit file or directory. "auto" is a '
+            "--resume spelling (this session's own checkpoints), and "
+            'fine-tuning from the run\'s own output is not what it means.')
+    if os.path.isfile(spec):
+        return spec
+    if not os.path.isdir(spec):
+        raise SystemExit(f'--pretrained {spec}: no such file or directory.')
+
+    for name in ('best.pt', 'final.pt'):
+        candidate = os.path.join(spec, name)
+        if os.path.isfile(candidate):
+            return candidate
+    latest = find_latest_checkpoint(spec)
+    if latest:
+        print(f'[PRETRAINED] {spec} holds no best.pt/final.pt; falling back to '
+              f'the newest checkpoint in it.')
+        return latest
+    # A released-weights directory, or a session's exported `normal/`.
+    weights = sorted(glob.glob(os.path.join(spec, '*.pytmodel'))
+                     + glob.glob(os.path.join(spec, '*', '*.pytmodel')))
+    if len(weights) == 1:
+        return weights[0]
+    if len(weights) > 1:
+        raise SystemExit(
+            f'--pretrained {spec}: {len(weights)} *.pytmodel files and no '
+            f'best.pt/final.pt — ambiguous. Name the file explicitly.')
+    raise SystemExit(
+        f'--pretrained {spec}: no weights found (looked for best.pt, '
+        f'final.pt, epoch_*.pt, *.pytmodel).')
+
+
 def check_resume_compat(prev_args, args, allow_change):
     """Compare the checkpoint's arguments against this invocation's.
 
@@ -592,14 +698,23 @@ def check_resume_compat(prev_args, args, allow_change):
               'hand against the original run.')
         return
 
+    def norm(k, v):
+        # `--hdlong_dir` / `--polarps_dir` became nargs='+', so a checkpoint
+        # written before that carries a plain string where this run has a list.
+        # Comparing them raw would report a split mismatch on every such resume
+        # and refuse to continue a run that has not changed at all.
+        if k in ROOT_LIST_ARGS:
+            return as_roots(v)
+        return v
+
     def diff(keys):
         out = []
         for k in keys:
             if k not in prev_args:
                 continue
-            now = getattr(args, k, None)
-            if now != prev_args[k]:
-                out.append(f'  {k}: checkpoint={prev_args[k]!r} now={now!r}')
+            then, now = norm(k, prev_args[k]), norm(k, getattr(args, k, None))
+            if now != then:
+                out.append(f'  {k}: checkpoint={then!r} now={now!r}')
         return out
 
     split_diffs = diff(SPLIT_CRITICAL_ARGS)
@@ -661,6 +776,9 @@ def run_eval_pass(trainer: Trainer,
     silently freeze `best.pt` selection for the rest of the run.
     """
     trainer.begin_eval_pass()
+
+    if not loader: return {}
+    
     totals = {}  # key -> [weighted_sum, weight]
     for batch in loader:
         batch_size = int(batch[0].shape[0])
@@ -675,7 +793,7 @@ def run_eval_pass(trainer: Trainer,
 
 
 def run_test_eval(
-        trainer: Trainer, test_loader: torch.utils.data.DataLoader,
+        trainer: Trainer, test_loader: torch.utils.data.DataLoader|None,
         logger: JSONLLogger, global_step: int, n_trials: int,
         elapsed_sec: float | None = None,
 ) -> dict:
@@ -705,43 +823,23 @@ def run_test_eval(
 # ---------------------------------------------------------------------------
 # Inference export
 # ---------------------------------------------------------------------------
-def export_for_inference(ckpt_dir: str) -> str | None:
-    """Publish the reported weights to `<ckpt_dir>/normal/normal.pytmodel`.
+def export_for_inference(trainer: Trainer, ckpt_dir: str, provenance: str) -> str:
+    """Publish the model's CURRENT weights to `<ckpt_dir>/normal/normal.pytmodel`.
 
-    `builder.load_models` globs `*.pytmodel` under `<--checkpoint>/normal` and
-    `"".join`s the matches, so that directory must contain exactly one file —
-    hence the dedicated subdirectory rather than pointing inference at
-    `ckpt_dir`, which holds both `normal.pytmodel` and `best_normal.pytmodel`.
+    `builder.load_models` needs a bare `state_dict` in a directory holding
+    exactly one `*.pytmodel` — a `.pt` training checkpoint will not do, since
+    its top-level keys are `model`/`optimizer`/… rather than parameter names.
+    Hence the dedicated `normal/` subdirectory, and hence this being the ONLY
+    `*.pytmodel` the pipeline writes: one file, at the path inference reads,
+    always holding the weights currently selected.
 
-    Source preference mirrors the checkpoint the final test number is reported
-    on: `best_normal.pytmodel` (written alongside every `best.pt` update, so
-    its presence means a best was recorded) when it exists, otherwise
-    `normal.pytmodel`, which `Trainer.save(tag='final')` last overwrote with
-    the final-epoch weights.
-
-    Returns the exported path, or None if neither source exists.
+    Called at each `best.pt` update and once at the end of the run, in both
+    cases at a point where `trainer.net` already holds exactly the weights to
+    publish — so nothing is copied between files and there is no second source
+    that could disagree with the first.
     """
-    best_src = os.path.join(ckpt_dir, 'best_normal.pytmodel')
-    final_src = os.path.join(ckpt_dir, 'normal.pytmodel')
-    if os.path.isfile(best_src):
-        src, provenance = best_src, 'best_normal.pytmodel (val-selected)'
-    elif os.path.isfile(final_src):
-        src, provenance = final_src, 'normal.pytmodel (final-epoch fallback)'
-    else:
-        print(f'[EXPORT] WARNING: no *.pytmodel found in {ckpt_dir}; '
-              f'skipping the inference export.')
-        return None
-
-    out_dir = os.path.join(ckpt_dir, 'normal')
-    os.makedirs(out_dir, exist_ok=True)
-    # Keep exactly one .pytmodel here (see docstring): drop anything a previous
-    # export left behind, e.g. a best export superseded by a fallback one.
-    for stale in glob.glob(os.path.join(out_dir, '*.pytmodel')):
-        os.remove(stale)
-    dst = os.path.join(out_dir, 'normal.pytmodel')
-    shutil.copyfile(src, dst)
-    print(f'[EXPORT] Inference weights = {provenance} → {dst}\n'
-          f'[EXPORT] Run inference with --checkpoint {ckpt_dir}')
+    dst = trainer.export_weights(ckpt_dir)
+    print(f'[EXPORT] Inference weights ({provenance}) → {dst}')
     return dst
 
 
@@ -785,11 +883,16 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Resolve --resume before the (slow) dataset scan so a typo'd path fails in
-    # a second rather than after the scene pool has been enumerated.
+    # Resolve --resume / --pretrained before the (slow) dataset scan so a typo'd
+    # path fails in a second rather than after the scene pool has been
+    # enumerated.
     resume_path = resolve_resume_path(args.resume, ckpt_dir) if args.resume else None
     if resume_path:
         print(f'[RESUME] checkpoint = {resume_path}')
+    pretrained_path = None
+    if args.pretrained:
+        pretrained_path = resolve_pretrained_path(args.pretrained)
+        print(f'[PRETRAINED] weights = {pretrained_path}')
 
     print(f'[TRAIN] Device = {device}  Session = {args.session_name}')
     print(f'[TRAIN] Dataset = mixed (hdlong + PolarPS) | Automatic Mixed Precision (AMP) = {args.amp_dtype}  '
@@ -844,14 +947,18 @@ def main():
         **_worker_kwargs(args.num_workers),
     )
 
-    # Validation set drives best.pt and test set is the final report, so neither may be empty.
+    # Validation drives best.pt, so `--val_fraction` cannot be 0 (rejected in
+    # `build_mixed_split`) and an empty val split is an error. The TEST split
+    # can be switched off with `--test_fraction 0`, in which case it simply has
+    # no loader — which is what lets a run judged by an external benchmark be
+    # configured without a mode of its own.
     if len(val_set) == 0:
         raise RuntimeError(
             'Validation split is empty. --val_fraction '
             f'({args.val_fraction}) rounded every present source to 0 val '
-            'scenes. Increase --val_fraction or provide more scenes per source .'
+            'scenes. Increase --val_fraction or provide more scenes per source.'
         )
-    if len(test_set) == 0:
+    if args.test_fraction > 0 and len(test_set) == 0:
         raise RuntimeError(
             'Test split is empty. --test_fraction '
             f'({args.test_fraction}) rounded every present source to 0 test '
@@ -877,17 +984,19 @@ def main():
         **_worker_kwargs(max(1, args.num_workers // 2)),
     )
 
-    # Test eval: a deterministic multi-trial wrapper over the test scenes (unbiased).
-    # Its per-item RNG is seeded from the index, so results are worker-count independent.
-    test_eval_set = MixedEvalDataset(args, test_set.scenes,
-                                     n_trials=args.test_trials, seed=args.seed)
-    test_loader = torch.utils.data.DataLoader(
-        test_eval_set, batch_size=args.batch_size, shuffle=False,
-        pin_memory=(device.type == 'cuda'),
-        drop_last=False, collate_fn=_collate,
-        worker_init_fn=_seed_worker, generator=loader_gen,
-        **_worker_kwargs(max(1, args.num_workers // 2)),
-    )
+    test_loader = None
+    if len(test_set) > 0:
+        # Test eval: a deterministic multi-trial wrapper over the test scenes (unbiased).
+        # Its per-item RNG is seeded from the index, so results are worker-count independent.
+        test_eval_set = MixedEvalDataset(args, test_set.scenes,
+                                        n_trials=args.test_trials, seed=args.seed)
+        test_loader = torch.utils.data.DataLoader(
+            test_eval_set, batch_size=args.batch_size, shuffle=False,
+            pin_memory=(device.type == 'cuda'),
+            drop_last=False, collate_fn=_collate,
+            worker_init_fn=_seed_worker, generator=loader_gen,
+            **_worker_kwargs(max(1, args.num_workers // 2)),
+        )
 
     # The scheduler and every *_every counter run on OPTIMIZER steps, so with
     # accumulation they must be derived from the micro-batch count, not from
@@ -897,14 +1006,21 @@ def main():
     micro_per_epoch = max(1, len(train_loader))
     steps_per_epoch = max(1, math.ceil(micro_per_epoch / accum_steps))
     total_steps = steps_per_epoch * args.epochs
-    print(f'[TRAIN] scenes: train = {len(train_set):,} | val = {len(val_set):,} | '
-          f'test = {len(test_set):,} (x{args.test_trials} trials) | '
+    trials_note = f' (x{args.test_trials} trials)' if test_loader else ''
+    print(f'[TRAIN] scenes: train = {len(train_set):,} | '
+          f'val = {len(val_set):,} | '
+          f'test = {len(test_set):,}{trials_note} | '
           f'K = {args.k_per_scene} | '
           f'pool fingerprint = {getattr(args, "scene_pool_fingerprint", "?")}')
-    print(f'[EVAL] Held-out evaluation is model-independent: renders pinned per '
-          f'scene (val x1 trial, test x{args.test_trials}) and pixel samples '
-          f'drawn outside the network, both seeded from --seed {args.seed}. '
-          f'Two runs differing only in the model are compared on identical data.')
+    if test_loader is None:
+        print('[TRAIN] No held-out test split (--test_fraction 0): the run ends '
+              'after the last epoch with no test report. Evaluate externally '
+              '(e.g. eval_diligent.py against <session>/checkpoints).')
+    print(f'[EVAL] Held-out evaluation is model-independent: renders pinned '
+          f'per scene (val x1 trial, test x{args.test_trials}) and pixel '
+          f'samples drawn outside the network, both seeded from --seed '
+          f'{args.seed}. Two runs differing only in the model are compared '
+          f'on identical data.')
     print(f'[TRAIN] micro-batches/epoch = {micro_per_epoch:,} | '
           f'optimizer steps/epoch = {steps_per_epoch:,} | '
           f'total steps = {total_steps:,} | '
@@ -944,10 +1060,21 @@ def main():
     auto_decay_flat = 0        # consecutive val checks flat against the best
     auto_decay_fired = False   # the ramp has been branched; never branch twice
 
+    # --pretrained is applied FIRST and --resume, if it finds anything, loads
+    # straight over it. That ordering is what makes
+    # `--pretrained X --resume auto` a single command that can be relaunched
+    # after every crash: the first launch warm-starts from X, and every
+    # relaunch continues the run's own (strictly newer) weights instead.
+    if pretrained_path:
+        args.pretrained_sha1 = trainer.load_pretrained(pretrained_path)['sha1']
+
     resume_state = None
     if resume_path:
-        resume_state = trainer.resume_from(
-            resume_path, weights_only=args.resume_weights_only)
+        resume_state = trainer.resume_from(resume_path)
+        if pretrained_path:
+            print(f'[PRETRAINED] superseded by --resume {resume_path}: this run '
+                  f'already has weights of its own, which are further along '
+                  f'than {pretrained_path}.')
     if resume_state is not None:
         check_resume_compat(resume_state.get('args'), args,
                             args.allow_config_change)
@@ -1034,6 +1161,18 @@ def main():
             print(f'[RESUME] the checkpoint has already completed all '
                   f'{args.epochs} epochs; skipping training and going straight '
                   f'to the final held-out test evaluation.')
+    elif args.decay_now:
+        # The branch above is the ONLY place --decay_now acts, so on a run that
+        # restored nothing it does nothing. Silently, until now: a launch script
+        # that carries --decay_now permanently would appear to work on the first
+        # launch and then branch the ramp at an arbitrary step on the first
+        # crash-relaunch. Say so instead.
+        print('[TRAIN] --decay_now IGNORED: it moves the decay ramp to the step '
+              'being RESUMED FROM, and this run restored no training state '
+              '(fresh start, or --resume found no checkpoint). The ramp is the '
+              f'one derived from --decay_fraction {args.decay_fraction} and '
+              f'--epochs {args.epochs}. Drop the flag from a fresh launch, or '
+              'pass --decay_from_step to place the ramp explicitly.')
 
     # `resume_count` on every record distinguishes the replayed tail of an
     # interrupted epoch from the run that actually produced the weights.
@@ -1045,9 +1184,7 @@ def main():
     # overwriting the original run's record of how it was launched.
     config_name = 'config.json' if resume_count == 0 else f'config_resume_{resume_count}.json'
     with open(os.path.join(log_dir, config_name), 'w') as f:
-        json.dump({k: v for k, v in sorted(vars(args).items())
-                   if isinstance(v, (str, int, float, bool, type(None)))},
-                  f, indent=2)
+        json.dump(dict(sorted(jsonable_args(args).items())), f, indent=2)
 
     if resume_state is not None:
         # Marker record: without it, a reader of the append-only train.jsonl
@@ -1345,7 +1482,7 @@ def main():
         # values, so a resume from that file would let a worse epoch overwrite
         # best.pt and would silently reset patience.
         improved = False
-        if val_loader is not None and (epoch + 1) % args.val_every_epochs == 0:
+        if (epoch + 1) % args.val_every_epochs == 0:
             # Same estimator as the final test report (see run_eval_pass):
             # scene-count-weighted, non-finite values dropped.
             means = run_eval_pass(trainer, val_loader)
@@ -1461,12 +1598,14 @@ def main():
 
         if improved:
             shutil.copyfile(path, best_path)
-            legacy = os.path.join(ckpt_dir, 'normal.pytmodel')
-            if os.path.isfile(legacy):
-                shutil.copyfile(
-                    legacy, os.path.join(ckpt_dir, 'best_normal.pytmodel'))
             print(f'[BEST] Epoch {epoch} | '
                   f'val_loss={best_val_loss:.4f} → {best_path}')
+            # Republish the inference weights from the model in memory, which
+            # at this point is exactly the epoch that just won: validation ran
+            # before the save above and no optimizer step has happened since.
+            # Doing it here, rather than only at the end, means a run killed
+            # mid-schedule still leaves a directly usable checkpoint.
+            export_for_inference(trainer, ckpt_dir, f'best, epoch {epoch}')
 
         prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',),
                           keep_last_steps=args.keep_last_steps)
@@ -1518,24 +1657,29 @@ def main():
               f'peak reserved = {run_peak["mem_reserved_peak_gib"]:.2f} GiB | '
               f'peak host RSS (self+workers) = {run_peak["host_rss_gib"]:.2f} GiB')
 
-    # Report the final test number on the SELECTED model (best.pt, chosen by
-    # val loss). Fall back to the in-memory weights only if best.pt is somehow absent (e.g. val never yielded a
-    # finite loss so no best was ever written).
+    # Report on (and export) the SELECTED model: best.pt, chosen by val loss.
+    # Fall back to the in-memory weights only if best.pt is somehow absent,
+    # i.e. validation never yielded a finite loss so no best was ever written.
     if os.path.isfile(best_path):
-        print(f'[TRAIN] loading best.pt (val_loss={best_val_loss:.4f}) '
-              f'for the final held-out test evaluation')
+        print(f'[TRAIN] loading best.pt (val_loss={best_val_loss:.4f}) as the '
+              f'reported and exported model')
         trainer.load(best_path)
+        provenance = f'best.pt, val_loss={best_val_loss:.4f}'
     else:
-        print('[TRAIN] WARNING: best.pt not found; running the final test '
-              'evaluation on the last-epoch weights instead.')
+        print('[TRAIN] WARNING: best.pt not found; reporting and exporting the '
+              'last-epoch weights instead.')
+        provenance = 'final epoch (no best.pt was written)'
 
-    # Publish the same weights the test number is reported on as a drop-in
-    # inference checkpoint. `trainer.load` above only updates the in-memory
-    # model — `normal.pytmodel` on disk still holds the final-epoch weights —
-    # so the export reads from `best_normal.pytmodel` when a best exists.
-    export_for_inference(ckpt_dir)
+    # Publish exactly the weights the test number below is reported on.
+    # `trainer.load` above updated the in-memory model, which is what
+    # `export_weights` serializes, so the exported file and the reported metric
+    # cannot describe different models.
+    export_for_inference(trainer, ckpt_dir, provenance)
+    print(f'[EXPORT] Run inference with --checkpoint {ckpt_dir}')
 
-    # The held-out mixed test split is the final benchmark.
+    # The held-out mixed test split is the final benchmark, when there is one.
+    if test_loader is None:
+        return
     # Re-seed here so the eval's pixel sampling (torch RNG inside the model) is
     # reproducible independent of how many RNG draws training consumed.
     torch.manual_seed(args.seed)

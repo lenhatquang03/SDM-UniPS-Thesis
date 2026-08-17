@@ -26,8 +26,10 @@ lands. The pool fingerprint is therefore recorded on `args` and guarded on
 `--resume`.
 
 Required attrs on `args`:
-    - hdlong_dir (optional)
-    - polarps_dir (optional)
+    - hdlong_dir (optional; one or more roots — MerlMix is structurally an
+      hdlong dataset, so it is passed as an additional root rather than as a
+      new kind. Every hdlong root is one source for the cap and the split.)
+    - polarps_dir (optional; one or more roots)
     - train_dir (optional fallback: auto-detect both kinds under one root)
     - train_resolution, session_name, seed
     - max_scenes (optional cap; default unlimited)
@@ -50,8 +52,8 @@ from typing import Callable
 from .hdlong import HdlongLoader
 from .polarps import PolarPSLoader
 from .scene_check import (
-    DEFAULT_MANIFEST_NAME, filter_valid_scenes, read_manifest,
-    scene_fingerprint, write_manifest,
+    DEFAULT_MANIFEST_NAME, as_roots, build_roots, filter_valid_scenes,
+    read_manifest, relative_to_roots, scene_fingerprint, write_manifest,
 )
 
 DEFAULT_K_PER_SCENE = 10
@@ -94,14 +96,35 @@ def _find_scenes(root: str, is_scene: Callable[[str], bool]) -> list[str]:
     return sorted(found)
 
 
-def _discover(roots: list[str], kinds: list[str]) -> list[tuple[str, str]]:
-    """Return list of (kind, scene_dir) for matching roots."""
-    predicate = {'hdlong': _is_hdlong_scene, 'polarps': _is_polarps_scene}
-    out = []
-    for kind, root in zip(kinds, roots):
-        for d in _find_scenes(root, predicate[kind]):
+def _discover(roots: list[str], kind: str):
+    """`[(kind, scene_dir), ...]` across every root of one source, in root order.
+
+    Roots are swept in the order they were given on the command line and the
+    results concatenated, so the pool — and therefore the split, which is a
+    permutation over pool POSITIONS — depends on that order. Reordering the
+    roots is a different pool; the fingerprint records which one was used.
+
+    Scene paths are de-duplicated across roots (first occurrence wins) because
+    one root nested inside another would otherwise discover the same scene
+    twice and scatter the copies across train/val/test.
+
+    Returns `(scenes, per_root_counts)`; the counts are what let the caller
+    warn about a single mistyped root instead of reporting one combined total
+    that a healthy root can hide a broken one behind.
+    """
+    predicate = {'hdlong': _is_hdlong_scene, 'polarps': _is_polarps_scene}[kind]
+    out, seen, counts = [], set(), []
+    for root in roots:
+        n = 0
+        for d in _find_scenes(root, predicate):
+            key = os.path.normpath(os.path.abspath(d))
+            if key in seen:
+                continue
+            seen.add(key)
             out.append((kind, d))
-    return out
+            n += 1
+        counts.append(n)
+    return out, counts
 
 
 def _auto_discover(root: str) -> list[tuple[str, str]]:
@@ -171,11 +194,9 @@ def _validate_pool(args, scenes):
     checkpoint's argument snapshot, where `--resume`'s config guard compares it.
     """
     k = _k_per_scene(args)
-    roots = {
-        'hdlong_dir': getattr(args, 'hdlong_dir', None),
-        'polarps_dir': getattr(args, 'polarps_dir', None),
-        'train_dir': getattr(args, 'train_dir', None),
-    }
+    # One key per root (`hdlong_dir`, `hdlong_dir#1`, ...), so two roots with
+    # identically-named scenes stay distinct in the manifest and the hash.
+    roots = build_roots(args)
     log_dir = (getattr(args, 'log_dir', None)
                or os.path.join(getattr(args, 'session_name', '.'), 'logs'))
     session_manifest = os.path.join(log_dir, DEFAULT_MANIFEST_NAME)
@@ -186,6 +207,10 @@ def _validate_pool(args, scenes):
     if explicit:
         reuse = explicit
     elif getattr(args, 'resume', None) and os.path.isfile(session_manifest):
+        # Only a genuine CONTINUATION reuses the session manifest. A fine-tune
+        # (`--pretrained`) is a new run on, usually, a different dataset: it
+        # must rescan, or it would silently train on the pool of whatever run
+        # happened to have used this session directory before it.
         reuse = session_manifest
         print('[SceneCheck] resuming: reusing this session\'s manifest so the '
               'pool (and therefore the split) is identical to the original run.')
@@ -249,20 +274,30 @@ def _discover_scenes(args):
     ratio (see `_proportional_cap`) rather than as a uniform draw, so the
     minority source cannot be sampled out of existence.
     """
-    hd_dir = getattr(args, 'hdlong_dir', None)
-    pp_dir = getattr(args, 'polarps_dir', None)
-    hd = _discover([hd_dir], ['hdlong'])
-    pp = _discover([pp_dir], ['polarps'])
+    hd_dirs = as_roots(getattr(args, 'hdlong_dir', None))
+    pp_dirs = as_roots(getattr(args, 'polarps_dir', None))
+    hd, hd_counts = _discover(hd_dirs, 'hdlong')
+    pp, pp_counts = _discover(pp_dirs, 'polarps')
 
-    # Fail loud on a configured-but-empty root.
-    if hd_dir and os.path.isdir(hd_dir) and not hd:
-        print(f"[MixedTrainDataset] WARNING: --hdlong_dir='{hd_dir}' exists but "
-              f"yielded 0 scenes (no 'light_means.config' marker found at any "
-              f"depth). Did you extract hdlong_config.zip into the same tree?")
-    if pp_dir and os.path.isdir(pp_dir) and not pp:
-        print(f"[MixedTrainDataset] WARNING: --polarps_dir='{pp_dir}' exists but "
-              f"yielded 0 scenes (no 'normal.exr' marker found at any depth). "
-              f"Check that the flag points at the PolarPS root.")
+    # Report and check PER ROOT: with several roots a combined total lets a
+    # healthy root hide a mistyped or half-mounted one behind it.
+    for flag, marker, hint, dirs, counts in (
+            ('--hdlong_dir', 'light_means.config',
+             'Did you extract hdlong_config.zip into the same tree?',
+             hd_dirs, hd_counts),
+            ('--polarps_dir', 'normal.exr',
+             'Check that the flag points at a PolarPS root.',
+             pp_dirs, pp_counts)):
+        for root, n in zip(dirs, counts):
+            if n:
+                print(f'[MixedTrainDataset] {flag} {root}: {n:,} scenes')
+            elif os.path.isdir(root):
+                print(f"[MixedTrainDataset] WARNING: {flag} root '{root}' "
+                      f"exists but yielded 0 scenes (no '{marker}' marker found "
+                      f"at any depth). {hint}")
+            else:
+                print(f"[MixedTrainDataset] WARNING: {flag} root '{root}' is "
+                      f"not a directory; it contributes no scenes.")
 
     # Execute only if hd = pp = [] with non-NaN train_dir
     if not (hd or pp) and getattr(args, 'train_dir', None):
@@ -282,6 +317,18 @@ def _discover_scenes(args):
     pp = [s for s in valid if s[0] == 'polarps']
     print(f'[SceneCheck] pool = {len(hd):,} hdlong + {len(pp):,} polarps '
           f'(fingerprint {getattr(args, "scene_pool_fingerprint", "?")})')
+    # Post-validation attribution per root. The pre-validation counts above are
+    # what was discovered; this is what survived, which is the number that
+    # actually enters the split.
+    roots = build_roots(args)
+    if len(roots) > 1:
+        per_root = {key: 0 for key in roots}
+        for _kind, path in valid:
+            key, _rel = relative_to_roots(path, roots)
+            if key in per_root:
+                per_root[key] += 1
+        print('[SceneCheck] valid per root: '
+              + ', '.join(f'{roots[key]}={n:,}' for key, n in per_root.items()))
 
     max_scenes = getattr(args, 'max_scenes', None)
     if max_scenes is not None and max_scenes > 0:
@@ -297,26 +344,39 @@ def build_mixed_split(args, augment=True):
     this repeatedly with the same args yields identical, disjoint
     train/val/test scene lists.
 
+    `--test_fraction 0` switches the test split off and returns an empty test
+    dataset, which is what lets a run judged by an external benchmark be
+    configured without a mode of its own. Validation has no such option: it is
+    what selects `best.pt`, and a run that trains without deciding which epoch
+    to keep produces nothing usable, so `--val_fraction` must be > 0.
+
     Returns (train_dataset, val_dataset, test_dataset); val and test never
     augment.
     """
     # Validate the cheap arguments before the (expensive) filesystem walk, so a
-    # bad flag dies immediately instead of after discovering ~1200 scenes.
+    # bad flag dies immediately instead of after discovering ~18k scenes.
     val_fraction = float(getattr(args, 'val_fraction', 0.1))
     test_fraction = float(getattr(args, 'test_fraction', 0.1))
     seed = int(getattr(args, 'seed', 42))
-    for flag, frac in (('--val_fraction', val_fraction),
-                       ('--test_fraction', test_fraction)):
-        if not 0 < frac < 1:
-            raise ValueError(
-                f"{flag} must be in the open interval (0, 1); got {frac}. "
-                f"Use e.g. 0.1 for a 10% held-out split."
-            )
+    if not 0 < val_fraction < 1:
+        raise ValueError(
+            f"--val_fraction must be in the open interval (0, 1); got "
+            f"{val_fraction}. Validation is what selects best.pt, so it cannot "
+            f"be switched off — without it nothing chooses which epoch to keep "
+            f"and --patience / --auto_decay have nothing to act on."
+        )
+    if not 0 <= test_fraction < 1:
+        raise ValueError(
+            f"--test_fraction must be in [0, 1); got {test_fraction}. Use e.g. "
+            f"0.1 for a 10% held-out split, or 0 to skip the test split when "
+            f"the verdict comes from an external benchmark."
+        )
     if val_fraction + test_fraction >= 1:
         raise ValueError(
             f"--val_fraction ({val_fraction}) + --test_fraction "
             f"({test_fraction}) must be < 1 to leave scenes for training."
         )
+    want_test = test_fraction > 0
 
     scenes = _discover_scenes(args)
     hd = [s for s in scenes if s[0] == 'hdlong']
@@ -329,22 +389,28 @@ def build_mixed_split(args, augment=True):
         n = len(items)
         if n == 0:
             return [], [], []
-        # A source present in the pool must land in *all three* splits, which
-        # needs at least one scene each. Fewer than 3 scenes is unsplittable.
-        if n < 3:
+        # A source present in the pool must land in every split that was ASKED
+        # for, one scene each minimum: train + val always, test only when
+        # --test_fraction > 0. So 3 scenes normally, 2 with the test split off.
+        n_min = 2 + int(want_test)
+        if n < n_min:
+            wanted = ' + '.join(['train', 'val'] + ['test'] * want_test)
             raise RuntimeError(
                 f"The {name} pool has only {n} VALID scene(s), which cannot "
-                f"fill the train, val, and test splits (one scene each "
-                f"minimum). Note this count is post-validation: check the "
-                f"[SceneCheck] lines above and the manifest, since scenes that "
-                f"cannot supply K images were removed. Provide at least 3 "
-                f"usable {name} scenes, or drop {flag} to train without {name}."
+                f"fill the {wanted} splits (one scene each minimum). Note this "
+                f"count is post-validation: check the [SceneCheck] lines above "
+                f"and the manifest, since scenes that cannot supply K images "
+                f"were removed. Provide at least {n_min} usable {name} scenes, "
+                f"or drop {flag} to train without {name}."
             )
         perm = rng.permutation(n)
-        # Clamp so every split keeps >=1 scene: val in [1, n-2], then test in
-        # [1, n-1-n_val], leaving n_train = n - n_val - n_test >= 1.
-        n_val = min(max(int(round(n * val_fraction)), 1), n - 2)
-        n_test = min(max(int(round(n * test_fraction)), 1), n - 1 - n_val)
+        # Clamp so every requested split keeps >=1 scene and >=1 scene is left
+        # for training. With --test_fraction > 0 these are the original bounds
+        # (val in [1, n-2], test in [1, n-1-n_val]), so the split of an existing
+        # run is unchanged.
+        n_val = min(max(int(round(n * val_fraction)), 1), n - 1 - int(want_test))
+        n_test = (min(max(int(round(n * test_fraction)), 1), n - 1 - n_val)
+                  if want_test else 0)
         val_pos = set(perm[:n_val].tolist())
         test_pos = set(perm[n_val:n_val + n_test].tolist())
         train = [items[i] for i in range(n)

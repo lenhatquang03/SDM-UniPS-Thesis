@@ -45,11 +45,13 @@ learned.
 
 Two distinct modes, chosen by inspecting the file:
 
-* **full resume** — the checkpoint carries an `optimizer` entry, so it came
-  from `Trainer.save`. Everything is restored and training continues at the
-  next epoch.
-* **warm start** — a bare `state_dict` (`*.pytmodel`, e.g. the upstream
-  released weights). Weights only, `strict=False`, fresh optimizer, epoch 0.
+* **full resume** (`resume_from`) — the checkpoint carries an `optimizer`
+  entry, so it came from `Trainer.save`. Everything is restored and training
+  continues at the next epoch.
+* **warm start** (`load_pretrained`, driven by `--pretrained`) — weights only,
+  from either a full checkpoint or a bare `state_dict` (`*.pytmodel`, e.g. the
+  upstream released weights). Fresh optimizer, fresh schedule, epoch 0. This is
+  the fine-tuning entry point: continue a *converged* model on new data.
 
 Which one happened is printed loudly, because silently warm-starting a run
 that was meant to resume looks like normal training until the loss curve is
@@ -57,6 +59,7 @@ read days later.
 """
 
 import glob
+import hashlib
 import math
 import os
 import random
@@ -76,6 +79,45 @@ from modules.loss import losses
 # older versions and fills in what it can, so a run started before a format
 # change can still be resumed.
 CHECKPOINT_FORMAT_VERSION = 3
+
+
+def _file_sha1(path, chunk=4 << 20):
+    """Short digest of a weights file, recorded as `--pretrained` provenance.
+
+    A path alone does not identify a model — `best.pt` in a session directory is
+    overwritten as the run improves, so "fine-tuned from modelA/best.pt" says
+    nothing about *which* best. The digest pins it. One streaming read of the
+    file, once, at startup.
+    """
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(chunk), b''):
+            h.update(block)
+    return h.hexdigest()[:16]
+
+
+def _is_scalar(v):
+    return isinstance(v, (str, int, float, bool, type(None)))
+
+
+def jsonable_args(args) -> dict:
+    """Serializable view of an argparse namespace, for config.json and the
+    checkpoint's argument snapshot.
+
+    Lists of scalars are kept, not dropped. `--hdlong_dir` / `--polarps_dir`
+    are `nargs='+'` and therefore arrive as lists; a scalars-only filter would
+    silently omit them from the snapshot, and `check_resume_compat` skips keys
+    that are absent — so the dataset roots, which are split-CRITICAL, would
+    stop being guarded on resume exactly when multi-root runs made that guard
+    matter most.
+    """
+    out = {}
+    for k, v in vars(args).items():
+        if _is_scalar(v):
+            out[k] = v
+        elif isinstance(v, (list, tuple)) and all(_is_scalar(x) for x in v):
+            out[k] = list(v)
+    return out
 
 
 class NonFiniteGradientAbort(RuntimeError):
@@ -906,8 +948,7 @@ class Trainer:
 
     def _args_snapshot(self):
         """JSON-ish copy of the run's arguments, for the resume compat check."""
-        return {k: v for k, v in vars(self.args).items()
-                if isinstance(v, (str, int, float, bool, type(None)))}
+        return jsonable_args(self.args)
 
     def save(self, ckpt_dir, tag, state=None):
         """Write a complete, resumable checkpoint.
@@ -942,22 +983,126 @@ class Trainer:
             'loop_state': dict(state) if state else None,
         }
         self._atomic_save(payload, path)
-        # Drop-in copy for the inference Builder.
-        legacy = os.path.join(ckpt_dir, f'{self.target}.pytmodel')
-        self._atomic_save(self.net.state_dict(), legacy)
         return path
 
-    def resume_from(self, path, weights_only=False):
+    def export_weights(self, ckpt_dir):
+        """Publish the CURRENT in-memory weights as the inference file.
+
+        `*.pytmodel` is not a legacy format — it is the interchange format
+        `builder.load_models` requires: a BARE `state_dict`, in a directory
+        holding exactly one of them. A `.pt` training checkpoint cannot be used
+        instead, because its top-level keys are `model`/`optimizer`/… rather
+        than parameter names.
+
+        Exactly one such file is written, at the path inference actually reads
+        (`<ckpt_dir>/<target>/<target>.pytmodel`), from whatever the model holds
+        right now. Callers invoke this when the in-memory weights ARE the ones
+        to publish: at each `best.pt` update, and once more at the end of the
+        run on the weights the test number was reported on.
+
+        Writing it here rather than copying files around at export time is what
+        keeps the "exactly one `*.pytmodel` in that directory" invariant true by
+        construction — the filename is fixed and `_atomic_save` replaces it in
+        place, so no stale sibling can accumulate for a later export to trip
+        over. It also means a run killed mid-schedule leaves weights that are
+        immediately usable, instead of needing files moved by hand.
+        """
+        out_dir = os.path.join(ckpt_dir, self.target)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f'{self.target}.pytmodel')
+        self._atomic_save(self.net.state_dict(), path)
+        return path
+
+    def load_pretrained(self, path):
+        """Initialize the weights from `path` and return a provenance record.
+
+        This is the `--pretrained` entry point: a **warm start**, i.e. a NEW run
+        (fresh optimizer, fresh LR schedule, epoch 0, `best_val_loss` reset)
+        that merely begins from an existing model rather than from random init.
+        Fine-tuning Model A on a further dataset is exactly this.
+
+        Accepts either a full training checkpoint (`best.pt`) or a bare
+        `state_dict` (`*.pytmodel`); only the weights are read from either.
+
+        Tensors are matched by name AND shape, and anything that does not match
+        is reported. Shape filtering is what lets a later architecture variant
+        inherit the layers it shares with Model A, rather than having
+        `load_state_dict` refuse the whole file over one changed layer.
+
+        Loading *nothing* raises. That is not a hypothetical: this file used to
+        hand a full checkpoint (top-level keys `model`/`optimizer`/...) to
+        `load_state_dict(strict=False)`, which matched no parameter name at all
+        and trained from random init while printing "Loading pretrained model".
+        A fine-tune that silently starts from scratch is indistinguishable from
+        one that worked until the results come back wrong.
+        """
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        sd = ckpt['model'] if (isinstance(ckpt, dict) and 'model' in ckpt) else ckpt
+        if not isinstance(sd, dict):
+            raise RuntimeError(
+                f'--pretrained {path}: not a checkpoint or state_dict '
+                f'(loaded a {type(sd).__name__}).')
+
+        own = self.net.state_dict()
+        matched, mismatched = {}, []
+        for k, v in sd.items():
+            if k not in own:
+                continue
+            if hasattr(v, 'shape') and own[k].shape != v.shape:
+                mismatched.append((k, tuple(own[k].shape), tuple(v.shape)))
+                continue
+            matched[k] = v
+        all_missing, unexpected = self.net.load_state_dict(matched, strict=False)
+        # `all_missing` is everything not in `matched`, which includes the
+        # shape-mismatched keys. Report those under their own heading only, so
+        # the two counts partition the gap instead of double-counting it.
+        bad_shape = {k for k, _o, _f in mismatched}
+        missing = [k for k in all_missing if k not in bad_shape]
+
+        if not matched:
+            raise RuntimeError(
+                f'--pretrained {path}: none of its {len(sd)} tensors matched a '
+                f'parameter of this model, so NOTHING was loaded and the run '
+                f'would train from random init. Check that the file holds this '
+                f"architecture's weights (a full checkpoint's top-level keys "
+                f'are model/optimizer/..., which is not a state_dict).')
+
+        sha = _file_sha1(path)
+        print(f'[Trainer] PRETRAINED (warm start) from {path}')
+        print(f'[Trainer]   sha1={sha} | tensors loaded {len(matched)}/'
+              f'{len(own)} | missing={len(missing)} unexpected={len(unexpected)}'
+              f' shape-mismatched={len(mismatched)}')
+        print(f'[Trainer]   optimizer, LR schedule, epoch counter and '
+              f'best_val_loss all start FRESH — this is a new run, not a resume.')
+        if missing:
+            print(f'[Trainer]   WARNING: {len(missing)} parameter tensors were '
+                  f'absent from the file and keep their random init, e.g. '
+                  f'{missing[:3]}')
+        if mismatched:
+            print(f'[Trainer]   WARNING: {len(mismatched)} tensors were skipped '
+                  f'for a shape mismatch and keep their random init, e.g. '
+                  f'{mismatched[:3]}')
+        if unexpected:
+            print(f'[Trainer]   note: {len(unexpected)} tensors in the file are '
+                  f'not part of this model and were ignored.')
+        return {'path': path, 'sha1': sha, 'loaded': len(matched),
+                'missing': len(missing), 'unexpected': len(unexpected),
+                'shape_mismatched': len(mismatched)}
+
+    def resume_from(self, path):
         """Restore a run from `path`. Returns the loop state, or None.
 
         A returned dict means a **full resume** happened and the caller must
-        continue from `state['epoch'] + 1`. `None` means only weights were
-        loaded (**warm start**) and the caller starts from scratch at epoch 0.
+        continue from `state['epoch'] + 1`. `None` means the file held weights
+        only, so nothing but the model could be restored and the caller starts
+        from scratch at epoch 0.
 
-        `weights_only=True` forces the warm-start reading of a full
-        checkpoint — for deliberately beginning a *new* run from a previous
-        run's weights, where inheriting stale optimizer moments and an
-        already-finished LR schedule would be wrong.
+        To deliberately start a new run from an old run's weights, use
+        `--pretrained` (`load_pretrained`) rather than pointing `--resume` at
+        them: `--resume` means "continue THIS run", and keeping the two
+        separate is what lets `--pretrained X --resume auto` be a single
+        relaunchable command — warm start on the first launch, true resume on
+        every one after a crash.
         """
         # weights_only=False is explicit: newer torch defaults it to True and
         # would reject the RNG/args payload, which is not a plain tensor dict.
@@ -965,22 +1110,10 @@ class Trainer:
 
         is_full = (isinstance(ckpt, dict) and 'model' in ckpt
                    and 'optimizer' in ckpt)
-        if not is_full or weights_only:
-            sd = ckpt['model'] if (isinstance(ckpt, dict) and 'model' in ckpt) else ckpt
-            missing, unexpected = self.net.load_state_dict(sd, strict=False)
-            why = ('forced by --resume_weights_only' if (is_full and weights_only)
-                   else 'file holds weights only, no optimizer state')
-            print(f'[Trainer] WARM START from {path} ({why}).')
-            print(f'[Trainer]   weights loaded | missing={len(missing)} '
-                  f'unexpected={len(unexpected)} | optimizer, LR schedule and '
-                  f'epoch counter all start FRESH at 0.')
-            if len(missing) > 0:
-                # strict=False is what makes a warm start possible at all, but
-                # it is also what silently loaded *nothing* when this code was
-                # handed a full training checkpoint. Report what actually landed.
-                print(f'[Trainer]   WARNING: {len(missing)} parameter tensors '
-                      f'were absent from the file and keep their random init, '
-                      f'e.g. {missing[:3]}')
+        if not is_full:
+            print(f'[Trainer] {path} holds weights only (no optimizer state), '
+                  f'so --resume can restore nothing else.')
+            self.load_pretrained(path)
             return None
 
         self.net.load_state_dict(ckpt['model'])
@@ -1108,8 +1241,8 @@ def prune_checkpoints(ckpt_dir, keep_last=3, protect=(), keep_last_steps=None):
     """Rotate `epoch_*.pt` (and, when `keep_last_steps` is set, `step_*.pt`).
 
     Keeps the most recent `keep_last` epoch checkpoints and anything in
-    `protect` (e.g. {'best'}). `final.pt` and the legacy `<target>.pytmodel`
-    are never touched.
+    `protect` (e.g. {'best'}). `final.pt` is never touched, and neither is the
+    exported `<target>/<target>.pytmodel`, which lives in a subdirectory.
 
     `step_*.pt` is rotated separately and only when `keep_last_steps` is not
     None: it is mid-epoch crash insurance, so a handful is enough, and with

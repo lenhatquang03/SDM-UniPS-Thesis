@@ -8,7 +8,7 @@ SDM-UniPS is a **CVPR 2023 Highlight** paper implementation for **Universal Phot
 
 **Scope:** this fork targets **surface-normal prediction only**. The upstream BRDF heads (baseColor / roughness / metallic from Appendix C of the paper) and novel-view relighting (`relighting.py`, `modules/utils/render.py`) have been removed.
 
-The current branch (`architecture/training-pipeline`) targets **Model A** (the baseline SDM-UniPS architecture, no modifications), trained on a mix of `hdlong-complexv1` and `PolarPS` for the author's thesis: *"Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens."* Models B and C (WTConv, WESS, latent-carrier deformable attention) will live on dedicated branches once Model A's smoke test is green.
+The current branch (`architecture/training-pipeline`) targets **Model A** (the baseline SDM-UniPS architecture, no modifications), trained on a mix of `hdlong-complexv1` and `PolarPS` for the author's thesis: *"Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens."* Models B and C (WTConv, WESS, latent-carrier deformable attention) will live on dedicated branches. A side experiment continues Model A on **MerlMix** (see **Fine-tuning from a pretrained model**) to test whether more data improves DiLiGenT MAE.
 
 ## Running Inference
 
@@ -41,9 +41,12 @@ python sdm_unips/train.py \
   --train_resolution 512 --canonical_resolution 256 \
   --batch_size 8 --pixel_samples 2048 \
   --epochs 60 --lr 1e-4 --weight_decay 0.05 \
-  --lr_schedule cosine --warmup_epochs 5 --min_lr_ratio 0.01 \
+  --lr_schedule wsd --decay_fraction 0.2 \
+  --warmup_epochs 5 --min_lr_ratio 0.01 \
   --grad_clip 1.0 --amp_dtype bf16
 ```
+(`--lr_schedule` defaults to `cosine`; pass `wsd` explicitly — see **LR
+schedule** below for why.)
 
 **Smoke test on Kaggle (10 epochs, optionally shrink dataset):**
 ```bash
@@ -59,15 +62,22 @@ python sdm_unips/train.py \
 `--test_fraction`, both default 0.1), split proportionally within each source
 (hdlong and PolarPS split separately, so the mix ratio is preserved in all
 three splits) and deterministic given `--seed`. A source present in the pool
-must supply at least 3 scenes (one per split) or training aborts with an
-informative error (and training also aborts if the val or test split comes
-out empty). `best.pt` is selected by **held-out validation loss** at the end
-of every `--val_every_epochs` epochs. The **held-out test split** is evaluated
-**exactly once, after the final epoch** via the same `val_step` path, on the
-weights loaded from `best.pt` (not the last-epoch weights, so late overfitting
-or early stopping never biases the headline number), and it never influences
-checkpoint selection. There is no external benchmark; DiLiGenT is no longer
-used.
+must supply at least one scene per split it is asked to fill (3 normally, 2
+with `--test_fraction 0`) or training aborts, as does a requested split that
+comes out empty. `best.pt` is selected by **held-out validation loss** at the
+end of every `--val_every_epochs` epochs. The **held-out test split** is
+evaluated **exactly once, after the final epoch** via the same `val_step` path,
+on the weights loaded from `best.pt` (not the last-epoch weights, so late
+overfitting or early stopping never biases the headline number), and it never
+influences checkpoint selection.
+
+**`--test_fraction 0` switches the test split off**, which is what lets a side
+experiment skip it without needing a mode of its own: validation still selects
+`best.pt` while everything else trains, and the verdict comes from an external
+benchmark (`sdm_unips/eval_diligent.py`, run against `<session>/checkpoints`
+after the run exports them). **`--val_fraction` has no such switch and must be
+> 0** — validation is what chooses which epoch to keep, so a run without it
+produces no deliverable.
 
 Test and validation report the **same quantities aggregated the same way** —
 both sweep `train.py:run_eval_pass`, which takes a scene-count-weighted mean
@@ -172,11 +182,10 @@ that is a plain function — so it cannot be rebuilt from `args`, and
 which the branch truncates). Checkpoints therefore carry
 `sched_state = {decay_start, decay_end, branched}`, and a resume restores those
 endpoints **authoritatively**, ignoring whatever `--epochs` and
-`--decay_fraction` the relaunch passes. Without it a mid-ramp resume put the LR
-back to the full `--lr`; re-passing `--decay_now` re-branched at the new step,
-so on a machine that crashes during the decay the ramp could never complete.
-Re-passing `--decay_now` against a branched checkpoint is now an announced
-no-op.
+`--decay_fraction` the relaunch passes. Otherwise a mid-ramp resume would put
+the LR back to the full `--lr` and `--decay_now` would re-branch at the new
+step, so a machine that crashes during the decay could never finish it.
+Re-passing `--decay_now` against a branched checkpoint is an announced no-op.
 
 A **derived** ramp (`--decay_from_step 0`, never branched) is deliberately
 *not* persisted: it is a pure function of the args, rebuilds identically, and
@@ -200,7 +209,7 @@ B and C would let each variant pick its own schedule and confound the result.
 **Early stopping (safety cutoff):** `--patience` (default 10, in units of
 validation checks; 0 disables) stops training once val loss has not improved
 by more than `--min_delta` (default 0.0) for that many consecutive checks. The
-cosine LR schedule still spans the full `--epochs`; patience only trims the
+LR schedule still spans the full `--epochs`; patience only trims the
 unproductive tail, and `best.pt` already holds the best-val weights, so
 stopping early never costs the deliverable.
 
@@ -357,8 +366,42 @@ uniform root change also leaves discovery order untouched (all paths share the
 prefix), so the split itself is unchanged — which is what makes the fingerprint
 match meaningful rather than coincidental.
 
+**Several roots per source.** `--hdlong_dir` and `--polarps_dir` are
+`nargs='+'`: each takes one or more roots, swept in the order given and pooled
+into a **single source**. MerlMix has hdlong's exact directory layout and
+marker file (`light_means.config`), so it is added as an extra `--hdlong_dir`
+root rather than as a new dataset kind — no new loader, no new `kind`. The
+consequence to keep in mind is that `_proportional_cap` and the per-source
+split key on *kind*, so `--max_scenes` balances hdlong-total against PolarPS,
+not hdlong-complexv1 against MerlMix.
+
+Scene paths are de-duplicated across roots (a root nested inside another would
+otherwise land two copies of a scene in different splits), and each root's
+discovered and post-validation counts are printed separately — a combined total
+would let a healthy root hide a mistyped or half-mounted one.
+
+Each root gets its **own manifest key**: `hdlong_dir`, `hdlong_dir#1`,
+`hdlong_dir#2`, … Without that, `hdlong/SCENE_0001` and `merlmix/SCENE_0001`
+would collapse to the same `(kind, root_key, relpath)` entry — a fingerprint
+collision, and a `read_manifest` that rebases both onto whichever root came
+first, i.e. training on one dataset twice and never touching the other. The
+fingerprint folds in only the key's `#n` **suffix**, so the *first* root of each
+flag hashes exactly as it did when the flag was single-valued: a single-root
+pool keeps its old fingerprint, and Model A's checkpoints (where the
+fingerprint is split-critical) still resume and its manifest is still reusable.
+`scene_check.build_roots` owns the keying; `sdm_unips/tests/test_scene_check_roots.py`
+pins both the collision case and the single-root invariant (stdlib-only, so it
+runs without a training environment).
+
+Root **order** is part of the pool identity, since the split is a permutation
+over pool *positions*. Passing the same roots in a different order is a
+different split; the fingerprint records which order was used, and `--resume`
+aborts on a change.
+
 **Key training flags** (defaults shown are thesis values):
-- `--hdlong_dir`, `--polarps_dir`: roots for the two mixed sources (either or both)
+- `--hdlong_dir`, `--polarps_dir`: roots for the two mixed sources (either or
+  both). Each takes **one or more** roots (`nargs='+'`) — see **Several roots
+  per source** below
 - `--train_dir`: auto-detect root (scenes classified into hdlong/polarps by on-disk markers)
 - `--max_scenes`: cap on the **combined** scene pool before the split (thesis uses 8000)
 - `--k_per_scene`: 10 — images drawn per scene, and the minimum a scene must
@@ -367,8 +410,10 @@ match meaningful rather than coincidental.
 - `--strict_scenes`: abort if any scene fails validation (default: skip it)
 - `--max_bad_scene_frac`: 0.05 — abort if more than this fraction fails
   validation (0 disables); catches a half-mounted dataset or a wrong `--k_per_scene`
-- `--val_fraction`: held-out fraction for validation (default 0.1)
-- `--test_fraction`: held-out fraction for the final test report (default 0.1)
+- `--val_fraction`: held-out fraction for validation (default 0.1; **0 = no
+  val split**, which also means no `best.pt`)
+- `--test_fraction`: held-out fraction for the final test report (default 0.1;
+  **0 = no test split**, for a run judged by an external benchmark)
 - `--test_trials`: deterministic K-image draws per test scene, averaged (default 3; keep small)
 - `--val_every_epochs`: epochs between validation passes / best.pt checks (default 1)
 - `--patience`: early-stopping patience in validation checks (default 10; 0 disables)
@@ -388,8 +433,8 @@ match meaningful rather than coincidental.
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
 - K is `--k_per_scene` (default 10), enforced in `HdlongLoader` / `PolarPSLoader` and as the pool's validity threshold.
 - `--lr`: 1e-4 — `--weight_decay`: 0.05
-- `--lr_schedule`: `wsd` (recommended), `cosine`, or `step` — see **LR
-  schedule** below
+- `--lr_schedule`: default `cosine`; `wsd` is recommended and `step` exists —
+  see **LR schedule** below
 - `--decay_fraction`: 0.2 — `--decay_from_step`: 0 — `--decay_now` (wsd only)
 - `--auto_decay` (off) — `--auto_decay_rel`: 0.01 — `--auto_decay_patience`: 2
   — `--auto_decay_min_epoch`: 8. In-process decay trigger; see **LR schedule**
@@ -402,16 +447,24 @@ match meaningful rather than coincidental.
   — `--ckpt_every`: 1000 optimizer steps, `--keep_last_steps`: 2 (mid-epoch
   crash insurance; see **Checkpoints** below)
 - `--resume`: continue an interrupted run (`auto`, a checkpoint dir, or a
-  file) — see **Resuming** below. `--resume_weights_only` forces a
-  weights-only warm start; `--allow_config_change` downgrades the split-config
-  guard to a warning
+  file) — see **Resuming** below. `--allow_config_change` downgrades the
+  split-config guard to a warning
+- `--pretrained`: start a **new** run from an existing checkpoint's weights —
+  see **Fine-tuning** below
 - `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
 
 The final test evaluation runs automatically after the last epoch on the
 held-out `--test_fraction` split, averaged over `--test_trials` deterministic
-trials.
+trials — unless `--test_fraction 0`, in which case the run ends after the
+export and the verdict comes from an external benchmark.
 
-Checkpoints are written to `<session>/checkpoints/`. Each save also drops a bare-`state_dict` `normal.pytmodel` copy (overwritten every save, so it tracks the *latest* weights); each `best.pt` update additionally copies it to `best_normal.pytmodel`. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned (`final.pt` is never auto-pruned), **ordered by parsed epoch number** — sorting the filenames as strings put `epoch_10.pt` before `epoch_7.pt`, so from epoch 10 onward the newest checkpoint was deleted the moment it was written.
+Checkpoints are written to `<session>/checkpoints/`. The most recent `--keep_last` `epoch_*.pt` files plus `best.pt` are retained; older epoch checkpoints are pruned (`final.pt` is never auto-pruned), **ordered by parsed epoch number** — string-sorting the filenames puts `epoch_10.pt` before `epoch_7.pt`, which would delete the newest checkpoint the moment it was written.
+
+**One inference file, not three.** `builder.load_models` needs a bare `state_dict` in a directory holding exactly one `*.pytmodel`; a `.pt` training checkpoint will not do, since its top-level keys are `model`/`optimizer`/… rather than parameter names. So `*.pytmodel` is the **interchange format**, not a legacy one — but only one copy of it is needed. `Trainer.export_weights` serializes the model **in memory** straight to `<session>/checkpoints/normal/normal.pytmodel`, called at each `best.pt` update and once after the final epoch. Consequences:
+
+- The filename is fixed and written atomically, so "exactly one `*.pytmodel` in that directory" holds by construction — no stale sibling to clean up, and no second copy that could disagree with the first.
+- A run killed mid-schedule leaves weights that are **immediately usable** (`--checkpoint <session>/checkpoints`), instead of files needing to be moved by hand.
+- Per-save weight writes are gone. Previously every epoch checkpoint *and* every `--ckpt_every` step checkpoint rewrote a full `normal.pytmodel` that nothing read until the run ended.
 
 **Mid-epoch checkpoints.** `--ckpt_every` (default 1000 optimizer steps, 0
 disables) writes `step_*.pt`, because resume granularity is one epoch and an
@@ -459,18 +512,15 @@ Two modes, chosen by inspecting the file and **printed at startup**:
   every RNG stream (python / numpy / torch / cuda / the DataLoader shuffle
   generator), and the loop's epoch, `best_val_loss`, patience counter and
   `elapsed_sec` are all restored; training continues at the next epoch.
-- **warm start** — a bare `*.pytmodel` `state_dict`, or `--resume_weights_only`.
-  Weights only (`strict=False`), fresh optimizer, epoch 0. For seeding a *new*
-  experiment from old weights.
+- **warm start** — the file holds weights only (a bare `*.pytmodel`
+  `state_dict`), so nothing else *can* be restored. This is the `--pretrained`
+  path; pointing `--resume` at such a file falls through to it with a printed
+  warning.
 
-Restoring only the weights — which is what `--resume` used to do — is worse
-than useless for continuing a run: a fresh AdamW has no moment estimates and a
-fresh `LambdaLR` restarts at step 0, so the first resumed step lands at the
-warmup LR with no gradient history. (It was in fact worse still: the old code
-passed a full training checkpoint to `loadmodel(..., strict=False)`, whose
-top-level keys are `model`/`optimizer`/… rather than parameter names, so
-`strict=False` swallowed all of them and **loaded nothing at all** while
-printing "Loading pretrained model".)
+Weights alone are worse than useless for *continuing* a run: a fresh AdamW has
+no moment estimates and a fresh `LambdaLR` restarts at step 0, so the first
+resumed step lands at the warmup LR with no gradient history. That is why the
+two are separate flags.
 
 **Config guard.** The checkpoint stores its own `args`. Resuming with a
 different `--seed`, `--val_fraction`, `--test_fraction`, `--max_scenes` or
@@ -501,14 +551,122 @@ interrupted epoch's steps remain, followed by the replayed epoch, and raw
 the seam, so the stale tail is a one-line filter. Each resumed run also writes
 `config_resume_<n>.json` rather than overwriting the original `config.json`.
 
-After the final epoch, `train.py:export_for_inference` publishes the weights the test number was reported on to `<session>/checkpoints/normal/normal.pytmodel` — `best_normal.pytmodel` when a best was recorded, else `normal.pytmodel` (the final-epoch weights). Inference then runs directly against the training output:
+## Fine-tuning from a pretrained model
+
+`--pretrained PATH` starts a **new** run from an existing checkpoint's weights:
+fresh optimizer, fresh LR schedule, epoch 0, `best_val_loss` reset. `--resume`
+means "continue *this* run"; `--pretrained` means "begin a new one from that
+model". The MerlMix experiment is exactly this — continue Model A (selected on
+the hdlong+PolarPS val split) on MerlMix alone and see whether DiLiGenT MAE
+improves:
+
+```bash
+python sdm_unips/train.py --session_name modelA_merlmix \
+  --hdlong_dir /path/to/MerlMix \
+  --pretrained modelA_full/checkpoints/best.pt --resume auto \
+  --val_fraction 0.1 --test_fraction 0 \
+  --lr 2e-5 --warmup_epochs 0.5 --lr_schedule wsd --epochs 15 \
+  --amp_dtype bf16
+```
+
+Then evaluate the exported weights externally:
+
+```bash
+python sdm_unips/eval_diligent.py --diligent_dir DATA \
+  --checkpoint modelA_merlmix/checkpoints
+```
+
+**How `--pretrained` and `--resume` compose.** The two answer different
+questions — `--pretrained` says *where a new run begins*, `--resume` says
+*whether this is a new run at all* — so they are applied in a fixed order at
+startup:
+
+1. **Resolve both paths**, before the (slow) scene scan, so a typo dies in a
+   second. `--resume auto` on a session with no checkpoints resolves to
+   **None** (not an error: that is what makes one command work for launch and
+   relaunch). `--pretrained` resolves a directory to `best.pt` and rejects
+   `auto`.
+2. **Build the Trainer** — random init, fresh AdamW, `LambdaLR` at step 0.
+3. **`load_pretrained`**, if `--pretrained` was given. Model weights only.
+   Records `args.pretrained_sha1`.
+4. **`resume_from`**, if `--resume` resolved to anything. A full checkpoint
+   overwrites the model from step 3 and additionally restores optimizer
+   moments, scheduler position, GradScaler scale, skip counters and every RNG
+   stream, then returns the loop state.
+5. **Loop state applied** only when step 4 returned one: `start_epoch`,
+   `best_val_loss`, patience counter, `elapsed_sec`, `resume_count`, the
+   shuffle generator, the auto-decay counters, the branched decay ramp, and the
+   `check_resume_compat` split guard. Otherwise the run starts at epoch 0 with
+   `best_val_loss = inf`.
+
+| `--pretrained` | `--resume` resolves to | weights come from | starts at | optimizer + schedule |
+|---|---|---|---|---|
+| — | nothing | random init | epoch 0 | fresh |
+| `X` | nothing | `X` | epoch 0 | fresh |
+| — | `epoch_N.pt` | `epoch_N.pt` | epoch N+1 | restored |
+| `X` | `epoch_N.pt` | `epoch_N.pt` (`X` discarded) | epoch N+1 | restored |
+
+So `--pretrained X --resume auto` is one relaunchable command. Launch 1: the
+checkpoint dir is empty, `--resume` resolves to nothing, and the run warm-starts
+from `X`. It crashes at epoch 8. Launch 2, *same command*: `--resume auto` finds
+`epoch_7.pt`, which wins outright — its weights are strictly downstream of `X`'s
+— and training continues at epoch 8 with the moment estimates and LR position
+intact.
+
+Points that are load-bearing:
+
+- **Why the order is pretrained-then-resume, and not a branch.** Whenever
+  `--resume` finds a real training checkpoint it must win, because those
+  weights already contain everything `--pretrained` would have supplied. Doing
+  it by unconditional overwrite rather than by an `if/else` means there is no
+  state in which the run can end up with neither. The cost is that a relaunch
+  reads and hashes the pretrained file and then immediately discards it (a few
+  seconds); that is deliberate, because it keeps `pretrained` and
+  `pretrained_sha1` in the argument snapshot of *every* checkpoint the resumed
+  run writes, instead of the provenance dropping off at the first crash.
+- **Nothing about `--pretrained` needs persisting**, unlike the WSD decay ramp.
+  A branched ramp lives only in a lambda closure and must be carried in
+  `sched_state` or it cannot be rebuilt; a warm start, by contrast, is already
+  baked into the weights the checkpoint stores. `pretrained` is therefore in
+  neither `SPLIT_CRITICAL_ARGS` nor `SCHEDULE_SENSITIVE_ARGS` — re-passing it
+  on a relaunch is silent, which is correct, since it changes nothing.
+- **`--resume` pointing at a bare `*.pytmodel`** finds no optimizer state, so
+  it falls through to `load_pretrained` and returns None: a warm start at epoch
+  0, announced. If `--pretrained` was also given, the `--resume` file wins (it
+  is loaded second). Ambiguous and rare — name one or the other.
+- **A directory resolves to `best.pt`** — the *selected* model, which is what
+  a fine-tune should start from. This is the exact opposite of `--resume`'s
+  directory rule, which never picks `best.pt` because that file lags the
+  training frontier and resuming from it would discard epochs. Order is
+  `best.pt` → `final.pt` → newest `epoch_*.pt` → an exported
+  `normal/normal.pytmodel`.
+- **Loading nothing is an error.** Tensors are matched by name *and shape*;
+  the loaded / missing / unexpected / shape-mismatched counts are printed, and
+  a match of zero raises rather than training from random init. (A full
+  checkpoint's top-level keys are `model`/`optimizer`/…, not parameter names,
+  so handing one to `load_state_dict(strict=False)` matches nothing and trains
+  from scratch in silence — the guard exists for exactly that.) Shape filtering
+  is deliberate: it lets a later architecture variant inherit the layers it
+  shares with Model A instead of `load_state_dict` refusing the whole file.
+- **Provenance.** `best.pt` is overwritten as a run improves, so a path alone
+  does not identify a model. `args.pretrained_sha1` (a digest of the weights
+  file) goes into `config.json` and every checkpoint.
+- **Use a lower `--lr`.** The recipe's peak 1e-4 with 5 warmup epochs would
+  largely undo the pretrained weights before they learn anything from the new
+  data.
+- The new run rescans the scene pool. The session-manifest reuse in
+  `_validate_pool` fires only for a genuine `--resume`, never for
+  `--pretrained`, which is usually pointed at a different dataset entirely.
+- The config guard does **not** compare against the pretrained checkpoint's
+  args. A different dataset and split is the whole point of a fine-tune;
+  `check_resume_compat` runs on full resumes only.
+
+After the final epoch, `export_for_inference` republishes `<session>/checkpoints/normal/normal.pytmodel` from the model in memory — `best.pt` when a best was recorded, else the final-epoch weights — so the exported file and the reported test number cannot describe different models (see **One inference file, not three** above). Inference runs directly against the training output:
 
 ```bash
 python sdm_unips/main.py --session_name SESSION --test_dir DATA \
     --checkpoint <session>/checkpoints
 ```
-
-The dedicated `normal/` subdirectory is required because `builder.load_models` globs `*.pytmodel` and `"".join`s the matches — the directory it points at must hold exactly one file, which `<session>/checkpoints/` itself does not.
 
 Logs land in `<session>/logs/`:
 - `train.jsonl` / `train.log`  — per-step loss, MAE, LR, grad norm, step seconds; per-epoch and per-validation summaries
@@ -607,9 +765,9 @@ normal.png
 error.png      # only if Normal_gt.png provided
 ```
 
-**Training layout (hdlong-complexv1 + PolarPS):**
+**Training layout (hdlong-complexv1 / MerlMix + PolarPS):**
 ```
-HDLONG_ROOT/
+HDLONG_ROOT/            # one or more; MerlMix uses this exact layout
 └── SCENE_NAME/
     ├── light_means.config        # required marker; lists point/dir/env means
     ├── cam_0000N/
@@ -628,13 +786,13 @@ POLARPS_ROOT/
         ├── light-02/S0.exr
         └── ... (32 lights total per scene)
 ```
-The dataset class auto-detects scene type via these markers (`light_means.config` ⇒ hdlong, `normal.exr` ⇒ PolarPS). It synthesizes each training render via a Dirichlet (α, β, γ) mix of one randomly chosen point/dir/env light triple (hdlong) or by drawing one of 32 `S0.exr` images (PolarPS). hdlong is upsampled from 256×256 to `--train_resolution`.
+The dataset class auto-detects scene type via these markers (`light_means.config` ⇒ hdlong, `normal.exr` ⇒ PolarPS). **MerlMix carries the hdlong layout and marker**, so it is passed as an additional `--hdlong_dir` root and needs no loader, `kind`, or preprocessing of its own. It synthesizes each training render via a Dirichlet (α, β, γ) mix of one randomly chosen point/dir/env light triple (hdlong) or by drawing one of 32 `S0.exr` images (PolarPS). hdlong is upsampled from 256×256 to `--train_resolution`.
 
 **Per-image normalization:** each observation is divided by a single scalar — the **max, over its foreground pixels, of that pixel's mean across the three colour channels**. This is deliberately the same statistic `realdata.py` uses at inference (`temp = mean over channels; mx = max over pixels; I /= mx`), so observations land in ~[0, 1] in both paths. That matters in two places the architecture is built around: `Net.forward` concatenates the 0/1 mask as a 4th input channel (a differently-scaled RGB drowns it out), and `Net._decode_pixels` concatenates raw observations with the 256-d GLC features before an `ln=True` attention block (a large-magnitude observation channel dominates the LayerNorm statistics and flattens the GLC signal).
 
 PolarPS caches the scalar in an `image_scales.config` sidecar per scene — its observations are fixed `S0.exr` files, so the value depends only on file + mask and is computed once, at the on-disk resolution so it survives a change of `--train_resolution`. **hdlong does not cache**: its observation is a random Dirichlet mix drawn afresh each epoch, and unlike the mean, the max is not linear (`max(Σ wᵢxᵢ) ≠ Σ wᵢ max(xᵢ)` — empirically ~12% off), so there is no per-component quantity to recombine; the scale is measured directly on each composite pre-resize. Read-only dataset mounts (e.g. Kaggle inputs) simply skip the sidecar write and keep an in-process cache.
 
-> Was mean-normalization before 2026-08-05. The sidecar was renamed from `image_means.config` so stale caches can't be reused as if they held maxima — but **delete any `image_means.config` files already written into the dataset trees**, they are now dead weight.
+> Migration: **delete any `image_means.config` files still present in the dataset trees.** They hold means from the pre-2026-08-05 normalization and are dead weight; the current sidecar is `image_scales.config`.
 
 ## Architecture
 
@@ -659,8 +817,8 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 
 ### Data loading
 - Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).
-- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `modules/io/dataloader/scene_check.py` validates the pool before the split and owns the shared "usable unit" helpers the loaders draw from. The per-image normalization scalar and its PolarPS-only sidecar cache live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is `--k_per_scene` (default 10) per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
-- Held-out val and test: both wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × n_trials`, per-index-seeded so renders are worker-count-independent and reproducible). Val uses `n_trials=1` and runs every `--val_every_epochs`; test uses `--test_trials` and runs **once after the final epoch** via `train.py:run_test_eval`. Both sweep `train.py:run_eval_pass` → `Trainer.val_step` (scene-count-weighted mean, non-finite dropped). No external benchmark is involved.
+- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `modules/io/dataloader/scene_check.py` validates the pool before the split, owns the shared "usable unit" helpers the loaders draw from, and owns multi-root keying (`as_roots` / `build_roots`). Every hdlong-structured dataset — hdlong-complexv1 and MerlMix alike — goes through `hdlong.py`; MerlMix is an extra `--hdlong_dir` root, not a new module. The per-image normalization scalar and its PolarPS-only sidecar cache live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is `--k_per_scene` (default 10) per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
+- Held-out val and test: both wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × n_trials`, per-index-seeded so renders are worker-count-independent and reproducible). Val uses `n_trials=1` and runs every `--val_every_epochs`; test uses `--test_trials` and runs **once after the final epoch** via `train.py:run_test_eval`. Both sweep `train.py:run_eval_pass` → `Trainer.val_step` (scene-count-weighted mean, non-finite dropped). `--test_fraction 0` builds no test loader (`--val_fraction` must be > 0, so the val loader always exists); `sdm_unips/eval_diligent.py` is the external benchmark used when the test split is off.
 
 ## Environment
 
