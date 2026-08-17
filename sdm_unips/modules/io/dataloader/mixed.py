@@ -353,6 +353,8 @@ def build_mixed_split(args, augment=True):
         test = [items[i] for i in range(n) if i in test_pos]
         return train, val, test
 
+    # args.seed is used directly for the split, allowing CONSISTENCY ACROSS RUNS, 
+    # given identical scene pool
     hd_train, hd_val, hd_test = _split(hd, np.random.RandomState(seed + 1),
                                        'hdlong', '--hdlong_dir')
     pp_train, pp_val, pp_test = _split(pp, np.random.RandomState(seed + 2),
@@ -362,12 +364,11 @@ def build_mixed_split(args, augment=True):
     train_ds = MixedTrainDataset(args, augment=augment,
                                  scenes=hd_train + pp_train,
                                  subset_name='MixedTrain', noun='train')
+
+    # val_ds and test_ds scenes will be wrapped around MixedEvalDataset.
     val_ds = MixedTrainDataset(args, augment=False,
                                scenes=hd_val + pp_val,
                                subset_name='MixedVal', noun='val')
-    # Not announced: `MixedEvalDataset` wraps exactly these scenes and prints
-    # the identical counts as `[MixedTestEval]`, so announcing here duplicates
-    # the line. train.py's `[TRAIN] scenes: ...` summary also reports the count.
     test_ds = MixedTrainDataset(args, augment=False,
                                 scenes=hd_test + pp_test,
                                 subset_name='MixedTest', noun='test',
@@ -473,6 +474,7 @@ class MixedTrainDataset(data.Dataset):
             f'unmounted, permissions, disk) rather than a few bad files, so it '
             f'is raised instead of skipped. Last error: {last!r}') from last
 
+    # To be called by CPU worker processes defined in torch.utils.data.DataLoader
     def __getitem__(self, idx):
         def load(j):
             kind, scene_dir = self.scenes[j]
