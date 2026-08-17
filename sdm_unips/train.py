@@ -1066,7 +1066,8 @@ def main():
     # after every crash: the first launch warm-starts from X, and every
     # relaunch continues the run's own (strictly newer) weights instead.
     if pretrained_path:
-        args.pretrained_sha1 = trainer.load_pretrained(pretrained_path)['sha1']
+        args.pretrained_weights_sha1 = (
+            trainer.load_pretrained(pretrained_path)['weights_sha1'])
 
     resume_state = None
     if resume_path:

@@ -81,18 +81,48 @@ from modules.loss import losses
 CHECKPOINT_FORMAT_VERSION = 3
 
 
-def _file_sha1(path, chunk=4 << 20):
-    """Short digest of a weights file, recorded as `--pretrained` provenance.
+def weights_sha1(state_dict):
+    """Short digest of a state_dict's CONTENTS, as `--pretrained` provenance.
 
     A path alone does not identify a model — `best.pt` in a session directory is
     overwritten as the run improves, so "fine-tuned from modelA/best.pt" says
-    nothing about *which* best. The digest pins it. One streaming read of the
-    file, once, at startup.
+    nothing about *which* best. This pins it.
+
+    Hashed over the tensors rather than over the file that carried them, which
+    is what makes the digest answer the question actually being asked. The same
+    weights reach this function through two different files: `best.pt` wraps
+    them alongside both AdamW moment buffers, the RNG streams, `sched_state`
+    and the args snapshot, while `normal/normal.pytmodel` is the bare
+    `state_dict`. Digesting the file would give those two different values for
+    identical weights, and would make the provenance record depend on optimizer
+    state that the fine-tune discards. Digesting the contents makes
+    `--pretrained <run>/checkpoints/best.pt` and
+    `--pretrained <run>/checkpoints/normal/normal.pytmodel` provably the same
+    starting point.
+
+    Keys are sorted, and shape/dtype are folded in alongside the raw bytes, so
+    the digest is independent of dict ordering and cannot collide across a
+    reinterpreted buffer.
     """
     h = hashlib.sha1()
-    with open(path, 'rb') as f:
-        for block in iter(lambda: f.read(chunk), b''):
-            h.update(block)
+    for k in sorted(state_dict):
+        v = state_dict[k]
+        h.update(k.encode())
+        h.update(b'\0')
+        if torch.is_tensor(v):
+            t = v.detach().cpu().contiguous().flatten()
+            h.update(f'{tuple(v.shape)}|{t.dtype}'.encode())
+            h.update(b'\0')
+            try:
+                # Reinterpret as bytes: works for dtypes numpy cannot hold
+                # directly (bfloat16), and copies nothing.
+                h.update(t.view(torch.uint8).numpy().tobytes())
+            except (RuntimeError, TypeError):
+                # Lossless promotion; still deterministic for a given dtype.
+                h.update(t.float().numpy().tobytes())
+        else:
+            h.update(repr(v).encode())
+        h.update(b'\0')
     return h.hexdigest()[:16]
 
 
@@ -1067,9 +1097,12 @@ class Trainer:
                 f"architecture's weights (a full checkpoint's top-level keys "
                 f'are model/optimizer/..., which is not a state_dict).')
 
-        sha = _file_sha1(path)
+        # Over the weights, not the file: `best.pt` and the exported
+        # `normal.pytmodel` carry the same tensors in different containers and
+        # must therefore produce the same provenance record.
+        sha = weights_sha1(sd)
         print(f'[Trainer] PRETRAINED (warm start) from {path}')
-        print(f'[Trainer]   sha1={sha} | tensors loaded {len(matched)}/'
+        print(f'[Trainer]   weights_sha1={sha} | tensors loaded {len(matched)}/'
               f'{len(own)} | missing={len(missing)} unexpected={len(unexpected)}'
               f' shape-mismatched={len(mismatched)}')
         print(f'[Trainer]   optimizer, LR schedule, epoch counter and '
@@ -1085,7 +1118,7 @@ class Trainer:
         if unexpected:
             print(f'[Trainer]   note: {len(unexpected)} tensors in the file are '
                   f'not part of this model and were ignored.')
-        return {'path': path, 'sha1': sha, 'loaded': len(matched),
+        return {'path': path, 'weights_sha1': sha, 'loaded': len(matched),
                 'missing': len(missing), 'unexpected': len(unexpected),
                 'shape_mismatched': len(mismatched)}
 

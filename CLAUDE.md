@@ -588,7 +588,7 @@ startup:
    `auto`.
 2. **Build the Trainer** — random init, fresh AdamW, `LambdaLR` at step 0.
 3. **`load_pretrained`**, if `--pretrained` was given. Model weights only.
-   Records `args.pretrained_sha1`.
+   Records `args.pretrained_weights_sha1`.
 4. **`resume_from`**, if `--resume` resolved to anything. A full checkpoint
    overwrites the model from step 3 and additionally restores optimizer
    moments, scheduler position, GradScaler scale, skip counters and every RNG
@@ -622,7 +622,7 @@ Points that are load-bearing:
   state in which the run can end up with neither. The cost is that a relaunch
   reads and hashes the pretrained file and then immediately discards it (a few
   seconds); that is deliberate, because it keeps `pretrained` and
-  `pretrained_sha1` in the argument snapshot of *every* checkpoint the resumed
+  `pretrained_weights_sha1` in the argument snapshot of *every* checkpoint the resumed
   run writes, instead of the provenance dropping off at the first crash.
 - **Nothing about `--pretrained` needs persisting**, unlike the WSD decay ramp.
   A branched ramp lives only in a lambda closure and must be carried in
@@ -648,9 +648,18 @@ Points that are load-bearing:
   from scratch in silence — the guard exists for exactly that.) Shape filtering
   is deliberate: it lets a later architecture variant inherit the layers it
   shares with Model A instead of `load_state_dict` refusing the whole file.
-- **Provenance.** `best.pt` is overwritten as a run improves, so a path alone
-  does not identify a model. `args.pretrained_sha1` (a digest of the weights
-  file) goes into `config.json` and every checkpoint.
+- **Provenance is over the weights, not the file.** `best.pt` is overwritten as
+  a run improves, so a path alone does not identify a model;
+  `args.pretrained_weights_sha1` pins it, and goes into `config.json` and every
+  checkpoint. `Trainer.weights_sha1` digests the `state_dict`'s sorted keys,
+  shapes, dtypes and raw bytes — deliberately not the file, because the same
+  weights arrive in two containers: `best.pt` wraps them alongside both AdamW
+  moment buffers, the RNG streams, `sched_state` and the args snapshot, while
+  `normal/normal.pytmodel` is the bare `state_dict`. A file digest would give
+  those different values for identical weights and would fold in optimizer
+  state the fine-tune discards. So `--pretrained <run>/checkpoints/best.pt` and
+  `--pretrained <run>/checkpoints/normal/normal.pytmodel` are provably the same
+  starting point, and record the same digest.
 - **Use a lower `--lr`.** The recipe's peak 1e-4 with 5 warmup epochs would
   largely undo the pretrained weights before they learn anything from the new
   data.
