@@ -6,6 +6,7 @@ Inference orchestration for surface-normal recovery.
 
 
 import glob
+import os
 
 import cv2
 import numpy as np
@@ -39,8 +40,70 @@ class builder():
         return I, N, M, nImgArray, roi
 
     def load_models(self, model, dirpath):
-        pytmodel = "".join(glob.glob(f'{dirpath}/*.pytmodel'))
-        model = loadmodel(model, pytmodel, strict=False)
+        """Load the single `*.pytmodel` under `dirpath` into `model`.
+
+        Two silent-failure modes are closed here, both of which produced a
+        *randomly initialised* network that still printed a success message and
+        went on to report ~76 deg MAE on DiLiGenT:
+
+        1. **`module.` prefix mismatch.** `model` is DataParallel-wrapped by the
+           caller, so its keys carry a `module.` prefix. Upstream's released
+           weights were saved from a wrapped model and match; `Trainer` saves
+           `self.net.state_dict()` from a *bare* `Net` (trainer.py:158, :947)
+           and does not. Under `strict=False` every key is then simultaneously
+           "missing" and "unexpected", zero parameters transfer, and nothing is
+           raised. The prefix is normalised in whichever direction is needed.
+        2. **Ambiguous glob.** The original `"".join(glob.glob(...))` silently
+           concatenated the paths when the directory held more than one
+           `.pytmodel`, yielding a nonexistent filename, which `loadmodel`
+           reports as "not Found" before returning the model untouched.
+
+        Anything short of a full key match now raises.
+        """
+        candidates = sorted(glob.glob(f'{dirpath}/*.pytmodel'))
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f'Expected exactly one *.pytmodel in {dirpath}, found '
+                f'{len(candidates)}: {[os.path.basename(c) for c in candidates]}. '
+                f'`load_models` must be pointed at a directory holding only the '
+                f'weights to load.')
+        pytmodel = candidates[0]
+
+        params = torch.load(pytmodel, map_location=self.device)
+        # A training checkpoint nests the weights; a *.pytmodel is already bare.
+        if isinstance(params, dict) and 'model' in params and 'optimizer' in params:
+            params = params['model']
+
+        wants_prefix = any(k.startswith('module.') for k in model.state_dict())
+        has_prefix = any(k.startswith('module.') for k in params)
+        if wants_prefix and not has_prefix:
+            params = {f'module.{k}': v for k, v in params.items()}
+            print('[builder] Added the "module." prefix to the checkpoint keys '
+                  '(saved from an unwrapped model).')
+        elif has_prefix and not wants_prefix:
+            params = {k[len('module.'):]: v for k, v in params.items()}
+            print('[builder] Stripped the "module." prefix from the checkpoint '
+                  'keys (saved from a DataParallel model).')
+
+        missing, unexpected = model.load_state_dict(params, strict=False)
+        n_total = len(model.state_dict())
+        n_loaded = n_total - len(missing)
+        if n_loaded == 0:
+            raise RuntimeError(
+                f'{pytmodel}: none of its {len(params)} keys matched the model '
+                f'({n_total} parameters). The network would be randomly '
+                f'initialised. First checkpoint key: '
+                f'{next(iter(params), "<empty>")!r}; first model key: '
+                f'{next(iter(model.state_dict()), "<empty>")!r}.')
+        if missing or unexpected:
+            raise RuntimeError(
+                f'{pytmodel}: partial load -- {n_loaded}/{n_total} parameters '
+                f'matched, {len(missing)} missing, {len(unexpected)} unexpected. '
+                f'Refusing to run on a half-initialised network. '
+                f'Missing e.g. {missing[:3]}; unexpected e.g. {unexpected[:3]}.')
+
+        print(f'Loading pretrained model... {pytmodel} '
+              f'({n_loaded}/{n_total} parameters)')
         return model
 
     def run(self,
