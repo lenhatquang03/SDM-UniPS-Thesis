@@ -872,6 +872,32 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 ### Inference orchestration — `modules/builder/builder.py`
 `Builder` loads the checkpoint, wraps `Net`, and runs the pixel-sampling loop in `--pixel_samples` chunks across all valid pixels. In scalable mode it handles patch decomposition at the encoder level and Gaussian feature smoothing (`modules/utils/gauss_filter.py`) at patch boundaries.
 
+**GLC smoothing is gated on P > 4, as the paper specifies — a deliberate
+deviation from upstream's released code.** The paper's scale-invariant encoder
+says *"Optionally, when P is larger than 4, we apply depth-wise Gaussian
+filtering ... to the feature maps to further enhance the interaction"*, where
+`P = decoder_resolution / canonical_resolution` is the mosaic factor.
+Upstream applied it **unconditionally** (`self.glc_smoothing = True`, no P
+test), so at the training configuration (512/256 ⇒ P=2) a 21×21 σ=1 depthwise
+blur landed on the GLC that every sampled pixel is `grid_sample`d from — σ=1 at
+quarter resolution is ≈4 px at 512 — to suppress sub-tensor block artifacts
+that barely exist at 4 sub-tensors. It cost detail and bought nothing, which is
+squarely in the path of what Models B and C are meant to improve.
+
+The **kernel size stays at upstream's `10*P+1`**, not the paper's `P−1`. With σ
+hard-coded to 1, 99.95% of the kernel's mass sits inside the central 7×7 at any
+declared size (a 21×21 and a 7×7 differ by <1e-4 per tap), so the two formulas
+are numerically equivalent and differ only in compute; keeping upstream's value
+leaves the P > 4 path byte-identical to the released model. (`P−1` is also
+*even* for odd P, and `padding = kernel_size//2` with an even kernel shifts the
+output size by one.)
+
+Blast radius: for any inference at **P ≤ 4** — decoder resolution ≤ 1024, which
+includes DiLiGenT via `eval_diligent.py` and every `--scalable` patch
+(`patch_size = 512`) — the filter no longer fires. Numbers produced for
+**existing** checkpoints before this change are therefore not comparable to
+numbers produced after it. Re-run the full ablation rather than mixing the two.
+
 ### Training orchestration — `modules/builder/trainer.py`
 `Trainer` builds `Net`, `AdamW`, the LR scheduler (step decay or cosine, both with epoch-based warmup), and `GradScaler` (AMP only for fp16). `Net.forward(..., training=True)` samples exactly `pixel_samples` valid-mask pixels per batch element with gradients on (no `.detach()`), and returns flat per-pixel predictions plus the sampled flat indices. The loss (`modules/loss/losses.py:normal_loss`) gathers GT at those indices and computes masked MSE on normals (Sec. 4). Each save also writes `normal.pytmodel` so checkpoints are drop-in for inference.
 

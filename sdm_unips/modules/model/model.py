@@ -296,8 +296,13 @@ class Net(nn.Module):
         H = decoder_imgsize[0]
         W = decoder_imgsize[1]
 
-        if self.glc_smoothing:
-            f_scale = decoder_resolution//canonical_resolution # (2048/256)
+        # Depth-wise Gaussian smoothing of the GLC, gated as the PAPER
+        # describes: "Optionally, when P is larger than 4, we apply depth-wise
+        # Gaussian filtering ... to the feature maps to further enhance the
+        # interaction", where P = R/G = decoder_resolution / canonical_resolution
+        # is the mosaic factor.
+        f_scale = decoder_resolution // canonical_resolution   # P in the paper
+        if self.glc_smoothing and f_scale > 4:
             smoothing = gauss_filter.gauss_filter(glc.shape[1], 10 * f_scale+1, 1).to(glc.device) # channels, kernel_size, sigma
             glc = smoothing(glc)
 
