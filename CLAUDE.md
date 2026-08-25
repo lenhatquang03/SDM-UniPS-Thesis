@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 SDM-UniPS is a **CVPR 2023 Highlight** paper implementation for **Universal Photometric Stereo** — recovering surface normal maps from multiple images captured under arbitrary, spatially-varying lighting with a fixed camera. The upstream repository is inference-only; this fork adds a training pipeline (`sdm_unips/train.py`, `modules/builder/trainer.py`, `modules/io/dataloader/`, `modules/loss/`) with train/val/test all drawn from the same synthetic mixed pool.
 
-**Scope:** this fork targets **surface-normal prediction only**. The upstream BRDF heads (baseColor / roughness / metallic from Appendix C of the paper) and novel-view relighting (`relighting.py`, `modules/utils/render.py`) have been removed.
+**Scope:** this fork targets **surface-normal prediction only**.
 
-The current branch (`architecture/training-pipeline`) targets **Model A** (the baseline SDM-UniPS architecture, no modifications), trained on a mix of `hdlong-complexv1` and `PolarPS` for the author's thesis: *"Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens."* Models B and C (WTConv, WESS, latent-carrier deformable attention) will live on dedicated branches. A side experiment continues Model A on **MerlMix** (see **Fine-tuning from a pretrained model**) to test whether more data improves DiLiGenT MAE.
+The current branch (`architecture/training-pipeline`) targets **Model A** (the baseline SDM-UniPS architecture, no modifications), trained on a mix of `hdlong-complexv1` and `PolarPS` for the author's thesis: *"Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens."* The branch `modelA-vflip-mean-max-scale` adds more versatile augmentations, the model is also to be trained on the `MerlMix` dataset. Models B and C (WTConv, WESS, latent-carrier deformable attention) will live on dedicated branches.
 
 ## Running Inference
 
@@ -75,8 +75,7 @@ influences checkpoint selection.
 experiment skip it without needing a mode of its own: validation still selects
 `best.pt` while everything else trains, and the verdict comes from an external
 benchmark (`sdm_unips/eval_diligent.py`, run against `<session>/checkpoints`
-after the run exports them). **`--val_fraction` has no such switch and must be
-> 0** — validation is what chooses which epoch to keep, so a run without it
+after the run exports them). **`--val_fraction` has no such switch and must be > 0** — validation is what chooses which epoch to keep, so a run without it
 produces no deliverable.
 
 Test and validation report the **same quantities aggregated the same way** —
@@ -104,8 +103,9 @@ each in one place:
    `MixedEvalDataset`, whose per-index seeding pins each scene's camera, K
    lights and Dirichlet mix. This matters because `MixedTrainDataset` passes
    `rng=None` to the scene loaders, which falls back to the global
-   `np.random`: `augment=False` disables only the horizontal flip, so val
-   scenes would otherwise be **re-rendered every epoch**. Val uses
+   `np.random`: `augment=False` disables only the augmentations (the two flips
+   and the random normalization scale), so val scenes would otherwise be
+   **re-rendered every epoch**. Val uses
    `n_trials=1` (one fixed render per scene, identical every epoch and every
    run); test uses `--test_trials` (each trial a *different* but fixed draw,
    averaged for variance reduction — reproducible across runs).
@@ -159,14 +159,6 @@ the **running best**, `(best − cur) / |best|`, is below `--auto_decay_rel`
 checks, but never before `--auto_decay_min_epoch` (8) completed epochs — so
 `[VAL EPOCH 7]` is the earliest check that can trigger. The floor absorbs an
 early noise-flat pair; the two-check requirement absorbs a single bad render.
-
-The comparison is against the running best and **not** against the previous
-check, because a sawtooth defeats the latter: a curve alternating 0.0300 /
-0.0285 shows a *+5% improvement* on every other check, resetting the counter
-forever while the model plateaus. Against the best, both halves of the
-oscillation read as flat and the rule fires. Model A's observed history
-(0.1072 → 0.0236, then 0.0255 at epoch 8) does **not** fire under this rule —
-one flat check, not two — which matches the decision that was taken manually.
 
 Firing truncates `--epochs` so the run ends with the ramp. Note that the epoch
 loop's `range()` is fixed at entry, so the truncation is enforced by a separate
@@ -797,11 +789,72 @@ POLARPS_ROOT/
 ```
 The dataset class auto-detects scene type via these markers (`light_means.config` ⇒ hdlong, `normal.exr` ⇒ PolarPS). **MerlMix carries the hdlong layout and marker**, so it is passed as an additional `--hdlong_dir` root and needs no loader, `kind`, or preprocessing of its own. It synthesizes each training render via a Dirichlet (α, β, γ) mix of one randomly chosen point/dir/env light triple (hdlong) or by drawing one of 32 `S0.exr` images (PolarPS). hdlong is upsampled from 256×256 to `--train_resolution`.
 
-**Per-image normalization:** each observation is divided by a single scalar — the **max, over its foreground pixels, of that pixel's mean across the three colour channels**. This is deliberately the same statistic `realdata.py` uses at inference (`temp = mean over channels; mx = max over pixels; I /= mx`), so observations land in ~[0, 1] in both paths. That matters in two places the architecture is built around: `Net.forward` concatenates the 0/1 mask as a 4th input channel (a differently-scaled RGB drowns it out), and `Net._decode_pixels` concatenates raw observations with the 256-d GLC features before an `ln=True` attention block (a large-magnitude observation channel dominates the LayerNorm statistics and flattens the GLC signal).
+**Augmentation (training only).** Two label-preserving symmetries and one
+intensity transform, all gated on the loaders' `augment` flag, which
+`build_mixed_split` sets False for both held-out splits:
 
-PolarPS caches the scalar in an `image_scales.config` sidecar per scene — its observations are fixed `S0.exr` files, so the value depends only on file + mask and is computed once, at the on-disk resolution so it survives a change of `--train_resolution`. **hdlong does not cache**: its observation is a random Dirichlet mix drawn afresh each epoch, and unlike the mean, the max is not linear (`max(Σ wᵢxᵢ) ≠ Σ wᵢ max(xᵢ)` — empirically ~12% off), so there is no per-component quantity to recombine; the scale is measured directly on each composite pre-resize. Read-only dataset mounts (e.g. Kaggle inputs) simply skip the sidecar write and keep an in-process cache.
+- **Horizontal and vertical flips**, drawn *independently* (so all four
+  orientations occur). Reflecting the image plane about an axis negates the
+  normal's in-plane component along that axis and leaves z alone, so the flip
+  is exact, not approximate: hflip reverses the width axis and negates
+  `N[..., 0]`, vflip reverses the height axis and negates `N[..., 1]`. The
+  reversed views are materialized with `ascontiguousarray` *before* the sign
+  flip, since the negation is an in-place write. Note the datasets render with
+  lights over the upper hemisphere, so the vertical flip is what supplies
+  below-lit examples — legitimate here because UniPS assumes unknown,
+  arbitrary lighting, and real captures are lit from anywhere.
+- **A random normalization scale**, described next.
 
-> Migration: **delete any `image_means.config` files still present in the dataset trees.** They hold means from the pre-2026-08-05 normalization and are dead weight; the current sidecar is `image_scales.config`.
+**Per-image normalization.** Each observation is divided by a single scalar,
+drawn per image from **U[mean, max]** of its foreground intensity while
+training and pinned to the **max** everywhere else, where both statistics are
+taken over the object's foreground pixels of that pixel's mean across the three
+colour channels. This follows the paper (Sec. 3.1: *"each image is normalized
+by a random value between its maximum and mean"*), whose own inference path
+uses the max end: `realdata.py` does `temp = mean over channels; mx = max over
+pixels; I /= mx`. So the eval/inference condition lands observations in ~[0, 1],
+and the training draw *widens* the range around it (a smaller divisor pushes
+values above 1) so the network cannot assume its input is exactly
+max-normalized.
+
+The eval end of that range matters in two places the architecture is built
+around: `Net.forward` concatenates the 0/1 mask as a 4th input channel (a
+differently-scaled RGB drowns it out), and `Net._decode_pixels` concatenates
+raw observations with the 256-d GLC features before an `ln=True` attention
+block (a large-magnitude observation channel dominates the LayerNorm statistics
+and flattens the GLC signal). Note the asymmetry this creates and live with it
+deliberately: because the range is `[mean, max]` rather than centred on the
+max, the inference condition sits at the *edge* of the training distribution,
+hit exactly when `t = 1`. That is what the paper specifies, and matching it is
+the point.
+
+Held-out val and test never draw: `augment=False` pins them to the max, which
+is both the inference condition and a *fixed* one — a random normalizer at eval
+would add variance to the very number that selects `best.pt`, for no
+information. It also means the eval renders are byte-identical to those of runs
+made before this augmentation existed (`augment=False` short-circuits every new
+RNG draw), so val/test numbers stay comparable across the change.
+
+PolarPS caches **both statistics** in an `image_scale_stats.config` sidecar per
+scene (one `<key> <mean> <max>` line per image) — its observations are fixed
+`S0.exr` files, so the pair depends only on file + mask and is computed once, at
+the on-disk resolution so it survives a change of `--train_resolution`. Only the
+statistics are cached, never the sampled scale, which is redrawn every epoch.
+**hdlong does not cache**: its observation is a random Dirichlet mix drawn
+afresh each epoch, and neither statistic can be recombined from per-component
+ones — the max is not linear (`max(Σ wᵢxᵢ) ≠ Σ wᵢ max(xᵢ)` — empirically ~12%
+off), and the mean is linear only in the mixing weights, which are themselves
+redrawn — so both are measured directly on each composite pre-resize.
+Read-only dataset mounts (e.g. Kaggle inputs) simply skip the sidecar write and
+keep an in-process cache.
+
+> Migration: **delete any `image_means.config` and `image_scales.config` files
+> still present in the dataset trees.** The first holds means from the
+> pre-2026-08-05 normalization, the second max-only scalars from before the
+> mean/max pair; nothing reads either. The filename changed each time precisely
+> so an older sidecar is ignored rather than misread — `read_scale_stats`
+> requires three tokens per line, so a two-token `image_scales.config` line
+> cannot be mistaken for a mean.
 
 ## Architecture
 
@@ -826,7 +879,7 @@ At the full decoder resolution (up to 4096×4096 in inference, 512 by default in
 
 ### Data loading
 - Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).
-- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `modules/io/dataloader/scene_check.py` validates the pool before the split, owns the shared "usable unit" helpers the loaders draw from, and owns multi-root keying (`as_roots` / `build_roots`). Every hdlong-structured dataset — hdlong-complexv1 and MerlMix alike — goes through `hdlong.py`; MerlMix is an extra `--hdlong_dir` root, not a new module. The per-image normalization scalar and its PolarPS-only sidecar cache live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is `--k_per_scene` (default 10) per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
+- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `modules/io/dataloader/scene_check.py` validates the pool before the split, owns the shared "usable unit" helpers the loaders draw from, and owns multi-root keying (`as_roots` / `build_roots`). Every hdlong-structured dataset — hdlong-complexv1 and MerlMix alike — goes through `hdlong.py`; MerlMix is an extra `--hdlong_dir` root, not a new module. The per-image normalization statistics, the U[mean, max] draw taken from them, and the PolarPS-only sidecar cache all live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is `--k_per_scene` (default 10) per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
 - Held-out val and test: both wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × n_trials`, per-index-seeded so renders are worker-count-independent and reproducible). Val uses `n_trials=1` and runs every `--val_every_epochs`; test uses `--test_trials` and runs **once after the final epoch** via `train.py:run_test_eval`. Both sweep `train.py:run_eval_pass` → `Trainer.val_step` (scene-count-weighted mean, non-finite dropped). `--test_fraction 0` builds no test loader (`--val_fraction` must be > 0, so the val loader always exists); `sdm_unips/eval_diligent.py` is the external benchmark used when the test split is off.
 
 ## Environment

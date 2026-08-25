@@ -240,28 +240,34 @@ def build_argparser():
     p.add_argument('--out_dir', default='diligent_eval',
                    help='Where the report, JSONL log, EXRs and staging tree go')
 
-    p.add_argument('--K_list', default='10',
+    # List of K (# images/scene) for MAE report (see SDM-UniPS paper's Table 2)
+    p.add_argument('--K_list', default='16',
                    help='Comma-separated image counts to evaluate')
+    # # of evaluations performed per (object, K) for unbiased MAE
     p.add_argument('--trials', type=int, default=10,
                    help='Random K-image subsets per (object, K), averaged '
                         '(the paper uses 10)')
+    # List of objects used for evaluation, '' means ALL
     p.add_argument('--objects', default='',
                    help='Comma-separated object keys to restrict to '
                         '(e.g. ball,bear); empty means all')
+    # Random seed for reproducibility
     p.add_argument('--seed', type=int, default=2024,
                    help='Base seed; per-trial seeds are derived from it')
 
+    # Visualization args
     p.add_argument('--visualize', action='store_true',
                    help='Write normal/GT/error EXRs for VERIV')
     p.add_argument('--vis_k_list', default='',
                    help='K values to visualize; empty means all of --K_list')
+    # Trial 0 is arbitrary but fixed, re-running gives the same pictures
     p.add_argument('--vis_trial', type=int, default=0,
                    help='Which trial index the visualized EXRs come from')
 
     # Inference knobs -- defaults mirror main.py; canonical_resolution must
     # match training.
     p.add_argument('--canonical_resolution', type=int, default=256)
-    p.add_argument('--pixel_samples', type=int, default=10000)
+    p.add_argument('--pixel_samples', type=int, default=2048)
     p.add_argument('--max_image_res', type=int, default=4096)
     p.add_argument('--mask_margin', type=int, default=8)
     p.add_argument('--scalable', action='store_true')
@@ -345,7 +351,7 @@ def main():
                 seed = seed_everything(args.seed, objkey, K, trial)
                 test_data.objlist = [objdir]
                 test_data.data.numberOfImages = K
-
+                # Inference
                 records = net.run(testdata=test_data,
                                   max_image_resolution=args.max_image_res,
                                   canonical_resolution=args.canonical_resolution)
