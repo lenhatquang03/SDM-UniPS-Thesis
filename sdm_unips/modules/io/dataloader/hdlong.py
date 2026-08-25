@@ -22,15 +22,12 @@ For one __getitem__ call we:
        and environment light image, each pre-normalized by its per-scene
        `light_means.config` value and masked.
     3. Upsample 256x256 -> --train_resolution (default 512).
-    4. Divide each composite by its foreground max intensity, matching the
-       inference-time normalization in `realdata.py`.
+    4. Optionally flip horizontally and/or vertically (training only).
+    5. Divide each composite by a per-image scalar drawn from U[mean, max] of
+       its foreground intensity when training (paper Sec. 3.1) and pinned to
+       the max otherwise, matching the inference-time normalization in
+       `realdata.py`.
 
-Unlike PolarPS this loader keeps no `scale_cache` sidecar: the observation is a
-*random* Dirichlet mix drawn afresh every epoch, and the max -- unlike the mean
-the previous version used -- is not linear, so there is no per-component
-quantity that could be cached and recombined. The scale is computed directly on
-each composite, a masked max over 256x256 that is negligible next to the three
-EXR reads that produced it.
 """
 
 import glob
@@ -40,7 +37,7 @@ import re
 import cv2
 import numpy as np
 
-from .scale_cache import masked_scale
+from .scale_cache import masked_scale_stats, resolve_scales
 from .scene_check import usable_cam_dirs
 
 # Required for OpenCV EXR support.
@@ -159,7 +156,10 @@ class HdlongLoader:
         mask_soft_r = cv2.resize(mask_soft, (out_h, out_w), interpolation=cv2.INTER_LINEAR).astype(np.float32)
         mask_r = (mask_soft_r >= 0.5).astype(np.float32)
 
-        scale = np.ones(K, np.float32)  # per-composite foreground max intensity
+        # Per-composite foreground intensity statistics. The scale actually
+        # divided through is drawn from them below, once the flip is settled.
+        mn_stat = np.zeros(K, np.float32)
+        mx_stat = np.ones(K, np.float32)
 
         for k in range(K):
             # Randomly sample
@@ -176,12 +176,10 @@ class HdlongLoader:
             # Rendered image = a convex combination of three component images
             w = rng.dirichlet(np.ones(3))
             img = (w[0] * p_img + w[1] * d_img + w[2] * e_img).astype(np.float32)
-            # Foreground max of THIS composite. The max is not linear, so it
-            # cannot be recombined from per-component maxima the way the old
-            # mean-based scale could -- it has to be read off the mix itself.
-            # Taken pre-resize (256x256, the native render size) so the value
-            # does not depend on --train_resolution or on cubic overshoot.
-            scale[k] = masked_scale(img, mask)
+            # Foreground (mean, max) of THIS composite.
+            # Taken pre-resize (256x256, the native render size) 
+            # so the values do not depend on--train_resolution or on cubic overshoot.
+            mn_stat[k], mx_stat[k] = masked_scale_stats(img, mask)
             # hdlong-complexv1's images have spatial size (256, 256), need upsampling
             if img.shape[0] != out_h or img.shape[1] != out_w:
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
@@ -195,19 +193,32 @@ class HdlongLoader:
         N_r = N_r * mask_r[..., None]
         N_r = N_r / (np.linalg.norm(N_r, axis=2, keepdims=True) + 1e-12)
 
-        do_flip = bool(augment and rng.rand() < 0.5)
-        # Horizontal flip everything
-        if do_flip:
-            composed = composed[:, :, ::-1, :].copy()
-            mask_r = mask_r[:, ::-1].copy()
-            N_r = N_r[:, ::-1, :].copy()
-            N_r[:, :, 0] = -N_r[:, :, 0]
+        # Flips are label-preserving symmetries here: reflecting the image
+        # plane about an axis negates the normal's in-plane component along
+        # that axis and leaves z untouched.
+        do_flip_h = bool(augment and rng.rand() < 0.5)
+        do_flip_v = bool(augment and rng.rand() < 0.5)
+        if do_flip_h:
+            composed = composed[:, :, ::-1, :]
+            mask_r = mask_r[:, ::-1]
+            N_r = N_r[:, ::-1, :]
+        if do_flip_v:
+            composed = composed[:, ::-1, :, :]
+            mask_r = mask_r[::-1, :]
+            N_r = N_r[::-1, :, :]
+        if do_flip_h or do_flip_v:
+            composed = np.ascontiguousarray(composed)
+            mask_r = np.ascontiguousarray(mask_r)
+            N_r = np.ascontiguousarray(N_r)
+            if do_flip_h:
+                N_r[..., 0] = -N_r[..., 0]
+            if do_flip_v:
+                N_r[..., 1] = -N_r[..., 1]
 
-        # Per-image max normalization: divide each composite by its foreground
-        # max intensity (`scale`, measured on the composite above), which puts
-        # the observations in ~[0, 1] exactly as `realdata.py` does at
-        # inference. Flipping is spatial and leaves it intact.
-        # scale.reshape(-1, 1, 1) = (K, 1, 1) for broadcasting.
+        # Per-image normalization: divide each composite by a scalar drawn
+        # from U[mean, max] of its foreground intensity while training (paper
+        # Sec. 3.1) and equal to the max otherwise
+        scale = resolve_scales(mn_stat, mx_stat, augment, rng) # (K,)
         I_flat = composed.reshape(K, -1, 3) # (K, H * W, 3)
         I_flat = I_flat / (scale.reshape(-1, 1, 1) + 1e-6)
         composed = I_flat.reshape(K, out_h, out_w, 3)

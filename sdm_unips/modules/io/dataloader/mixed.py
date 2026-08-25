@@ -351,7 +351,8 @@ def build_mixed_split(args, augment=True):
     to keep produces nothing usable, so `--val_fraction` must be > 0.
 
     Returns (train_dataset, val_dataset, test_dataset); val and test never
-    augment.
+    augment -- no flips, and the per-image normalization scale is pinned to the
+    foreground max, which is the inference condition (`realdata.py`).
     """
     # Validate the cheap arguments before the (expensive) filesystem walk, so a
     # bad flag dies immediately instead of after discovering ~18k scenes.
@@ -554,7 +555,8 @@ class MixedEvalDataset(MixedTrainDataset):
 
     `MixedTrainDataset` passes `rng=None` to the scene loaders, which makes them
     fall back to the global `np.random`: `augment=False` only disables the
-    horizontal flip, so the camera, the K lights and the Dirichlet mix are still
+    augmentations (the two flips and the random U[mean, max] normalization
+    scale), so the camera, the K lights and the Dirichlet mix are still
     re-drawn on every access. For validation that means a *different render of
     every scene each epoch*, and the val curve then mixes model progress with
     render noise. This wrapper pins the draw instead:
