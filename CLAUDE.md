@@ -443,6 +443,10 @@ aborts on a change.
   split-config guard to a warning
 - `--pretrained`: start a **new** run from an existing checkpoint's weights —
   see **Fine-tuning** below
+- `--hf_backup`: mirror the resume-critical files to a HuggingFace repo at
+  each epoch boundary (**off by default**) — `--hf_repo`
+  (`culacgiontan0312/UniPS`), `--hf_repo_type` (`dataset`),
+  `--hf_backup_every` (1). See **Off-box backup** below
 - `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
 
 The final test evaluation runs automatically after the last epoch on the
@@ -542,6 +546,63 @@ interrupted epoch's steps remain, followed by the replayed epoch, and raw
 (0 for the original run) and a `{"kind": "resume", ...}` marker is written at
 the seam, so the stale tail is a one-line filter. Each resumed run also writes
 `config_resume_<n>.json` rather than overwriting the original `config.json`.
+
+## Off-box backup (`--hf_backup`)
+
+`--resume` protects against a *crash*; it does nothing about the machine
+itself disappearing. On rented GPU time that is the likelier loss, and the
+whole session directory goes with it.
+
+Almost everything on the box is regenerable for free — the datasets come back
+from HuggingFace, the code from git, `scene_manifest.json` from a rescan (the
+manifest and its fingerprint are relative to the dataset roots, so a fresh scan
+of the same data reproduces the same pool and the same split), and
+`normal.pytmodel` is re-exported from `best.pt`. **The trained weights are the
+only thing that cannot be reconstructed at any price**, so they are the only
+thing that has to leave the box.
+
+`--hf_backup` uploads to `sdm-ckpt/<model-name>/` in `--hf_repo`, where
+`<model-name>` is the last path component of `--session_name` (a session at
+`$HOME/runs/modelA` backs up to `sdm-ckpt/modelA/`):
+
+- `latest.pt` — the epoch checkpoint just written. A **full** checkpoint, so
+  `--resume <path>/latest.pt` on a fresh box continues the run with optimizer
+  moments, scheduler position and RNG streams intact rather than warm-starting.
+- `best.pt` — the deliverable. Not needed to resume, but if the run never
+  improves again after a crash there would otherwise be no selected model.
+- `train.jsonl`, `eval.jsonl`, `config*.json` — the curves and the exact args.
+
+Deliberately **not** uploaded: `step_*.pt` (resume granularity is one epoch, so
+a mid-epoch snapshot buys nothing once `latest.pt` exists), `normal.pytmodel`
+(re-exportable from `best.pt`), `scene_manifest.json` (regenerable, and large).
+
+**Where the call sits is load-bearing.** The upload runs in the epoch loop
+*after* `trainer.save`, the `best.pt` copy and `prune_checkpoints` — so every
+file it reads is complete (`_atomic_save` has already renamed its `*.tmp` into
+place) and none is about to be rotated away. Two further forced uploads run at
+the end: one after `export_for_inference`, and one after the test eval so
+`eval.jsonl` is included (everything unchanged since the previous upload is
+skipped by a size/mtime check).
+
+**It can never kill a run.** Every failure path prints `[HF-BACKUP] …` and
+returns; `huggingface_hub` is imported *inside* the call, so a box without it
+trains normally. `preflight()` checks credentials and repo access once at
+startup rather than hours in at the first backup point — and warns rather than
+aborting. With `--hf_backup` absent the object is inert.
+
+**`--hf_backup_every` is a storage control, not a safety dial.** HuggingFace
+keeps LFS history even though the remote filenames are overwritten, so every
+upload adds a revision that counts against the repo (HF asks that dataset repos
+stay under ~300 GB). At roughly 1.5–2 GB per backup, `--hf_backup_every 5` over
+a 200-epoch run costs ~70 GB of history and risks losing at most 5 epochs.
+Collapse the accumulated history with
+`HfApi().super_squash_history(repo_id=..., repo_type='dataset')` when it grows;
+that is irreversible and keeps only the current tree.
+
+**Restoring on a fresh box**: download `latest.pt` and `best.pt`, put `best.pt`
+in `<session>/checkpoints/` **first** (otherwise a later, worse epoch
+overwrites the selected model), then relaunch with
+`--resume <path>/latest.pt`.
 
 ## Fine-tuning from a pretrained model
 

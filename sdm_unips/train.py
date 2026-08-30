@@ -127,6 +127,7 @@ from modules.builder.trainer import (
 )
 from modules.io.dataloader.mixed import build_mixed_split, MixedEvalDataset
 from modules.io.dataloader.scene_check import as_roots
+from modules.utils.hf_backup import HFBackup
 
 
 def _seed_worker(worker_id):
@@ -444,6 +445,28 @@ def build_argparser():
                         'a NaN/Inf in forward or backward raises at the exact op '
                         '(with the forward stack trace). Slow; use for debugging.')
     p.add_argument('--seed', type=int, default=42)
+
+    # Off-box backup ------------------------------------------------------
+    p.add_argument('--hf_backup', action='store_true',
+                   help='Mirror the resume-critical files (the epoch checkpoint '
+                        'just written, best.pt, train.jsonl, config*.json) to a '
+                        'HuggingFace repo at each epoch boundary. A rented GPU '
+                        'box can vanish without warning and the trained weights '
+                        'are the only thing on it that cannot be regenerated. '
+                        'Off by default; without it the path is inert.')
+    p.add_argument('--hf_repo', default='culacgiontan0312/UniPS',
+                   help='Backup target. Files land under '
+                        'sdm-ckpt/<model-name>/, where <model-name> is the last '
+                        'path component of --session_name.')
+    p.add_argument('--hf_repo_type', default='dataset',
+                   choices=['dataset', 'model'],
+                   help='Kind of repo --hf_repo names (default: dataset).')
+    p.add_argument('--hf_backup_every', type=int, default=1,
+                   help='Epochs between uploads. HuggingFace keeps LFS history '
+                        'even when a file is overwritten, so this is the main '
+                        'control on how much repo storage the backup consumes. '
+                        'The final checkpoint is uploaded regardless; 0 means '
+                        'that final upload only.')
 
     # Smoke test ---------------------------------------------------------
     p.add_argument('--smoke_test', action='store_true',
@@ -1187,6 +1210,20 @@ def main():
     with open(os.path.join(log_dir, config_name), 'w') as f:
         json.dump(dict(sorted(jsonable_args(args).items())), f, indent=2)
 
+    # Off-box backup of the resume-critical files. Inert unless --hf_backup.
+    # `<model-name>` is the last component of --session_name, so a session at
+    # "$HOME/runs/modelA" backs up to sdm-ckpt/modelA/ in the repo.
+    hf_backup = HFBackup(
+        repo_id=args.hf_repo,
+        model_name=os.path.basename(args.session_name.rstrip('/\\')),
+        repo_type=args.hf_repo_type,
+        every=args.hf_backup_every,
+        enabled=args.hf_backup,
+    )
+    # Checked once here rather than at the first backup point, which on a long
+    # run is hours in -- the wrong moment to discover the token is missing.
+    hf_backup.preflight()
+
     if resume_state is not None:
         # Marker record: without it, a reader of the append-only train.jsonl
         # sees a step counter that jumps and an epoch that repeats, with no
@@ -1611,6 +1648,13 @@ def main():
         prune_checkpoints(ckpt_dir, keep_last=args.keep_last, protect=('best',),
                           keep_last_steps=args.keep_last_steps)
 
+        # Off-box backup, deliberately placed after the checkpoint save, the
+        # best.pt copy and the rotation: every file it reads is then complete
+        # (`trainer.save` renames its *.tmp into place) and none is about to be
+        # pruned. Failures are swallowed with a warning -- see hf_backup.py.
+        hf_backup.maybe_upload(epoch=epoch, resume_path=path,
+                               ckpt_dir=ckpt_dir, log_dir=log_dir)
+
         # Early stopping (option 1): a safety cutoff that leaves the cosine
         # schedule spanning --epochs but bails once val loss plateaus.
         if args.patience > 0 and epochs_no_improve >= args.patience:
@@ -1678,6 +1722,11 @@ def main():
     export_for_inference(trainer, ckpt_dir, provenance)
     print(f'[EXPORT] Run inference with --checkpoint {ckpt_dir}')
 
+    # Final upload, forced past --hf_backup_every: wherever the run happened to
+    # stop, the last state must reach the repo.
+    hf_backup.maybe_upload(epoch=last_epoch_done, resume_path=final,
+                           ckpt_dir=ckpt_dir, log_dir=log_dir, force=True)
+
     # The held-out mixed test split is the final benchmark, when there is one.
     if test_loader is None:
         return
@@ -1694,6 +1743,12 @@ def main():
         print(f'[TRAIN] Final held-out test (avg of {args.test_trials} trials) | '
               f'mae={summary.get("test_mae_deg", float("nan")):.4f} | '
               f'loss={summary.get("test_loss", float("nan")):.4f}')
+
+    # Second forced pass, so eval.jsonl (written by run_test_eval above) is
+    # backed up too. Everything else is unchanged since the upload before the
+    # test split ran, and is skipped by the size/mtime check.
+    hf_backup.maybe_upload(epoch=last_epoch_done, resume_path=final,
+                           ckpt_dir=ckpt_dir, log_dir=log_dir, force=True)
 
 
 if __name__ == '__main__':
