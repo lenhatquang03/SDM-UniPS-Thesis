@@ -5,8 +5,8 @@
 # GLOBAL VARS
 SRC_DIR="thesis_data:DataThesis/zipped"
 DEST_DIR="/workspace/data/zipped"
-FILTER_FILE="/workspace/rclone_filters.txt"
-LOG_FILE="/workspace/download_$(date +%Y%m%d_%H%M%S).log"
+FILTER_FILE="/workspace/data_scripts/rclone_filters.txt"
+LOG_FILE="/workspace/data_scripts/download_$(date +%Y%m%d_%H%M%S).log"
 
 # DECLARE FILTERS
 cat <<EOF > "$FILTER_FILE"

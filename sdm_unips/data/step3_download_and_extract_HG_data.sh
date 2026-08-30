@@ -23,7 +23,7 @@
 set -uo pipefail
 
 # Searched in order; the first repo containing a given path wins.
-REPOS=("culacgiontan0312/UniPS" "HUST-CVLab-PS/UniPS")
+REPOS=("HUST-CVLab-PS/UniPS")
 # REPOS=("culacgiontan0312/UniPS") # Trial run
 
 RETRIES=3
