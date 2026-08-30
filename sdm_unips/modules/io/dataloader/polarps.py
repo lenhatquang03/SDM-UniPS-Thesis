@@ -74,9 +74,23 @@ class PolarPSLoader:
             self._stats_by_dir[cache_dir] = stats
         return stats
 
-    @staticmethod
-    def _is_same_resolution(img: np.ndarray, expected: tuple[int, int]=(512, 512)):
+    def _is_same_resolution(self, img: np.ndarray, expected: tuple[int, int] | None = None):
+        """Is `img` already at the output size, so the resize below can be skipped?
+
+        `expected` defaults to `--train_resolution`, NOT to a fixed 512. It used
+        to be a hardcoded (512, 512), which happens to be the thesis default and
+        so was correct by coincidence there and wrong everywhere else: PolarPS is
+        512x512 on disk, so at --train_resolution 256 every scene answered "already
+        the right size", skipped its resize, and then failed on
+        `composed[i] = img` with "could not broadcast (512,512,3) into (256,256,3)".
+        The same helper also gates the mask and normal resizes, which would have
+        stayed at 512 alongside a 256 image buffer, so the fix has to live here
+        rather than at any one call site. (`hdlong.py` compares against out_h/out_w
+        and never had the bug.)
+        """
         if len(img.shape) < 2: raise ValueError("Input array must have > 1 dimension!")
+        if expected is None:
+            expected = (self.train_resolution, self.train_resolution)
 
         if (img.shape[0] == expected[0]) and (img.shape[1] == expected[1]):
             return True
@@ -153,7 +167,7 @@ class PolarPSLoader:
             else:
                 mn_stat[i], mx_stat[i] = masked_scale_stats(img, mask)
                 stats[rel] = new_entries[rel] = (mn_stat[i], mx_stat[i])
-            # Upsample to the desired shape (512, 512) if needed
+            # Resize to the desired shape (--train_resolution) if needed
             if not self._is_same_resolution(img):
                 img = cv2.resize(img, (out_h, out_w), interpolation=cv2.INTER_CUBIC)
                 img *= mask_r[..., None]
