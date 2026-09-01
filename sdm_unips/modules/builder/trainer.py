@@ -229,7 +229,11 @@ class Trainer:
 
         self.net = model.Net(args.pixel_samples, device).to(device)
         self.net.with_grad()
-        print(f"[Trainer] Target = Normal  Params = {get_n_params(self.net):,}")
+        # Name the variant in the log: the architecture is fixed by the branch,
+        # not by a flag, so this line is the only record in `train.log` of which
+        # model produced the run.
+        print(f"[Trainer] Target = Normal  Backbone = ConvNeXt-T + WTConv "
+              f"(Model B1)  Params = {get_n_params(self.net):,}")
 
         # NOTE: resuming is NOT done here. It has to happen after the optimizer
         # and scheduler exist, or their state cannot be restored — which is

@@ -11,6 +11,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .wtconv import WTConv2d
+
+
+def derive_wt_levels(canonical_resolution, min_subband=4, max_levels=3):
+    """Per-stage DWT depth for a backbone fed at `canonical_resolution`.
+
+    The encoder always hands the backbone a `canonical_resolution` square --
+    `x_resized` is interpolated to it and `x_grid`'s tiles are exactly it (see
+    `ScaleInvariantSpatialLightImageEncoder.forward`). So stage resolutions are
+    fixed at R/4, R/8, R/16, R/32 = 64/32/16/8 for the default R=256, and the
+    level budget can be settled at construction rather than guessed.
+
+    A level is only worth spending while its sub-bands stay at least
+    `min_subband` wide: at 256 a flat `wt_levels=3` would give stage 3 a 1x1
+    sub-band, where a 5x5 depthwise kernel is all padding around a single real
+    tap -- parameters and FLOPs bought for nothing.
+
+    This is an architectural decision, not a training knob, so it is settled
+    here rather than exposed on the command line. `ConvNeXt`'s default is
+    `derive_wt_levels(256)` == (3, 3, 2, 1), matching the 256 that `train.py`,
+    `main.py` and `eval_diligent.py` all default `--canonical_resolution` to.
+    Training at a different canonical resolution means editing that default.
+
+    Returns a 4-tuple, e.g. (3, 3, 2, 1) at R=256.
+    """
+    levels = []
+    for i in range(4):
+        stage_res = canonical_resolution // (4 * 2 ** i)
+        n = 0
+        while n < max_levels and stage_res // (2 ** (n + 1)) >= min_subband:
+            n += 1
+        levels.append(max(1, n))
+    return tuple(levels)
+
+
 class Block(nn.Module):
     r""" ConvNeXt Block. There are two equivalent implementations:
     (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
@@ -22,9 +57,15 @@ class Block(nn.Module):
         drop_path (float): Stochastic depth rate. Default: 0.0
         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
     """
-    def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
+    def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6,
+                 wt_levels=3, wt_kernel_size=5):
         super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
+        # Model B1: the depthwise operator is a wavelet convolution rather than
+        # the baseline's 7x7 spatial kernel. It is shape-preserving
+        # ([N,C,H,W] -> [N,C,H,W]), so the rest of this block and everything
+        # downstream of the backbone is untouched. The attribute keeps the name
+        # `dwconv` so the surrounding code reads unchanged.
+        self.dwconv = WTConv2d(dim, kernel_size=wt_kernel_size, wt_levels=wt_levels)
         self.norm = LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
         self.act = nn.GELU()
@@ -63,11 +104,16 @@ class ConvNeXt(nn.Module):
         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
         head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
     """
-    def __init__(self, in_chans=3, depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], 
-                 drop_path_rate=0., layer_scale_init_value=1e-6, out_indices=[0, 1, 2, 3], use_checkpoint=False
+    def __init__(self, in_chans=3, depths=[3, 3, 9, 3], dims=[96, 192, 384, 768],
+                 drop_path_rate=0., layer_scale_init_value=1e-6, out_indices=[0, 1, 2, 3], use_checkpoint=False,
+                 wt_levels=derive_wt_levels(256), wt_kernel_size=5
                  ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
+        if len(wt_levels) != 4:
+            raise ValueError(f'wt_levels must have 4 entries (one per stage), got {wt_levels}')
+        self.wt_levels = tuple(wt_levels)
+        self.wt_kernel_size = wt_kernel_size
         self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
         stem = nn.Sequential(
             nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4),
@@ -86,8 +132,9 @@ class ConvNeXt(nn.Module):
         cur = 0
         for i in range(4):
             stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], 
-                layer_scale_init_value=layer_scale_init_value) for j in range(depths[i])]
+                *[Block(dim=dims[i], drop_path=dp_rates[cur + j],
+                layer_scale_init_value=layer_scale_init_value,
+                wt_levels=self.wt_levels[i], wt_kernel_size=wt_kernel_size) for j in range(depths[i])]
             )
 
 

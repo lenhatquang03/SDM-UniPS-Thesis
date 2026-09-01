@@ -8,8 +8,125 @@ SDM-UniPS is a **CVPR 2023 Highlight** paper implementation for **Universal Phot
 
 **Scope:** this fork targets **surface-normal prediction only**.
 
-The current branch (`architecture/training-pipeline`) targets **Model A** (the baseline SDM-UniPS architecture, no modifications), trained on a mix of `hdlong-complexv1` and `PolarPS` for the author's thesis: *"Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens."* The branch `modelA-vflip-mean-max-scale` adds more versatile augmentations, the model is also to be trained on the `MerlMix` dataset. Models B and C (WTConv, WESS, latent-carrier deformable attention) will live on dedicated branches.
+The current branch (`modelB-wtconv`) targets **Model B1** (WTConv). **Model A** (the baseline SDM-UniPS architecture, no modifications) is trained on a mix of `hdlong-complexv1` and `PolarPS` for the author's thesis: *"Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens."* The branch `modelA-vflip-mean-max-scale` adds more versatile augmentations, the model is also to be trained on the `MerlMix` dataset. Models B and C (WTConv, WESS, latent-carrier deformable attention) live on dedicated branches — see **Model variants** below.
 
+## Model variants
+
+Three modifications sit on top of Model A. **Each is a branch, not a flag.**
+The variant is chosen by checking out its branch; `train.py` carries training
+hyperparameters only, and the architecture is not one of them. There is
+deliberately no runtime switch that can select the baseline from a variant
+branch — a flag-gated architecture puts the identity of the trained model in
+the launch command rather than in the code, which is where a thesis comparison
+cannot afford it.
+
+| Variant | Branch | What changes |
+|---|---|---|
+| **A** — baseline | `modelA-vflip-mean-max-scale` | — |
+| **B1** — WTConv | `modelB-wtconv` | `convnext.Block.dwconv`: 7×7 depthwise conv → wavelet convolution |
+| **B2** — WESS | (planned) | the training pixel sampler, driven by B1's sub-band energy |
+| **C** — carrier tokens + deformable attention | (planned) | `Regressor`'s pixel-sampling transformer |
+
+**What this costs, and why it is the right trade.** A checkpoint is only
+meaningful under the branch that produced it. `main.py` and `eval_diligent.py`
+on `modelB-wtconv` will not load Model A's `normal.pytmodel` — `builder.
+load_models`' partial-match guard raises, loudly, rather than running a
+half-initialised network. To evaluate A, check out A's branch. Likewise
+`--resume` against a foreign checkpoint dies in `resume_from`'s
+`load_state_dict`, which is strict: a name-and-shape guard, strictly stronger
+than the args-comparison guard a `--dw` flag would have needed.
+
+The one cross-variant path that still works is `--pretrained`, which matches by
+name *and* shape under `strict=False`: B1 warm-started from Model A inherits
+everything except the 12 depthwise kernels (A's 7×7 `dwconv.weight` has no
+counterpart in a WTConv block, whose base conv is 5×5).
+
+### B1 — WTConv (`modelB-wtconv`)
+
+`modules/model/wtconv.py`. Replaces the ConvNeXt block's 7×7 depthwise
+convolution with a cascaded Haar DWT: each level halves resolution and splits
+into {LL, LH, HL, HH}, a small depthwise kernel (5×5) is applied to all four
+independently, and the levels are folded back with the inverse transform and
+added to a full-resolution base convolution. The point is that a large spatial
+kernel low-passes exactly the intensity gradients photometric stereo reads
+normals from, whereas the sub-band form never averages low and high frequencies
+together.
+
+**The diff is two files.** `wtconv.py` (new) and `convnext.py` (one attribute).
+`model.py`, `builder.py` and `train.py` are byte-identical to Model A's branch;
+`trainer.py` differs only in a log line naming the backbone. That is not
+tidiness — it is the drop-in claim, made checkable by `git diff`. `WTConv2d`
+maps `[N,C,H,W] → [N,C,H,W]`, identically to the `nn.Conv2d` it replaces, so
+*nothing* downstream can observe it: the UPerHead fusion, the light-axis
+attention, the 128×128 GLC merge and the 2048-pixel decode are unchanged by
+construction. `sdm_unips/tests/test_wtconv_shapes.py` pins it.
+
+Three things are load-bearing:
+
+- **The Haar filters are buffers, not `nn.Parameter(requires_grad=False)`**
+  (which is what the reference implementation uses). `Net.with_grad()` →
+  `model_utils.mode_change` does a blanket
+  `for param in net.parameters(): param.requires_grad = True`, so a
+  non-trainable Parameter would be silently promoted and swept into the AdamW
+  parameter list — the fixed orthonormal basis the whole method rests on would
+  drift during training, with no error and no log line.
+- **`wt_levels` is per stage.** Both encoder paths feed the backbone a
+  `--canonical_resolution` square (`x_resized` is interpolated to it,
+  `x_grid`'s tiles are exactly it), so stage resolutions are a fixed
+  64/32/16/8 at R=256 and the budget can be settled at construction.
+  `convnext.derive_wt_levels` picks the largest depth that keeps every
+  sub-band ≥ 4×4 — `(3, 3, 2, 1)` at 256, which is `ConvNeXt.__init__`'s
+  default. A flat `3` would give stage 3 a **1×1** sub-band, where a 5×5
+  depthwise kernel is all padding around one real tap. Training at a different
+  canonical resolution means editing that default, which is correct: it is an
+  architecture decision and belongs in the architecture file.
+- **The cascade recurses on the raw LL**, not the convolved one, so every level
+  decomposes the input band-limited rather than the accumulated output of the
+  levels above it. The *filtered* LL is what the synthesis pass consumes. Swap
+  the two and the pyramid becomes a serial chain of convolutions, losing the
+  independent-frequency-processing property the method exists for.
+
+**Cost.** The backbone runs **5N times per scene** (N resized + 4N tiles), so a
+per-block slowdown is multiplied by 50 at K=10 before `--batch_size` is applied.
+Parameters rise only modestly (depthwise is small next to the 1×1s) but DWT/IWT
+are unfused `conv2d`/`conv_transpose2d` at 3 levels × 4 stages × 12 blocks. Read
+the `{"kind": "eta", ...}` record ~100 optimizer steps into the first launch and
+kill the run there if the projected length is unacceptable.
+
+**Hook for B2.** `WTConv2d.tap_subbands` (off by default, so B1 holds no extra
+tensors) makes `WTConv2d.subbands` hold the level-0 detail bands
+`[N, C, 3, H/2, W/2]`, **detached** — the saliency draw is an index selection
+and carries no gradient, and keeping the live tensor would pin the encoder
+graph. Note that the encoder calls the backbone twice and the *tile* path
+(`x_grid`, 4N) is last, so that is what the attribute holds after a forward;
+assert on `subbands.shape[0]` rather than relying on call order.
+
+**Shape probe:** `python sdm_unips/tests/test_wtconv_shapes.py` (needs torch, so
+it runs on the training box). Checks Haar orthonormality and perfect
+reconstruction, sub-band channel ordering, shape preservation at all four stage
+geometries, the odd-size padding path, the buffer-vs-parameter guarantee, the
+backbone's four stage outputs against Model A's shapes, and the derived level
+budget. Also prints the depthwise parameter count against Model A's.
+
+### Comparing A against B1
+
+`eval_diligent.py` is the verdict, and it is comparable across the two branches
+provided the runs share a schedule and a split:
+
+- Pin the pool: `--scene_manifest <modelA-session>/logs/scene_manifest.json`
+  and the same `--seed`.
+- Pin the schedule: same `--epochs`, an explicit `--decay_from_step` (A's), no
+  `--auto_decay`, and `--patience 0` so both curves span the full run.
+- DiLiGenT decodes **every** valid pixel (`builder.run` chunks through all of
+  them), so the pixel-sampling question the A/B fairness contract exists for
+  does not arise there at all; and at DiLiGenT resolution P ≤ 4, so the GLC
+  Gaussian fires for neither. Do check that A's number was produced with the
+  **current** code — the P > 4 gate changed what inference does at P ≤ 4.
+
+One irreducible caveat: B1 has more parameters, so initialisation consumes the
+torch RNG stream differently and the two runs see different *training* pixel
+draws from step 0. Same distribution, different sample — noise, not bias, but
+it means a small MAE gap on one seed each is not a result.
 ## Running Inference
 
 **Normal map recovery:**
@@ -423,6 +540,8 @@ aborts on a change.
   batches raise OOM instead of consuming the whole card. Worth setting when
   the GPU also drives a display.
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
+  (There are deliberately **no architecture flags**: the variant is the branch.
+  See **Model variants** above.)
 - K is `--k_per_scene` (default 10), enforced in `HdlongLoader` / `PolarPSLoader` and as the pool's validity threshold.
 - `--lr`: 1e-4 — `--weight_decay`: 0.05
 - `--lr_schedule`: default `cosine`; `wsd` is recommended and `step` exists —
@@ -922,7 +1041,7 @@ keep an in-process cache.
 The system has three logical stages.
 
 ### 1. Encoding — `modules/model/model.py` → `ScaleInvariantSpatialLightImageEncoder`
-Each input image is encoded at a fixed 256×256 canonical resolution regardless of original resolution. A **ConvNeXt-T** backbone (`modules/model/convnext.py`, depths `[3,3,9,3]`, dims `[96,192,384,768]`) extracts 4-scale features fused by **UPerHead** (`modules/model/uper.py`). Light-axis transformer blocks are stacked at counts `[0,1,2,4]` per scale. The output is a *Global Light-aware Context* (GLC) feature map at ¼ resolution. For high-res inputs (or `--scalable` inference), images are decomposed into G×G sub-tensors via `modules/model/decompose_tensors.py`, processed independently, then recomposed; a downsized-image feature map is added back to promote inter-tile interaction.
+Each input image is encoded at a fixed 256×256 canonical resolution regardless of original resolution. A **ConvNeXt-T** backbone (`modules/model/convnext.py`, depths `[3,3,9,3]`, dims `[96,192,384,768]`) extracts 4-scale features fused by **UPerHead** (`modules/model/uper.py`). On the `modelB-wtconv` branch each block's depthwise convolution is `modules/model/wtconv.py:WTConv2d` instead of the 7×7 conv; it is shape-preserving, so everything in this section and below is unchanged. Light-axis transformer blocks are stacked at counts `[0,1,2,4]` per scale. The output is a *Global Light-aware Context* (GLC) feature map at ¼ resolution. For high-res inputs (or `--scalable` inference), images are decomposed into G×G sub-tensors via `modules/model/decompose_tensors.py`, processed independently, then recomposed; a downsized-image feature map is added back to promote inter-tile interaction.
 
 ### 2. Aggregation — `modules/model/model.py` → `GLC_Aggregation`
 A `CommunicationBlock` transformer (`modules/model/transformer.py`) performs **cross-image attention**: at each sampled pixel, K image features attend to each other along the light axis. PMA collapses K → 1 (paper's pixel-sampling Transformer). No positional embeddings on samples (paper Sec. 3).
