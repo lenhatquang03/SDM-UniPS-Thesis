@@ -339,3 +339,175 @@ def draw_stats(e, p, sel):
         'wess_top10_frac': float((e[sel] >= thresh).float().mean()),
         'n_valid': int(n_valid),
     }
+
+
+# ---------------------------------------------------------------------------
+# Training sampler (Model B2)
+#
+# Phase 0 (n=431, the full val split, both sources) settled the shape of this.
+# Two findings drove it:
+#
+# 1. `E` at stage 0 block 0 is dominated by the OCCLUDING CONTOUR. The panels
+#    show a bright ring one to two cells wide and a near-flat interior. That is
+#    not a discovery about geometry -- `Net.forward` feeds the backbone
+#    `cat([I * M, M])`, so the mask itself is a hard step at the boundary in
+#    all four input channels, and the level-0 Haar detail bands of a step edge
+#    are enormous by construction. Left alone the sampler spends ~40% of the
+#    budget (tau=1) tracing a discontinuity that the mask channel put there,
+#    against 7-9% for a uniform draw. "Sample the silhouette more" needs no
+#    wavelets and is not the thesis claim.
+#
+# 2. The interior signal is real but was being crushed by that ring. Over the
+#    eroded interior the curvature tilt is 1.20 at tau=1, and across scenes
+#    rho(MAE gain, interior curvature tilt) = +0.39 -- the strongest coupling in
+#    the probe. The reason it is only 1.20 is the standardization: `e.std()`
+#    over the whole mask is inflated by the rim, so every interior z-score is
+#    squashed toward 0 and the softmax over the interior comes out nearly flat.
+#
+# So the rim is excluded from E's statistics and from the softmax, but NOT from
+# the draw -- it keeps exactly its uniform share. WESS reallocates only the
+# interior's own share, among interior pixels:
+#
+#     p(rim pixel)      = 1 / n_valid                        (Model A, unchanged)
+#     p(interior pixel) = (n_int / n_valid) * [ lam / n_int
+#                                             + (1 - lam) * softmax_int ]
+#
+# The two blocks sum to n_rim/n_valid + n_int/n_valid = 1 exactly, so no
+# renormalization is needed and none is done. Properties this buys:
+#
+# * `lam = 1` or `tau -> inf` still recovers Model A's uniform draw exactly, on
+#   the rim and in the interior alike -- the free correctness check survives.
+# * The hard per-pixel floor survives and is unchanged: an interior pixel keeps
+#   p >= (n_int/n_valid) * lam/n_int = lam/n_valid, a rim pixel keeps 1/n_valid.
+#   Every masked pixel is still reachable, which is what makes training under
+#   E_P while reporting E_uniform defensible.
+# * Any A/B difference is attributable to interior reallocation alone. The
+#   silhouette, where GT normals sit at grazing angles and the mask edge is
+#   antialiased, is sampled identically to Model A -- so a win cannot be
+#   explained away as "B2 just trained harder on the boundary".
+#
+# The erosion runs on the 64x64 energy grid rather than at 512x512 because that
+# is the resolution at which the ring is actually defined, and because one cell
+# there is ~16 px of true localization anyway (see the module docstring).
+# ---------------------------------------------------------------------------
+
+# Ring width to exclude, in energy-grid cells. 2 cells ~ 16 px nominal / ~24 px
+# effective at R=512. Phase 0's `--erode 9` (~1 cell) still left tau=1 with 40%
+# of the draw outside the interior, so the ring is wider than one cell.
+DEFAULT_ERODE_CELLS = 2
+
+# Below this many interior PIXELS the object is a thin sliver and eroding it
+# leaves nothing to reallocate; fall back to the uniform draw for that scene
+# rather than to a softmax whose mean and sigma come from a handful of pixels.
+MIN_INTERIOR_PIXELS = 256
+
+
+def interior_mask(mask_hw, grid_hw, erode_cells=DEFAULT_ERODE_CELLS):
+    """[H, W] 0/1 mask -> [H, W] 0/1 interior mask, eroded on the energy grid.
+
+    Area-pools the decoder-resolution mask down to the energy grid, keeps only
+    cells that are FULLY inside the object (`>= 1 - 1e-6`, so a cell straddling
+    the boundary is already dropped before any erosion), erodes by
+    `erode_cells` with a max-pool on the complement, then upsamples back with
+    nearest so the result is exactly a union of energy cells.
+    """
+    m = mask_hw[None, None].float()
+    cells = F.adaptive_avg_pool2d(m, grid_hw)
+    full = (cells >= 1.0 - 1e-6).float()
+    k = 2 * int(erode_cells) + 1
+    if k > 1:
+        # Erosion = -dilation(-x): a cell survives only if every cell within
+        # `erode_cells` of it is also full.
+        full = 1.0 - F.max_pool2d(1.0 - full, kernel_size=k, stride=1, padding=k // 2)
+    up = F.interpolate(full, size=mask_hw.shape[-2:], mode='nearest')
+    return (up[0, 0] * mask_hw).clamp_(0.0, 1.0)
+
+
+def wess_train_probabilities(E, valid_ids, interior_flat, H, W,
+                             tau=DEFAULT_TAU, lam=DEFAULT_LAM):
+    """The rim-preserving sampling distribution over `valid_ids`.
+
+    `interior_flat` is the flattened [H*W] interior mask from `interior_mask`.
+    Returns `(p, e, is_int)`: `p` sums to 1 over `valid_ids`, `e` is the raw
+    energy there, `is_int` is the boolean interior selector into that same set.
+    """
+    E_up = F.interpolate(E[None, None].float(), size=(H, W),
+                         mode='bilinear', align_corners=False).reshape(-1)
+    e = E_up[valid_ids]
+    n_valid = e.numel()
+    is_int = interior_flat.reshape(-1)[valid_ids] > 0
+    n_int = int(is_int.sum())
+
+    lam = float(min(max(lam, 0.0), 1.0))
+    # Degenerate cases fall back to Model A rather than to a distribution whose
+    # statistics are estimated from a handful of pixels.
+    if n_int < MIN_INTERIOR_PIXELS or lam >= 1.0:
+        return e.new_full((n_valid,), 1.0 / n_valid), e, is_int
+
+    e_int = e[is_int]
+    z = (e_int - e_int.mean()) / (e_int.std() + 1e-6)
+    logits = z / max(float(tau), 1e-6)
+    p_int = torch.softmax(logits - logits.max(), dim=0)
+
+    share = n_int / n_valid
+    p = e.new_full((n_valid,), 1.0 / n_valid)          # rim keeps Model A's rate
+    p[is_int] = share * (lam / n_int + (1.0 - lam) * p_int)
+    return p, e, is_int
+
+
+def wess_sample_train(E, mask_hw, valid_ids, H, W, n_sample,
+                      tau=DEFAULT_TAU, lam=DEFAULT_LAM,
+                      erode_cells=DEFAULT_ERODE_CELLS, generator=None):
+    """Draw `n_sample` flat decoder-grid indices for one training scene.
+
+    Unlike `wess_sample` (the Phase-0 probe path) the draw runs on the tensors'
+    own device using the ambient RNG, exactly as Model A's `randperm` does. A
+    CPU generator would be more reproducible in isolation but would make B2's
+    draw depend on a different RNG stream than A's, and would force a device
+    sync per batch element per step. `--resume` restores the CUDA and CPU
+    streams alike, so this is resumable on the same terms Model A is.
+
+    Returns `(ids, stats)`.
+    """
+    if valid_ids.numel() == 0:
+        zeros = torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
+        return zeros, {'wess_tilt': float('nan'), 'wess_tilt_int': float('nan'),
+                       'wess_ess': float('nan'), 'wess_top10_frac': float('nan'),
+                       'wess_interior_frac': float('nan'), 'n_valid': 0}
+
+    interior = interior_mask(mask_hw, E.shape[-2:], erode_cells)
+    p, e, is_int = wess_train_probabilities(E, valid_ids, interior, H, W,
+                                            tau=tau, lam=lam)
+    replace = p.numel() < n_sample
+    sel = torch.multinomial(p, n_sample, replacement=replace, generator=generator)
+    return valid_ids[sel], train_draw_stats(e, p, sel, is_int)
+
+
+def train_draw_stats(e, p, sel, is_int):
+    """Per-step sampler instrumentation for `train.jsonl` (Phase 1).
+
+    `wess_tilt_int` is the honest one: the energy tilt achieved *within the
+    interior*, which is the only region WESS is allowed to reweight. `wess_tilt`
+    over the whole mask stays for comparability with the Phase-0 numbers, but it
+    is diluted by the rim samples, which are uniform by construction.
+    `wess_interior_frac` should sit near the uniform value -- a drift away from
+    it means the erosion is not doing what it claims.
+    """
+    e = e.detach().float()
+    n_valid = e.numel()
+    sel = sel.to(e.device)
+    sel_int = is_int[sel]
+    e_sel = e[sel]
+    thresh = torch.quantile(e, 0.9) if n_valid > 1 else e.max()
+
+    tilt_int = float('nan')
+    if bool(sel_int.any()) and bool(is_int.any()):
+        tilt_int = float(e_sel[sel_int].mean() / (e[is_int].mean() + 1e-12))
+    return {
+        'wess_tilt': float(e_sel.mean() / (e.mean() + 1e-12)),
+        'wess_tilt_int': tilt_int,
+        'wess_ess': float(1.0 / (p.detach().float().pow(2).sum() + 1e-12) / n_valid),
+        'wess_top10_frac': float((e_sel >= thresh).float().mean()),
+        'wess_interior_frac': float(sel_int.float().mean()),
+        'n_valid': int(n_valid),
+    }

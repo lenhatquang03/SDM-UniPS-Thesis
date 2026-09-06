@@ -312,6 +312,36 @@ def build_argparser():
     p.add_argument('--canonical_resolution', type=int, default=256)
     p.add_argument('--pixel_samples', type=int, default=2048)
 
+    # WESS sampler (Model B2) --------------------------------------------
+    # Hyperparameters of the pixel sampler, not of the architecture -- the
+    # architecture is the branch. `--wess_lam 1` reproduces Model A's uniform
+    # draw exactly on this branch, which is the correctness check.
+    p.add_argument('--wess_tau', type=float, default=1.0,
+                   help='WESS softmax temperature, in units of the interior '
+                        'energy sigma. Smaller = more concentrated. Watch '
+                        'wess_ess in train.jsonl: below ~0.1 the draw has '
+                        'collapsed onto a handful of pixels; near 1.0 it is '
+                        'indistinguishable from uniform.')
+    p.add_argument('--wess_lam', type=float, default=0.25,
+                   help='Uniform mixture weight inside the interior '
+                        '(0.25 = the proposal\'s 512-of-2048 base set). Every '
+                        'masked pixel keeps p >= lam/n_valid, so the sampler '
+                        'changes the RATE at which a pixel is supervised, '
+                        'never whether it can be. 1.0 = Model A.')
+    p.add_argument('--wess_erode_cells', type=int, default=2,
+                   help='Silhouette band excluded from the energy statistics '
+                        'and from the softmax, in 64x64 energy-grid cells '
+                        '(2 ~ 16 px at R=512). Those pixels keep Model A\'s '
+                        'uniform rate; WESS reallocates the interior only. 0 '
+                        'keeps only the erosion implied by dropping cells that '
+                        'straddle the mask edge, which Phase 0 showed is not '
+                        'enough: the ring is one to two cells wide.')
+    p.add_argument('--wess_top_k', type=int, default=2,
+                   help='Energy is reduced over the K images by the mean of '
+                        'the top-k per pixel (2 = agreed default: keeps '
+                        '"informative under at least one light" while '
+                        'surviving one blown-out specular image).')
+
     # Data ---------------------------------------------------------------
     # K is fixed at 10 per scene inside HdlongLoader / PolarPSLoader.
     p.add_argument('--train_resolution', type=int, default=512)
@@ -613,6 +643,11 @@ SCHEDULE_SENSITIVE_ARGS = (
     'min_lr_ratio', 'lr_decay_every', 'lr_decay_gamma', 'batch_size',
     'accum_steps', 'pixel_samples', 'train_resolution',
     'canonical_resolution', 'amp_dtype', 'grad_clip',
+    # The WESS sampler shapes the training distribution, not the scene split,
+    # so changing one at resume warns rather than aborting -- same treatment as
+    # --lr. It does mean a resumed run can silently be a different sampler than
+    # the one that produced the earlier epochs, hence the warning.
+    'wess_tau', 'wess_lam', 'wess_erode_cells', 'wess_top_k',
 )
 
 

@@ -24,7 +24,7 @@ cannot afford it.
 |---|---|---|
 | **A** — baseline | `modelA-vflip-mean-max-scale` | — |
 | **B1** — WTConv | `modelB-wtconv` | `convnext.Block.dwconv`: 7×7 depthwise conv → wavelet convolution |
-| **B2** — WESS | (planned) | the training pixel sampler, driven by B1's sub-band energy |
+| **B2** — WESS | `modelC-wess` | `Net.sample_train_pixels`: uniform draw → wavelet sub-band energy over the mask **interior**; see **B2 — WESS** below |
 | **C** — carrier tokens + deformable attention | (planned) | `Regressor`'s pixel-sampling transformer |
 
 **What this costs, and why it is the right trade.** A checkpoint is only
@@ -107,6 +107,135 @@ reconstruction, sub-band channel ordering, shape preservation at all four stage
 geometries, the odd-size padding path, the buffer-vs-parameter guarantee, the
 backbone's four stage outputs against Model A's shapes, and the derived level
 budget. Also prints the depthwise parameter count against Model A's.
+
+### B2 — WESS (`modelC-wess`)
+
+`modules/model/wess.py` plus a `Net.sample_train_pixels` body. The training
+pixel draw stops being uniform over the mask and instead follows the level-0
+Haar sub-band energy of the *first* WTConv block (stage 0, block 0), reduced
+over the K images by the mean of the top 2, so each optimizer step spends its
+2048-pixel budget on creases and shadow boundaries rather than on flat regions
+that contribute almost no gradient.
+
+**The tap is a forward pre-hook, not a model edit.** It sits on
+`stages[0][0].dwconv.wavelet_convs[0]`, whose input is exactly the raw
+`bands.reshape(n, 4C, h, w)` — the pure Haar coefficients, before any learned
+parameter. `WTConv2d.tap_subbands` cannot supply that: it stores the *filtered*
+bands (scaled by a trainable gain that drifts during training) and is
+last-writer-wins across all 12 blocks, so after a forward it holds stage 3's
+4×4 bands. The hook adds no parameters and no buffers, so B1's `best.pt` loads
+here under the exact-match guard and `--pretrained` warm-starts cleanly.
+
+The energy is captured on the **tile** path (`x_grid`, K·N maps), never the
+resized one: `x_resized` is a bilinear downsample, i.e. a low-pass filter that
+destroys precisely the frequencies being measured. The four 32² tile maps merge
+through `merge_tensor_spatial` into a 64² full-frame map. Nominal cell size is
+8×8 image pixels; **true localization is ~16 px**, because the four tiles' cell
+(i,j) all summarize the same 16×16 region at four different phases. WESS
+concentrates the budget on crease *neighbourhoods*, not crease pixels.
+
+**The silhouette is excluded from the reweighting — this is the load-bearing
+decision, and it came out of Phase 0.** `Net.forward` feeds the backbone
+`cat([I * M, M])`, so the object boundary is a hard step in all four input
+channels and its level-0 detail bands are enormous *by construction*. Left
+alone the sampler put ~40% of the draw on that ring (τ=1) against 7–9% for a
+uniform draw, and — worse — the ring inflated `e.std()` enough to squash every
+interior z-score, so the interior softmax came out nearly flat. Sampling the
+silhouette harder needs no wavelets and is not the thesis claim. So the
+distribution is:
+
+```
+p(rim pixel)      = 1 / n_valid                        # Model A, untouched
+p(interior pixel) = (n_int / n_valid) * [ lam / n_int + (1 - lam) * softmax_int ]
+```
+
+The two blocks sum to `n_rim/n_valid + n_int/n_valid = 1` exactly, so nothing is
+renormalized. The rim keeps Model A's rate, which means **any A/B difference is
+attributable to interior reallocation alone** — a win cannot be explained away
+as "B2 just trained harder on the boundary, where GT normals sit at grazing
+angles and the mask edge is antialiased". `--wess_erode_cells` (2, in 64²
+energy-grid cells ≈ 16 px at R=512) sets the excluded band; the erosion runs on
+the energy grid because that is the resolution at which the ring is defined.
+
+Order of operations inside the interior is fixed and was settled before
+implementation: **upsample → gather at the mask → standardize → softmax → mix
+with uniform**. Softmax before the mask would spend the budget on background
+(`exp(0) = 1`); softmax before standardizing would make `--wess_tau` mean
+something different at every epoch, since `E` is an L2 norm over 96 channels of
+a *learned* feature map whose scale drifts as the encoder trains. Standardizing
+puts τ in units of σ.
+
+**`--wess_lam` is a mixture weight, not a second draw.** The proposal split the
+budget into 512 uniform + 1536 saliency-drawn, which needs bookkeeping to keep
+the two disjoint. The mixture has the same expected count per pixel, takes one
+`multinomial`, and converts the support argument from asymptotic into a hard
+guarantee: every masked pixel keeps `p ≥ lam/n_valid` however peaked the
+softmax gets. The sampler changes the *rate* at which a pixel is supervised,
+never whether it can be — which is what makes training under `E_P` while
+reporting `E_uniform` defensible. **`--wess_lam 1` (or a large `--wess_tau`)
+recovers Model A's uniform draw exactly**, on the rim and in the interior
+alike; that is a free correctness check, and worth running for a few hundred
+steps before the real launch.
+
+**The A/B fairness contract is untouched.** The tap is armed only when
+`training=True and sample_ids is None`. Evaluation always supplies `sample_ids`
+(`Trainer._eval_sample_ids`), so the hook never fires on a val/test forward and
+those numbers stay byte-identical to Model A's. WESS lives entirely inside the
+training draw.
+
+**Instrumentation (Phase 1).** `sample_train_pixels` accumulates per-scene
+diagnostics that `_forward_losses` folds into the ordinary per-step log, so
+they land in `train.jsonl` and are averaged into each epoch summary by the same
+code that averages `loss` — no new plumbing:
+
+- `wess_ess` — effective sample size `1/Σp²` as a fraction of the mask. **The
+  one to watch on launch.** Below ~0.1 the draw has collapsed onto a handful of
+  pixels and the per-step gradient is high-variance; near 1.0 the sampler is
+  inert. Phase 0 measured 0.21 at τ=1 *with* the rim included, and excluding the
+  rim removes what was inflating σ, so the shipped sampler will read lower at
+  the same τ. If the first hundred steps show `wess_ess < 0.1`, raise
+  `--wess_tau`.
+- `wess_tilt_int` — energy tilt achieved *within the interior*, the only region
+  WESS may reweight. The honest headline number.
+- `wess_tilt` — the same over the whole mask, kept for comparability with the
+  Phase-0 records; diluted by the rim samples, which are uniform by construction.
+- `wess_interior_frac` — share of the draw landing inside the eroded interior.
+  Should sit near the uniform value (~0.90); a drift away from it means the
+  erosion is not doing what it claims.
+- `wess_top10_frac` — share of the draw in the mask's top energy decile
+  (uniform reads 0.10).
+
+**Phase 0 (premise validation), n = 431, the full val split.** `sdm_unips/wess_probe.py`
+loads B1's `best.pt`, taps the sub-bands and asks whether `E` points at geometry
+before any GPU time is spent training on it. It answered yes: ρ(E, GT curvature)
+median **+0.46**, positive in 99% of scenes and above +0.2 in 90%, and
+consistent across both sources (hdlong +0.44, PolarPS +0.47). B1's MAE on
+WESS-drawn pixels is **+0.79°** above its MAE on uniform-drawn pixels at τ=1
+(higher in 80% of scenes), i.e. the sampler does find pixels the model currently
+gets wrong — and across scenes ρ(that gain, interior curvature tilt) = **+0.39**,
+the strongest coupling in the probe, so the gain tracks the mechanism rather
+than the silhouette.
+
+Two limitations to report rather than let a reviewer find:
+
+- **Albedo contamination is real but not dominant.** The partial correlation
+  ρ(E, |∇I| | curvature) is +0.29 overall (+0.22 hdlong, +0.33 PolarPS). The
+  panels for the worst offenders are reassuring — on `soap-002@fabric_159` and
+  `blob01-uv@metalplate_4` the GT normal is smooth, `|∇I|` lights up the painted
+  ornament, and `E` visibly does *not* follow it — so much of that partial
+  correlation is the silhouette, where E and `|∇I|` both spike and where
+  `np.gradient`-based curvature is itself an artifact. Still, E is a feature-map
+  energy, not a shading-gradient estimator, and nothing forces it to ignore paint.
+- **The gain is largest where B1 is already good.** ρ(MAE gain, uniform MAE) is
+  −0.13 to −0.22. WESS targets hard *pixels within* a scene; it does not target
+  hard scenes.
+
+**Probe:** `python -u sdm_unips/wess_probe.py --checkpoint <B1>/checkpoints/best.pt
+<same --hdlong_dir/--polarps_dir/--scene_manifest as the run> --num_scenes 0
+--tau 1.0 2.0 --band raw --no_figures --out_dir <dir>`. Roughly 3 s/scene plus
+~1–2 min of startup; drop `--no_figures` for per-scene panels. Note `python -u`:
+the probe's `print`s are block-buffered into a redirected file otherwise, and a
+redirected run looks hung for minutes.
 
 ### Comparing A against B1
 

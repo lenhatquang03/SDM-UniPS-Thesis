@@ -71,8 +71,14 @@ import numpy as np
 import torch
 
 from modules.model import model
+from modules.model import wess
 from modules.model.model_utils import mode_change, get_n_params
 from modules.loss import losses
+
+
+def net_unwrapped(net):
+    """The bare `Net` behind an optional DataParallel wrapper."""
+    return wess.unwrap(net)
 
 
 # Bumped when the checkpoint payload changes shape. `resume_from` accepts
@@ -227,7 +233,14 @@ class Trainer:
         self.device = device
         self.target = 'normal'
 
-        self.net = model.Net(args.pixel_samples, device).to(device)
+        self.net = model.Net(
+            args.pixel_samples, device,
+            wess_tau=getattr(args, 'wess_tau', wess.DEFAULT_TAU),
+            wess_lam=getattr(args, 'wess_lam', wess.DEFAULT_LAM),
+            wess_erode_cells=getattr(args, 'wess_erode_cells',
+                                     wess.DEFAULT_ERODE_CELLS),
+            wess_top_k=getattr(args, 'wess_top_k', 2),
+        ).to(device)
         self.net.with_grad()
         # Name the variant in the log: the architecture is fixed by the branch,
         # not by a flag, so this line is the only record in `train.log` of which
@@ -689,7 +702,18 @@ class Trainer:
         loss = losses.normal_loss(pred_n, N, M, sample_idx)
         with torch.no_grad():
             mae = losses.angular_error_deg(pred_n, N, M, sample_idx)
-        return loss, {'loss': loss.detach(), 'mae_deg': mae.detach()}
+        log = {'loss': loss.detach(), 'mae_deg': mae.detach()}
+
+        # Phase-1 instrumentation. These ride along on the existing per-step
+        # record, so they are averaged into the epoch summary by the same code
+        # that averages `loss` -- no new plumbing, and nothing to strip out
+        # afterwards. Present only on training steps: the eval path supplies
+        # `sample_ids` and never reaches the sampler, so `last_wess_stats` is
+        # None there and the keys are simply absent from those records.
+        stats = getattr(net_unwrapped(self.net), 'last_wess_stats', None)
+        if stats is not None and not deterministic_eval:
+            log.update(stats)
+        return loss, log
 
     def _report_nan(self, batch):
         """One-time diagnostic: localize a non-finite loss to inputs vs forward."""

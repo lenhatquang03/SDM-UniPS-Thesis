@@ -17,6 +17,7 @@ from . import convnext
 from . import uper
 from ..utils import gauss_filter
 from ..utils.ind2sub import *
+from . import wess as wess_mod
 from .decompose_tensors import *
 
 class ImageFeatureExtractor(nn.Module):
@@ -181,11 +182,30 @@ class PredictionHead(nn.Module):
         return self.regression(x)
 
 class Net(nn.Module):
-    def __init__(self, pixel_samples, device):
+    def __init__(self, pixel_samples, device,
+                 wess_tau=wess_mod.DEFAULT_TAU, wess_lam=wess_mod.DEFAULT_LAM,
+                 wess_erode_cells=wess_mod.DEFAULT_ERODE_CELLS,
+                 wess_top_k=2):
         super().__init__()
         self.device = device
         self.pixel_samples = pixel_samples
         self.glc_smoothing = True
+
+        # --- Model B2 (WESS) sampler configuration -------------------------
+        # Hyperparameters of the *sampler*, not of the architecture, so they
+        # live on the launch command like --lr does. `wess_lam = 1` reproduces
+        # Model A's uniform draw exactly, which is the correctness check.
+        self.wess_tau = float(wess_tau)
+        self.wess_lam = float(wess_lam)
+        self.wess_erode_cells = int(wess_erode_cells)
+        self.wess_top_k = int(wess_top_k)
+        # Populated by the sub-band hook during a training forward, read by
+        # `sample_train_pixels`, cleared immediately after. Never a Parameter
+        # and never in the state_dict, so checkpoints are unaffected.
+        self._wess_capture = False
+        self._wess_bands = None
+        self._wess_stats_acc = []
+        self.last_wess_stats = None
 
 
         self.input_dim = 4 # RGB + mask
@@ -197,7 +217,37 @@ class Net(nn.Module):
 
 
         self.regressor = Regressor(384, num_enc_sab=1, use_efficient_attention=True, dim_feedforward=1024).to(self.device)
-        
+
+        self._install_wess_hook()
+
+    def _install_wess_hook(self):
+        """Tap the level-0 Haar coefficients of stage 0, block 0.
+
+        A forward PRE-hook on `wavelet_convs[0]`, whose input is exactly the raw
+        `bands.reshape(n, 4C, h, w)` of the level-0 DWT -- the `X^LH/X^HL/X^HH`
+        the method is defined on, before any learned parameter touches them.
+        `WTConv2d.tap_subbands` cannot supply this: it stores the *filtered*
+        bands (scaled by a trainable gain that drifts during training) and is
+        last-writer-wins across all 12 blocks.
+
+        Installed once, permanently, but gated on `self._wess_capture` so it is
+        inert on every evaluation and inference forward -- and so B1's
+        `best.pt` still loads here, since a hook adds no parameters and no
+        buffers. The encoder calls the backbone twice; this fires on both and
+        the tile path (`x_grid`, K*N maps) is second, so last-writer-wins is
+        the wanted one. `saliency_maps` asserts the leading dimension rather
+        than trusting that ordering.
+        """
+        dwconv = wess_mod.wtconv_block(self, wess_mod.DEFAULT_STAGE,
+                                       wess_mod.DEFAULT_BLOCK)
+        self._wess_channels = dwconv.channels
+
+        def pre_hook(_module, inputs):
+            if self._wess_capture:
+                self._wess_bands = inputs[0].detach()
+
+        dwconv.wavelet_convs[0].register_forward_pre_hook(pre_hook)
+
     def no_grad(self):
         mode_change(self.image_encoder, False)
         mode_change(self.glc_upsample, False)
@@ -233,7 +283,52 @@ class Net(nn.Module):
         return x_n / norm
 
 
-    def sample_train_pixels(self, valid_ids, n_sample):
+    def _wess_saliency(self, nImgArray, canonical_resolution):
+        """Per-batch-element 64x64 energy maps, or None if the tap is empty.
+
+        None is not an error path to be silenced -- it is what makes the WESS
+        branch impossible to reach on an evaluation forward, where the tap is
+        never armed. It also keeps this branch inert if the backbone is ever
+        run without wavelet levels.
+        """
+        if self._wess_bands is None:
+            return None
+        # The encoder derives its mosaic factor the same way, from the encoder
+        # input resolution; re-deriving it here from the captured tile count
+        # would not distinguish K from N.
+        mosaic_scale = self._wess_mosaic_scale
+        try:
+            energy = wess_mod.subband_energy(self._wess_bands, self._wess_channels)
+            merged = wess_mod.merge_tile_energy(
+                energy, int(sum(int(n) for n in nImgArray)), mosaic_scale)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                'WESS could not build a saliency map from the sub-band tap. '
+                'This is a wiring fault, not a data fault -- training would '
+                'otherwise silently fall back to a uniform draw and the run '
+                f'would not be Model B2 at all. Original error: {exc}') from exc
+
+        out, q = [], 0
+        for n in (int(v) for v in nImgArray):
+            out.append(wess_mod.reduce_over_lights(merged[q:q + n],
+                                                   top_k=self.wess_top_k))
+            q += n
+        return out
+
+    def _mean_wess_stats(self):
+        """Average the per-scene sampler diagnostics over the micro-batch."""
+        acc = getattr(self, '_wess_stats_acc', None)
+        if not acc:
+            return None
+        keys = acc[0].keys()
+        out = {}
+        for k in keys:
+            vals = [d[k] for d in acc if d[k] == d[k]]   # drop NaN
+            out[k] = (sum(vals) / len(vals)) if vals else float('nan')
+        return out
+
+    def sample_train_pixels(self, valid_ids, n_sample,
+                            E=None, mask_hw=None, H=None, W=None):
         """Choose which `n_sample` pixels a TRAINING step decodes.
 
         This is the pixel-sampling policy under study: the thesis' Models B/C
@@ -247,11 +342,26 @@ class Net(nn.Module):
 
         Baseline (Model A) = uniform over the mask, as in the paper: m random
         pixels without replacement, falling back to with-replacement only when a
-        scene holds fewer than m valid pixels.
+        scene holds fewer than m valid pixels. That is still the body below, and
+        it is what runs whenever `E` is unavailable.
+
+        Model B2 (WESS) = the same draw with the interior's share of the budget
+        reallocated by wavelet sub-band energy; see `wess.py`. The silhouette
+        band keeps Model A's rate exactly, so the two samplers differ only in
+        how they spend the *interior* budget.
         """
         if valid_ids.numel() == 0:
             # No valid pixels: emit a placeholder; loss masking discards them.
             return torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
+
+        if E is not None and mask_hw is not None:
+            ids, stats = wess_mod.wess_sample_train(
+                E, mask_hw, valid_ids, H, W, n_sample,
+                tau=self.wess_tau, lam=self.wess_lam,
+                erode_cells=self.wess_erode_cells)
+            self._wess_stats_acc.append(stats)
+            return ids
+
         if valid_ids.numel() >= n_sample:
             perm = torch.randperm(valid_ids.numel(), device=valid_ids.device)
             return valid_ids[perm[:n_sample]]
@@ -280,7 +390,18 @@ class Net(nn.Module):
         M_enc = M_enc.unsqueeze(1).expand(-1, Nmax, -1, -1, -1).reshape(-1, 1, H, W)
         data = torch.cat([I_enc * M_enc, M_enc], dim=1)
         data = data[img_index==1,:,:,:] # torch.size([B, N, 4, H, W])d
-        glc = self.image_encoder(data, nImgArray, canonical_resolution) # torch.Size([B, N, 256, H/4, W/4]) [img, mask]
+
+        # Capture the sub-bands only on a training forward that will actually
+        # draw its own pixels. Evaluation supplies `sample_ids`, so the tap
+        # stays off there and val/test remain byte-identical to Model A's --
+        # which is what the A/B fairness contract requires.
+        self._wess_capture = bool(training and sample_ids is None)
+        self._wess_bands = None
+        self._wess_mosaic_scale = data.shape[-1] // canonical_resolution
+        try:
+            glc = self.image_encoder(data, nImgArray, canonical_resolution) # torch.Size([B, N, 256, H/4, W/4]) [img, mask]
+        finally:
+            self._wess_capture = False
 
         """ Sample Decoder at Original Resolution"""
         img = I.permute(0, 4, 1, 2, 3).to(self.device)
@@ -315,6 +436,9 @@ class Net(nn.Module):
             (evaluation -- fixed across model variants), otherwise
             `sample_train_pixels`, the policy under study.
             """
+            E_maps = self._wess_saliency(nImgArray, canonical_resolution)
+            self._wess_stats_acc = []
+
             pred_n_list, idx_list = [], []
             p = 0
             for b in range(B):
@@ -327,11 +451,17 @@ class Net(nn.Module):
                 else:
                     m_ = M_dec[b, :, :, :].reshape(-1, H * W).permute(1, 0)
                     valid_ids = torch.nonzero(m_ > 0, as_tuple=False)[:, 0]
-                    ids = self.sample_train_pixels(valid_ids, self.pixel_samples)
+                    ids = self.sample_train_pixels(
+                        valid_ids, self.pixel_samples,
+                        E=None if E_maps is None else E_maps[b],
+                        mask_hw=M_dec[b, 0], H=H, W=W)
 
                 X_n = self._decode_pixels(glc, I_dec, target, ids, num_imgs, H, W, C)
                 pred_n_list.append(X_n)
                 idx_list.append(ids)
+
+            self.last_wess_stats = self._mean_wess_stats()
+            self._wess_bands = None
 
             pred_n = torch.stack(pred_n_list, dim=0)         # [B, n_sample, 3]
             sample_idx = torch.stack(idx_list, dim=0)        # [B, n_sample]
