@@ -191,7 +191,8 @@ code that averages `loss` — no new plumbing:
 - `wess_ess` — effective sample size `1/Σp²` as a fraction of the mask. **The
   one to watch on launch.** Below ~0.1 the draw has collapsed onto a handful of
   pixels and the per-step gradient is high-variance; near 1.0 the sampler is
-  inert. Phase 0 measured 0.21 at τ=1 *with* the rim included, and excluding the
+  inert. Phase 0 measured a **median** 0.21 at τ=1 (mean 0.23, min 0.01, max
+  0.72) *with* the rim included, and excluding the
   rim removes what was inflating σ, so the shipped sampler will read lower at
   the same τ. If the first hundred steps show `wess_ess < 0.1`, raise
   `--wess_tau`.
@@ -208,13 +209,25 @@ code that averages `loss` — no new plumbing:
 **Phase 0 (premise validation), n = 431, the full val split.** `sdm_unips/wess_probe.py`
 loads B1's `best.pt`, taps the sub-bands and asks whether `E` points at geometry
 before any GPU time is spent training on it. It answered yes: ρ(E, GT curvature)
-median **+0.46**, positive in 99% of scenes and above +0.2 in 90%, and
-consistent across both sources (hdlong +0.44, PolarPS +0.47). B1's MAE on
-WESS-drawn pixels is **+0.79°** above its MAE on uniform-drawn pixels at τ=1
-(higher in 80% of scenes), i.e. the sampler does find pixels the model currently
-gets wrong — and across scenes ρ(that gain, interior curvature tilt) = **+0.39**,
-the strongest coupling in the probe, so the gain tracks the mechanism rather
-than the silhouette.
+median **+0.46** (mean +0.43), positive in **98.6%** of scenes and above +0.2 in
+90.0%, and consistent across both sources (hdlong +0.44, PolarPS +0.47, medians).
+B1's MAE on WESS-drawn pixels is **+0.79°** above its MAE on uniform-drawn pixels
+at τ=1 — that is the **median**; the mean is +1.05° — and it is higher in 79.6%
+of scenes, i.e. the sampler does find pixels the model currently gets wrong. Across
+scenes ρ(that gain, interior curvature tilt) = **+0.39**, the strongest coupling in
+the probe.
+
+**Every headline figure above is a median unless stated.** Per-scene correlations
+are bounded and skewed, so the median is the honest summary, but quote it
+consistently — the mean differs by enough to look like a different result.
+
+That the gain tracks the mechanism rather than the silhouette is a separate
+claim, and it was checked separately: the obvious objection is that the τ=1 draw
+puts 39.6% of its budget on the rim (against 8.5% uniform), where GT normals sit
+at grazing angles and the mask is antialiased, so of course B1 does worse there.
+It does not survive the data. ρ(MAE gain, rim share of the draw) = **−0.139** —
+the wrong sign for that confound — and partialling rim share out of the coupling
+moves it only from +0.389 to **+0.368**.
 
 Two limitations to report rather than let a reviewer find:
 
@@ -227,8 +240,38 @@ Two limitations to report rather than let a reviewer find:
   `np.gradient`-based curvature is itself an artifact. Still, E is a feature-map
   energy, not a shading-gradient estimator, and nothing forces it to ignore paint.
 - **The gain is largest where B1 is already good.** ρ(MAE gain, uniform MAE) is
-  −0.13 to −0.22. WESS targets hard *pixels within* a scene; it does not target
-  hard scenes.
+  **−0.13 at τ=1** and −0.03 at τ=2. WESS targets hard *pixels within* a scene;
+  it does not target hard scenes. (An earlier draft of this file quoted a range
+  of "−0.13 to −0.22". The −0.22 does not reproduce from the 431-scene records
+  and its source run was not preserved — it was withdrawn on 2026-09-07. The
+  tendency is real but mild.)
+
+**Phase 0 was not pre-registered.** No claim / metric / null / threshold set was
+written down before the probe ran; the thresholds in its output ("want clearly
+positive", "want small") are prose in a `print`. The measurements stand, but
+report Phase 0 as exploration that came out favourable, not as a decision
+procedure that passed — a reviewer who is told otherwise and then reads the
+commit history will discount everything else in the chapter.
+
+**Falsification control (`--shuffle_energy`).** The one check that closes the
+gap: permute the 64×64 energy map, leaving its value multiset untouched but
+destroying its alignment with the surface, and re-run. ρ(E, curvature),
+ρ(E, |∇I| | curvature), both curvature tilts and the MAE gain must collapse to
+their nulls (0, 0, 1.0, 1.0, 0°) and the rim share must fall back to the uniform
+draw's ~0.085. At n = 431 the null standard error is ~0.005 on ρ and ~0.03 on the
+tilts, so read the control on the **full split** — per-scene nulls have a sd of
+~0.29 on tilt and a ten-scene run says nothing.
+
+`wess_ess` is **not** a null target and will *fall* sharply under the control
+(~0.11 → ~0.008 in a simulation of the chain). `wess_probabilities` upsamples
+before it standardizes, and bilinear interpolation of a decorrelated field
+shrinks σ, so standardizing re-amplifies the surviving outliers and the softmax
+comes out *more* peaked. That is an artefact of permuting a normally-smooth
+field, not a signal. Records from a control run carry `"shuffled": true`.
+
+The other free check needs no new code: **`--lam 1.0` must print `ESS 1.000`**
+and reproduce the uniform row exactly, since the mixture collapses to Model A's
+sampler.
 
 **Probe:** `python -u sdm_unips/wess_probe.py --checkpoint <B1>/checkpoints/best.pt
 <same --hdlong_dir/--polarps_dir/--scene_manifest as the run> --num_scenes 0

@@ -209,6 +209,49 @@ def partial_spearman(r_eg, r_ec, r_gc):
     return float((r_eg - r_ec * r_gc) / denom)
 
 
+def shuffle_map(E, generator):
+    """Falsification control: permute the energy map's cells.
+
+    A positive result is only evidence if the *same pipeline* reads null on
+    input that cannot carry the signal. Permuting `E` destroys its spatial
+    correspondence with the surface while preserving its value multiset
+    **exactly**, so the softmax is as peaked as before and the draw is as
+    concentrated as before -- what changes is only *where* the concentrated
+    mass sits.
+
+    Under the shuffle, `rho(E, curvature)`, `rho(E, |grad I| | curvature)`,
+    both curvature tilts and the MAE gain must collapse to their nulls (0, 0,
+    1.0, 1.0, 0 deg), and the rim share of the draw must fall back to the
+    uniform draw's ~0.085.
+
+    `wess_ess` is **not** a null target here, and it will not stay put --
+    measured, not assumed. `wess_probabilities` upsamples the 64x64 map to the
+    decoder grid *before* standardizing, and bilinear interpolation of a
+    spatially decorrelated field averages unrelated neighbours, shrinking
+    `std(e)`; standardizing by the smaller sigma then amplifies whatever
+    outliers survive, so the softmax comes out MORE peaked, not less. A
+    stdlib simulation of this exact chain (64x64 -> bilinear 512 -> disk mask ->
+    tau 1.0, lam 0.25) reads std 0.366 -> 0.217 and ESS 0.107 -> 0.008. That is
+    an artefact of permuting a field that is normally smooth; read ESS from the
+    real run only.
+
+    The permutation runs on the 64x64 map rather than the 512x512 upsample so
+    the bilinear interpolation that follows still produces a field of the same
+    resolution as the real one. Shuffling after the upsample would hand the
+    control a white-noise field the real map never is -- an easier null to pass
+    than the honest one.
+
+    Per-scene nulls are noisy, because the draw concentrates on wherever the
+    permutation happened to put the high cells: in that simulation the tilt
+    null has a per-scene sd of ~0.29 against a mean of 0.99. Run the control
+    over the whole split (`--num_scenes 0`), where the standard error falls to
+    ~0.014, not over a handful of scenes.
+    """
+    flat = E.reshape(-1)
+    perm = torch.randperm(flat.numel(), generator=generator).to(flat.device)
+    return flat[perm].reshape(E.shape)
+
+
 # ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
@@ -301,6 +344,14 @@ def build_parser():
     g.add_argument('--erode', type=int, default=9,
                    help='Mask erosion (px) for the correlation statistics. The '
                         'silhouette is a spurious edge in both references.')
+    g.add_argument('--shuffle_energy', action='store_true',
+                   help='FALSIFICATION CONTROL. Randomly permute the energy '
+                        'map before it is used, so it keeps its value '
+                        'histogram but loses all alignment with the surface. '
+                        'Every geometric metric must collapse to its null; '
+                        'wess_ess must not move. Records are tagged '
+                        '"shuffled": true so a control run cannot be mistaken '
+                        'for a real one.')
     g.add_argument('--no_figures', action='store_true',
                    help='Statistics only; skip the PNG panels.')
     return p
@@ -346,6 +397,13 @@ def probe_scene(net, batch, args, device, gen):
     mae_uniform = float(losses.angular_error_deg(pred_u, N_dev, M, idx_u))
 
     primary = maps['raw' if 'raw' in maps else args.band]
+    if args.shuffle_energy:
+        # Consumes `gen`, so a control run's WESS draws sit at a different RNG
+        # position than a real run's. That is intended and harmless: the
+        # control is compared against its nulls, never sample-for-sample
+        # against the real run. With the flag off nothing here executes and
+        # the stream is untouched.
+        primary = shuffle_map(primary, gen)
     draws = []
     for tau in args.tau:
         ids, stats = wess.wess_sample(primary, valid_ids, H, H,
@@ -495,6 +553,9 @@ def main():
     print(f'[probe] {n_scenes} scene(s) | tap = stage {args.stage} block '
           f'{args.block} | bands = {args.band} | top_k = {args.top_k} | '
           f'tau = {args.tau} | lam = {args.lam}')
+    if args.shuffle_energy:
+        print('[probe] *** SHUFFLED-ENERGY FALSIFICATION CONTROL *** these are '
+              'NULL measurements, not results')
 
     out_jsonl = os.path.join(args.out_dir, 'wess_probe.jsonl')
     records = []
@@ -514,7 +575,8 @@ def main():
 
             kind, scene_dir = eval_set.scenes[i % eval_set.n_scenes]
             rec = {'index': i, 'kind': kind,
-                   'scene': os.path.basename(scene_dir.rstrip('/')), **stats}
+                   'scene': os.path.basename(scene_dir.rstrip('/')),
+                   'shuffled': bool(args.shuffle_energy), **stats}
             records.append(rec)
             fh.write(json.dumps(rec) + '\n')
             fh.flush()
@@ -558,6 +620,13 @@ def main():
         return float(np.mean(vals)) if vals else float('nan')
 
     print(f'\n[probe] {len(records)} scenes in {time.time() - t0:.0f}s\n')
+    if args.shuffle_energy:
+        print('  *** SHUFFLED-ENERGY CONTROL. Expected nulls: rho ~ 0.000 '
+              '(+/-0.005 at n=431), curv_tilt and interior ~ 1.000 (+/-0.03),\n'
+              '      top-decile ~ 0.100, rim ~ the uniform row, MAE delta ~ '
+              '+0.000 deg. ESS is NOT a null here -- it falls sharply because\n'
+              '      interpolating a decorrelated field shrinks sigma and '
+              'standardizing re-amplifies the outliers. See shuffle_map(). ***\n')
     print('  Does E point at geometry?  (interior only, silhouette eroded)')
     print(f"    rho(E, curvature)                 {agg('rho_E_curvature'):+.3f}"
           '   <- want clearly positive')
