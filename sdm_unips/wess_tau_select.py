@@ -129,10 +129,16 @@ def main():
         se = math.sqrt(se_r ** 2 + se_s ** 2)
         e = st.mean(ess.get(t, [float('nan')]))
         ti = st.mean(tilt.get(t, [float('nan')]))
+        # A scene whose eroded interior is too thin falls back to a uniform
+        # draw inside wess_train_probabilities, reading ESS exactly 1.0. Those
+        # scenes dilute every mean here, so count them rather than let them
+        # quietly inflate the ESS column.
+        fb = sum(1 for v in ess.get(t, []) if v > 0.999)
         keep = e >= a.min_ess and ti >= a.min_tilt
         rows.append((t, net, se, e, ti, keep))
         print(f'{t:>5.2f} {e:>7.3f} {ti:>8.3f} {m_r:>+10.3f} {m_s:>+8.3f} '
-              f'{net:>+10.3f} {se:>7.3f}  {"yes" if keep else "no"}')
+              f'{net:>+10.3f} {se:>7.3f}  {"yes" if keep else "no"}'
+              + (f'   [{fb} uniform-fallback scenes]' if fb else ''))
 
     ok = [r for r in rows if r[5]]
     print(f'\nrule: ESS >= {a.min_ess}, tilt >= {a.min_tilt}, max net gain, '

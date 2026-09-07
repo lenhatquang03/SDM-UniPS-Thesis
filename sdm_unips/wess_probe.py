@@ -440,6 +440,18 @@ def probe_scene(net, batch, args, device, gen):
         # against the real run. With the flag off nothing here executes and
         # the stream is untouched.
         primary = shuffle_map(primary, gen)
+    # `wess_sample_train` draws on the tensors' own device (deliberately: it
+    # mirrors Model A's training-time draw), while `_draw` -- the Phase-0 path --
+    # moves `p` to CPU so the sample depends on the seed alone. torch requires
+    # the generator's device to match, so the shipped path needs a device-side
+    # generator. Seeding it from `gen`'s own seed keeps the probe reproducible
+    # per scene without reseeding any global stream.
+    if args.shipped_sampler and device.type != 'cpu':
+        gen_draw = torch.Generator(device=device)
+        gen_draw.manual_seed(gen.initial_seed())
+    else:
+        gen_draw = gen
+
     draws = []
     for tau in args.tau:
         if args.shipped_sampler:
@@ -453,7 +465,7 @@ def probe_scene(net, batch, args, device, gen):
             ids, stats = wess.wess_sample_train(
                 primary, M[0, 0], valid_ids, H, H, int(args.pixel_samples),
                 tau=tau, lam=args.lam,
-                erode_cells=args.erode_cells, generator=gen)
+                erode_cells=args.erode_cells, generator=gen_draw)
         else:
             ids, stats = wess.wess_sample(primary, valid_ids, H, H,
                                           int(args.pixel_samples),
