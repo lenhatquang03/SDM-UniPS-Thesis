@@ -224,16 +224,36 @@ def shuffle_map(E, generator):
     1.0, 1.0, 0 deg), and the rim share of the draw must fall back to the
     uniform draw's ~0.085.
 
+    RESULT (2026-09-07, n=431, B1 best.pt). Every geometric null passes, and
+    tightly: rho(E, curvature) +0.43 -> -0.008, rho partial +0.29 -> -0.001,
+    curv_tilt 1.0019, curv_tilt_interior 1.0007, top-decile 0.1004, interior
+    share within 0.0011 of the uniform arm. The MAE gain does NOT fully
+    collapse: +0.162 +- 0.037 deg survives at tau=1 (4.4 SE from zero), +0.059
+    +- 0.025 at tau=2. It is not leaked signal -- rho(real gain, shuffled gain)
+    = -0.047 -- but an offset that tracks peakedness (ESS 0.100 -> +0.162 deg;
+    ESS 0.614 -> +0.059 deg), most likely because `Regressor`'s spatial-axis
+    transformer attends across pixels within the sample set, so a clustered
+    draw degrades the decoder's context wherever the clusters land. Subtract it
+    before quoting the gain.
+
     `wess_ess` is **not** a null target here, and it will not stay put --
     measured, not assumed. `wess_probabilities` upsamples the 64x64 map to the
     decoder grid *before* standardizing, and bilinear interpolation of a
     spatially decorrelated field averages unrelated neighbours, shrinking
     `std(e)`; standardizing by the smaller sigma then amplifies whatever
-    outliers survive, so the softmax comes out MORE peaked, not less. A
-    stdlib simulation of this exact chain (64x64 -> bilinear 512 -> disk mask ->
-    tau 1.0, lam 0.25) reads std 0.366 -> 0.217 and ESS 0.107 -> 0.008. That is
-    an artefact of permuting a field that is normally smooth; read ESS from the
-    real run only.
+    outliers survive, so the softmax comes out MORE peaked, not less. Measured
+    on the real split: ESS 0.231 -> 0.100 at tau=1, 0.715 -> 0.614 at tau=2.
+    (An earlier version of this docstring predicted 0.107 -> 0.008 from a
+    stdlib simulation of the chain -- right direction, wrong by ~12x, because
+    the simulation's sigma-shrinkage is far stronger on a synthetic field than
+    on a real energy map. Corrected against the run.) That is an artefact of
+    permuting a field that is normally smooth; read ESS from the real run only.
+
+    INTEGRITY GATE for any re-run: `uniform_sample` is called before this
+    function consumes the generator, so the control's uniform arm is
+    bit-identical to the real run's, scene for scene. Verify that first (it
+    held exactly on all 431); if it does not, the two runs are not the same
+    checkpoint or scene list and nothing downstream is comparable.
 
     The permutation runs on the 64x64 map rather than the 512x512 upsample so
     the bilinear interpolation that follows still produces a field of the same
@@ -242,10 +262,13 @@ def shuffle_map(E, generator):
     than the honest one.
 
     Per-scene nulls are noisy, because the draw concentrates on wherever the
-    permutation happened to put the high cells: in that simulation the tilt
-    null has a per-scene sd of ~0.29 against a mean of 0.99. Run the control
-    over the whole split (`--num_scenes 0`), where the standard error falls to
-    ~0.014, not over a handful of scenes.
+    permutation happened to put the high cells. Measured on the run, the tilt
+    null has a per-scene sd of 0.085 at tau=1 (0.054 at tau=2) and the MAE
+    delta a sd of 0.77 deg -- so a ten-scene control resolves nothing, and the
+    MAE arm is the slowest to converge. Run over the whole split
+    (`--num_scenes 0`), where the standard error is 0.004 on the tilts and
+    0.037 deg on the MAE delta. (An earlier simulation put the tilt sd at
+    ~0.29; the real field is far better behaved.)
     """
     flat = E.reshape(-1)
     perm = torch.randperm(flat.numel(), generator=generator).to(flat.device)
@@ -621,12 +644,14 @@ def main():
 
     print(f'\n[probe] {len(records)} scenes in {time.time() - t0:.0f}s\n')
     if args.shuffle_energy:
-        print('  *** SHUFFLED-ENERGY CONTROL. Expected nulls: rho ~ 0.000 '
-              '(+/-0.005 at n=431), curv_tilt and interior ~ 1.000 (+/-0.03),\n'
-              '      top-decile ~ 0.100, rim ~ the uniform row, MAE delta ~ '
-              '+0.000 deg. ESS is NOT a null here -- it falls sharply because\n'
-              '      interpolating a decorrelated field shrinks sigma and '
-              'standardizing re-amplifies the outliers. See shuffle_map(). ***\n')
+        print('  *** SHUFFLED-ENERGY CONTROL. Nulls measured 2026-09-07 at '
+              'n=431 (tau=1): rho ~ -0.008, curv_tilt 1.002, interior 1.001,\n'
+              '      top-decile 0.100, interior share within 0.001 of the '
+              'uniform row. MAE delta does NOT reach zero -- it reads +0.162\n'
+              '      +/-0.037 deg, a peakedness offset, not leaked signal '
+              '(rho with the real gain = -0.047). ESS is NOT a null here and\n'
+              '      falls 0.231 -> 0.100. Compare against these, and check the '
+              'uniform arm matches the real run exactly. See shuffle_map(). ***\n')
     print('  Does E point at geometry?  (interior only, silhouette eroded)')
     print(f"    rho(E, curvature)                 {agg('rho_E_curvature'):+.3f}"
           '   <- want clearly positive')

@@ -196,6 +196,20 @@ code that averages `loss` — no new plumbing:
   rim removes what was inflating σ, so the shipped sampler will read lower at
   the same τ. If the first hundred steps show `wess_ess < 0.1`, raise
   `--wess_tau`.
+
+  **Peakedness has a measured cost, so treat 0.1 as a floor and not a target.**
+  The shuffled-energy control showed a draw at ESS 0.100 raises MAE by +0.16°
+  *on randomly-placed clusters* — i.e. purely for being clustered, with no
+  geometric content at all — against +0.06° at ESS 0.614. The likely cause is
+  that `Regressor`'s spatial-axis transformer attends across pixels within the
+  sample set, so a clustered draw degrades the decoder's spatial context; at
+  training time that cost is paid on **every step**, not just at measurement.
+  It is a plausible mechanism rather than an isolated one, but it is enough to
+  change how the tripwire should be read: prefer the largest `--wess_tau` that
+  still delivers a useful `wess_tilt_int`, rather than the smallest τ that stays
+  above the floor. If B2 underperforms B1 at a healthy tilt, over-peaking is the
+  first hypothesis to test — re-run at higher τ before concluding WESS does not
+  work.
 - `wess_tilt_int` — energy tilt achieved *within the interior*, the only region
   WESS may reweight. The honest headline number.
 - `wess_tilt` — the same over the whole mask, kept for comparability with the
@@ -211,11 +225,17 @@ loads B1's `best.pt`, taps the sub-bands and asks whether `E` points at geometry
 before any GPU time is spent training on it. It answered yes: ρ(E, GT curvature)
 median **+0.46** (mean +0.43), positive in **98.6%** of scenes and above +0.2 in
 90.0%, and consistent across both sources (hdlong +0.44, PolarPS +0.47, medians).
-B1's MAE on WESS-drawn pixels is **+0.79°** above its MAE on uniform-drawn pixels
+B1's MAE on WESS-drawn pixels is +0.79° above its MAE on uniform-drawn pixels
 at τ=1 — that is the **median**; the mean is +1.05° — and it is higher in 79.6%
 of scenes, i.e. the sampler does find pixels the model currently gets wrong. Across
 scenes ρ(that gain, interior curvature tilt) = **+0.39**, the strongest coupling in
 the probe.
+
+**Quote the gain net of the peakedness offset: ≈ +0.63° median / +0.89° mean.**
+The shuffled-energy control (below) showed that a draw this peaked costs
++0.16° — 15–20% of the raw figure — *whatever* it is peaked on, so the raw
++0.79°/+1.05° over-states what alignment with geometry buys. The geometric
+metrics need no such correction; they collapse to their nulls exactly.
 
 **Every headline figure above is a median unless stated.** Per-scene correlations
 are bounded and skewed, so the median is the honest summary, but quote it
@@ -253,25 +273,59 @@ report Phase 0 as exploration that came out favourable, not as a decision
 procedure that passed — a reviewer who is told otherwise and then reads the
 commit history will discount everything else in the chapter.
 
-**Falsification control (`--shuffle_energy`).** The one check that closes the
-gap: permute the 64×64 energy map, leaving its value multiset untouched but
-destroying its alignment with the surface, and re-run. ρ(E, curvature),
-ρ(E, |∇I| | curvature), both curvature tilts and the MAE gain must collapse to
-their nulls (0, 0, 1.0, 1.0, 0°) and the rim share must fall back to the uniform
-draw's ~0.085. At n = 431 the null standard error is ~0.005 on ρ and ~0.03 on the
-tilts, so read the control on the **full split** — per-scene nulls have a sd of
-~0.29 on tilt and a ten-scene run says nothing.
+**Falsification control (`--shuffle_energy`) — run 2026-09-07, n = 431.**
+Permuting the 64×64 energy map leaves its value multiset untouched and destroys
+its alignment with the surface, so every geometric metric must collapse to its
+null. Pass bands were written down *before* the run (this one was pre-registered,
+unlike Phase 0 itself). Result: **six of seven pass at τ=1, seven of seven at
+τ=2.**
 
-`wess_ess` is **not** a null target and will *fall* sharply under the control
-(~0.11 → ~0.008 in a simulation of the chain). `wess_probabilities` upsamples
-before it standardizes, and bilinear interpolation of a decorrelated field
-shrinks σ, so standardizing re-amplifies the surviving outliers and the softmax
-comes out *more* peaked. That is an artefact of permuting a normally-smooth
-field, not a signal. Records from a control run carry `"shuffled": true`.
+| Field | τ=1 mean | τ=2 mean | Null ± band | |
+|---|---|---|---|---|
+| `rho_E_curvature` | −0.0076 | — | 0 ±0.02 | PASS |
+| `rho_E_imgrad_given_curvature` | −0.0013 | — | 0 ±0.02 | PASS |
+| `curv_tilt` | 1.0019 | 1.0026 | 1 ±0.05 | PASS |
+| `curv_tilt_interior` | 1.0007 | 1.0003 | 1 ±0.05 | PASS |
+| `curv_top10_frac` | 0.1004 | 0.1005 | 0.10 ±0.02 | PASS |
+| `interior_frac` − uniform | −0.0011 | −0.0010 | 0 ±0.03 | PASS |
+| `mae_delta_vs_uniform_deg` | **+0.162 ± 0.037** | +0.059 ± 0.025 | 0 ±0.15 | **FAIL** / pass |
 
-The other free check needs no new code: **`--lam 1.0` must print `ESS 1.000`**
-and reproduce the uniform row exactly, since the mixture collapses to Model A's
-sampler.
+ρ(E, curvature) goes +0.43 → −0.008 and the interior tilt → 1.0007, so the
+*geometric* premise is not a distributional artifact. The **MAE gain is not
+fully killed**: +0.162° survives at τ=1, 4.4 SE from zero.
+
+It is not leaked signal — ρ(real gain, shuffled gain) = −0.047, so scene-for-scene
+the residual is unrelated to where the real gain came from, and subtracting it as
+an offset is defensible. It tracks **peakedness**, not geometry: ESS 0.100 →
+residual +0.162°, ESS 0.614 → +0.059°. The likely mechanism is that `Regressor`'s
+spatial-axis communication transformer attends across pixels *within the sample
+set*, so a clustered draw hands the decoder a degenerate spatial context and
+predictions degrade wherever the clusters land — a cost any peaked sampler pays,
+independent of correctness. **This is a hypothesis consistent with two τ points,
+not an isolated mechanism**; it deserves its own control (fixed sample count,
+clustered-but-uniform-energy draw) before the thesis asserts it.
+
+**Integrity gate.** `uniform_sample` runs before the shuffle consumes the
+generator, so the control's uniform arm must be bit-identical to the real run's.
+It was, on all 431 scenes (max |ΔMAE| = 0, max |Δtilt| = 0). Check this first on
+any re-run; without it nothing downstream is comparable.
+
+`wess_ess` is **not** a null target and *falls* under the control: **0.231 →
+0.100** at τ=1 (measured, n=431; 0.715 → 0.614 at τ=2). `wess_probabilities`
+upsamples before it standardizes, and bilinear interpolation of a decorrelated
+field shrinks σ, so standardizing re-amplifies the surviving outliers. That is an
+artefact of permuting a normally-smooth field, not a signal. (An earlier draft
+predicted ~0.11 → ~0.008 from a stdlib simulation — right direction, wrong by
+~12×. The simulation's σ-shrinkage is far weaker on real energy maps. Corrected
+2026-09-07.) Records from a control run carry `"shuffled": true`.
+
+The other free check needs no new code: **`--lam 1.0` must print `ESS 1.000`**,
+since the mixture collapses to Model A's sampler. **Run 2026-09-07, n = 20:
+passed** — `wess_ess` = 1.000000 in 20/20 scenes (max deviation 2e-6, float
+noise), `wess_tilt` 1.009 (inert), `mae_delta` +0.051 ± 0.078 (consistent with
+zero), and the correlations reproduce the original run bit-exactly. Re-run it
+after any edit to `wess_probabilities`; it is the cheapest guard on the mixture
+algebra.
 
 **Probe:** `python -u sdm_unips/wess_probe.py --checkpoint <B1>/checkpoints/best.pt
 <same --hdlong_dir/--polarps_dir/--scene_manifest as the run> --num_scenes 0
