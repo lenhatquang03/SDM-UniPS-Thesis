@@ -367,6 +367,19 @@ def build_parser():
     g.add_argument('--erode', type=int, default=9,
                    help='Mask erosion (px) for the correlation statistics. The '
                         'silhouette is a spurious edge in both references.')
+    g.add_argument('--shipped_sampler', action='store_true',
+                   help='Draw with `wess_sample_train` -- the sampler B2 '
+                        'actually trains with, which excludes the silhouette '
+                        'ring from the reweighting -- instead of the Phase-0 '
+                        '`wess_sample`. REQUIRED for any run whose purpose is '
+                        'to choose --wess_tau or --wess_lam: the two are '
+                        'different distributions, and the rim carries 14-59% '
+                        'of the Phase-0 draw. Adds wess_tilt_int and '
+                        'wess_interior_frac to each record.')
+    g.add_argument('--erode_cells', type=int, default=wess.DEFAULT_ERODE_CELLS,
+                   help='Silhouette ring width excluded by --shipped_sampler, '
+                        'in 64x64 energy-grid cells. Must match the value the '
+                        'B2 run will pass as --wess_erode_cells.')
     g.add_argument('--shuffle_energy', action='store_true',
                    help='FALSIFICATION CONTROL. Randomly permute the energy '
                         'map before it is used, so it keeps its value '
@@ -429,9 +442,22 @@ def probe_scene(net, batch, args, device, gen):
         primary = shuffle_map(primary, gen)
     draws = []
     for tau in args.tau:
-        ids, stats = wess.wess_sample(primary, valid_ids, H, H,
-                                      int(args.pixel_samples),
-                                      tau=tau, lam=args.lam, generator=gen)
+        if args.shipped_sampler:
+            # `wess_sample_train` is what `Net.sample_train_pixels` actually
+            # calls: the rim is excluded from E's statistics and from the
+            # softmax, and keeps only its uniform share of the draw. It is a
+            # different distribution from `wess_sample`, not a variant of it --
+            # removing the rim removes what was inflating e.std(), so interior
+            # z-scores stop being squashed and the same tau comes out peakier.
+            # A tau chosen against `wess_sample` therefore does not transfer.
+            ids, stats = wess.wess_sample_train(
+                primary, M[0, 0], valid_ids, H, H, int(args.pixel_samples),
+                tau=tau, lam=args.lam,
+                erode_cells=args.erode_cells, generator=gen)
+        else:
+            ids, stats = wess.wess_sample(primary, valid_ids, H, H,
+                                          int(args.pixel_samples),
+                                          tau=tau, lam=args.lam, generator=gen)
         with torch.no_grad():
             pred_w, idx_w, _ = net(I, M, n_imgs.to(device),
                                    decoder_resolution=dec_res,
@@ -599,7 +625,8 @@ def main():
             kind, scene_dir = eval_set.scenes[i % eval_set.n_scenes]
             rec = {'index': i, 'kind': kind,
                    'scene': os.path.basename(scene_dir.rstrip('/')),
-                   'shuffled': bool(args.shuffle_energy), **stats}
+                   'shuffled': bool(args.shuffle_energy),
+               'shipped_sampler': bool(args.shipped_sampler), **stats}
             records.append(rec)
             fh.write(json.dumps(rec) + '\n')
             fh.flush()
