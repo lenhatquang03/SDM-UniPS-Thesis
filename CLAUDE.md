@@ -921,6 +921,16 @@ aborts on a change.
   each epoch boundary (**off by default**) — `--hf_repo`
   (`culacgiontan0312/UniPS`), `--hf_repo_type` (`dataset`),
   `--hf_backup_every` (1). See **Off-box backup** below
+- `--config FILE.yaml`: read arguments from a flat YAML mapping (argument
+  name → value; lists for `--hdlong_dir` / `--polarps_dir`, `true`/`false` for
+  flags). Each entry is expanded into the flag it stands for, so it gets the
+  same type and `choices` checks; anything also given on the command line wins.
+  An unknown key is an error — including `scene_pool_fingerprint`, which
+  `config.json` records but is not an argument — and a flag set `true` in the
+  file cannot be turned off from the command line. `config.json` and every
+  checkpoint store the resolved values, so `--resume` is unaffected by how the
+  arguments arrived. `sdm_unips/configs/modelB2_wess.yaml` is B2's launch
+  config. Needs PyYAML
 - `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
 
 The final test evaluation runs automatically after the last epoch on the

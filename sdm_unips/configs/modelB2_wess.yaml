@@ -1,0 +1,106 @@
+# Model B2 (WESS) launch config -- branch modelC-wess.
+#
+#   PYTHONUNBUFFERED=1 nohup python -u sdm_unips/train.py \
+#       --config sdm_unips/configs/modelB2_wess.yaml \
+#       > /workspace/runs/modelB2_wess.log 2>&1 &
+#
+# Every value is Model B1's config.json except session_name, scene_manifest and
+# the wess_* block, so B1 and B2 differ in the sampler only. Values equal to
+# train.py's current defaults are still written out, so a later change of
+# default cannot alter this run. The command line overrides this file.
+#
+# CHECK before launching:
+#   * hdlong_dir / polarps_dir -- where step 3 extracted the data on this box.
+#     Keep hdlong-complexv1 BEFORE MerlMix: root order is part of the split.
+#   * scene_manifest -- the uploaded manifest; startup must print
+#     fingerprint=dca709407e0adb11.
+
+# I/O and scene pool
+session_name: /workspace/runs/modelB2_wess
+hdlong_dir:
+  - /workspace/data/mnt/8TData/Datasets/UniPS/hdlong-complexv1
+  - /workspace/data/mnt/8TData/Datasets/UniPS/MerlMix
+polarps_dir:
+  - /workspace/data/mnt/8TData/Datasets/UniPS/PolarPS
+train_dir: null
+scene_manifest: /workspace/runs/scene_manifest.json
+log_dir: null
+checkpoint_dir: null
+seed: 42
+max_scenes: 0
+k_per_scene: 10
+strict_scenes: false
+max_bad_scene_frac: 0.05
+
+# Splits and evaluation
+val_fraction: 0.1
+test_fraction: 0.1
+test_trials: 5
+val_every_epochs: 1
+
+# WESS sampler -- the only intended difference from B1
+wess_tau: 1.0
+wess_lam: 0.25
+wess_erode_cells: 2
+wess_top_k: 2
+
+# Resolution and batch (effective batch = batch_size x accum_steps = 8)
+train_resolution: 512
+canonical_resolution: 256
+batch_size: 2
+accum_steps: 4
+pixel_samples: 2048
+
+# Optimisation and LR schedule
+epochs: 84
+lr: 0.0001
+weight_decay: 0.05
+lr_schedule: wsd
+warmup_epochs: 3.0
+min_lr_ratio: 0.01
+decay_fraction: 0.2381
+decay_from_step: 27648
+decay_now: false
+lr_decay_every: 10
+lr_decay_gamma: 0.8
+auto_decay: false
+auto_decay_rel: 0.01
+auto_decay_patience: 2
+auto_decay_min_epoch: 8
+patience: 0
+min_delta: 0.0
+grad_clip: 1.0
+amp: false
+amp_dtype: bf16
+
+# Non-finite gradient guards
+max_consecutive_skips: 20
+max_skip_rate: 0.3
+skip_rate_window: 200
+detect_anomaly: false
+
+# Loader and memory
+num_workers: 8
+prefetch_factor: 2
+max_vram_gib: 30.0
+log_memory: false
+
+# Logging, checkpoints, resume
+log_every: 10
+ckpt_every: 1000
+keep_last: 5
+keep_last_steps: 2
+resume: auto
+pretrained: null
+allow_config_change: false
+
+# Off-box backup (uploads to <hf_repo>/sdm-ckpt/modelB2_wess/)
+hf_backup: true
+hf_backup_every: 5
+hf_repo: culacgiontan0312/UniPS
+hf_repo_type: dataset
+
+# Smoke test (inactive while smoke_test is false)
+smoke_test: false
+smoke_epochs: 10
+smoke_max_scenes: 0

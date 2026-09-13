@@ -16,3 +16,6 @@ opencv-python>=4.7
 
 # Transformer attention (used by modules/model/transformer.py)
 einops>=0.6
+
+# YAML argument files (train.py --config); imported only when --config is given
+pyyaml>=5.1

@@ -207,10 +207,124 @@ def _host_rss_gib() -> float:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+class ConfigArgumentParser(argparse.ArgumentParser):
+    """`ArgumentParser` that can also read its arguments from `--config FILE`.
+
+    The file is a flat YAML mapping of argument names -- the `dest` spelling,
+    e.g. `wess_tau` -- to values. Each entry is turned into the command-line
+    tokens it stands for and placed BEFORE the real command line, so:
+
+    * the command line wins over the file (argparse keeps the last value);
+    * every value goes through the same `type` conversion and `choices` check
+      as a typed flag, so the file cannot pass anything the command line would
+      have rejected (and YAML's `1e-4`, which it reads as a string, still
+      becomes a float).
+
+    Rejected rather than guessed: a key that is not an argument (a typo would
+    otherwise be ignored in silence -- this includes `scene_pool_fingerprint`,
+    which `config.json` records but nothing parses), `true`/`false` for a
+    non-flag argument (YAML reads unquoted yes/no/on/off as booleans), a
+    non-boolean for a flag, a list for a single-valued argument, `null` for an
+    argument whose default is not None, and a nested `config`. A flag set to
+    `true` in the file cannot be switched off from the command line.
+
+    `args.config` keeps the path; `config.json` and every checkpoint store the
+    resolved values, so `--resume` compares like with like however the
+    arguments arrived.
+    """
+
+    def parse_known_args(self, args=None, namespace=None):
+        args = list(sys.argv[1:] if args is None else args)
+        # A throwaway parser finds --config (abbreviations and --config=PATH
+        # included, exactly as the real parser would read them) without
+        # tripping over every other argument.
+        pre = argparse.ArgumentParser(add_help=False)
+        pre.add_argument('--config', action='append', default=[])
+        found, _ = pre.parse_known_args(args)
+        if len(found.config) > 1:
+            self.error('--config may be given only once')
+        if found.config:
+            args = self._config_to_argv(found.config[0]) + args
+        return super().parse_known_args(args, namespace)
+
+    def _config_to_argv(self, path):
+        try:
+            import yaml
+        except ImportError:
+            self.error('--config needs PyYAML (pip install pyyaml)')
+        try:
+            with open(path) as fh:
+                cfg = yaml.safe_load(fh)
+        except (OSError, yaml.YAMLError) as exc:
+            # PyYAML's messages span several lines; keep the error on one.
+            self.error(f'--config {path}: {" ".join(str(exc).split())}')
+        if cfg is None:
+            return []
+        if not isinstance(cfg, dict):
+            self.error(f'--config {path}: expected a mapping of argument names '
+                       f'to values, got {type(cfg).__name__}')
+
+        actions = {a.dest: a for a in self._actions
+                   if a.option_strings and a.dest not in ('help', 'config')}
+        argv = []
+        for key, value in cfg.items():
+            where = f'--config {path}: {key!r}'
+            if key == 'config':
+                self.error(f'{where}: a config file cannot name another one')
+            action = actions.get(key)
+            if action is None:
+                import difflib
+                near = difflib.get_close_matches(str(key), list(actions), n=1)
+                hint = f' (did you mean {near[0]!r}?)' if near else ''
+                self.error(f'{where} is not an argument of this script{hint}')
+            flag = max(action.option_strings, key=len)
+
+            if isinstance(action, argparse._StoreTrueAction):
+                if not isinstance(value, bool):
+                    self.error(f'{where} is a flag: use true or false, got {value!r}')
+                if value:
+                    argv.append(flag)
+                continue
+            if action.nargs == 0:
+                self.error(f'{where}: this kind of flag is not supported in a config file')
+            if value is None:
+                if action.default is not None:
+                    self.error(f'{where}: null does not restore the default '
+                               f'{action.default!r} -- omit the key instead')
+                continue
+
+            many = action.nargs in ('+', '*')
+            if isinstance(value, list) and not many:
+                self.error(f'{where} takes one value, got a list')
+            values = value if isinstance(value, list) else [value]
+            for v in values:
+                if isinstance(v, bool):
+                    self.error(f'{where}: got {v!r}, but this is not a flag -- YAML '
+                               f'reads unquoted yes/no/on/off as booleans; quote it')
+                if v is None or isinstance(v, (dict, list)):
+                    self.error(f'{where}: unsupported value {v!r}')
+            if many:
+                if not values and action.nargs == '+':
+                    self.error(f'{where}: expected at least one value')
+                argv.append(flag)
+                argv.extend(str(v) for v in values)
+            else:
+                # --flag=VALUE, so a value that starts with '-' is not mistaken
+                # for an option.
+                argv.append(f'{flag}={value}')
+        return argv
+
+
 def build_argparser():
-    p = argparse.ArgumentParser()
+    p = ConfigArgumentParser()
 
     # I/O ----------------------------------------------------------------
+    p.add_argument('--config', default=None,
+                   help='YAML file of arguments: a flat mapping of argument '
+                        'name to value (e.g. `wess_tau: 1.0`, lists for '
+                        '--hdlong_dir / --polarps_dir, true/false for flags). '
+                        'Anything also given on the command line overrides '
+                        'the file.')
     p.add_argument('--session_name', default='train_run')
     p.add_argument('--hdlong_dir', nargs='+', default=None,
                    help='One or more roots of hdlong-structured data (scenes '
