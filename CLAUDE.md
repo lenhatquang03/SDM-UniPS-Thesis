@@ -1455,7 +1455,15 @@ numbers produced after it. Re-run the full ablation rather than mixing the two.
 
 ## Environment
 
-- Python 3.11, PyTorch 2.0, CUDA 11.8
-- Dependencies pinned in `requirements.txt` (`torch`, `numpy`, `opencv-python`, `einops`).
-- Tested on NVIDIA RTX A6000 (48 GB VRAM); CPU fallback supported for inference. Training expects a CUDA GPU.
+- Python 3.11. PyTorch >= 2.7 built for CUDA >= 12.8 (install torch from
+  `https://download.pytorch.org/whl/cu128` first) — required by the RTX 5090
+  that trains Model B2. Upstream used PyTorch 2.0 / CUDA 11.8.
+- Dependencies in `requirements.txt` (`torch`, `numpy`, `opencv-python`, `einops`, `pyyaml`).
+- GPUs: Models A and B1 trained on RTX 4090s, Model B2 on an RTX 5090;
+  upstream was tested on an RTX A6000 (48 GB). CPU fallback supported for
+  inference. Training expects a CUDA GPU. A/B1 and B2 therefore differ in GPU
+  and PyTorch as well as sampler: compare by epoch/step, not `elapsed_sec`.
+- PyTorch >= 2.6 loads with `weights_only=True` by default. The trainer passes
+  `weights_only=False`; `probes/wess/wess_probe.py` does not, so point its
+  `--checkpoint` at `normal/normal.pytmodel`, not `best.pt`.
 - Platforms: Ubuntu 20.04.5 (WSL2) and Windows 11

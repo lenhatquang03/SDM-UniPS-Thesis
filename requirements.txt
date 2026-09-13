@@ -1,12 +1,18 @@
 # SDM-UniPS dependencies (inference + training).
-# Tested with Python 3.11. The author's published configuration uses
-# PyTorch 2.0 with CUDA 11.8 — pin accordingly when reproducing.
+# Tested with Python 3.11. Training runs on an RTX 5090 (Blackwell), which needs
+# PyTorch >= 2.7 built against CUDA >= 12.8 -- older wheels have no kernels for
+# it and fail with "no kernel image is available for execution on the device".
+# (The upstream release used PyTorch 2.0 with CUDA 11.8.)
+#
+# Install PyTorch from the CUDA 12.8 index first, then the rest:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
 
 # Core deep learning
-torch>=2.0,<2.4
+torch>=2.7
 # Pull torchvision in only if you also use the standard pretrained backbones;
 # none of the SDM-UniPS modules import it. Uncomment if you add it later.
-# torchvision>=0.15,<0.19
+# torchvision>=0.22
 
 # Numerical
 numpy>=1.23,<2.0
