@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# chunk_and_upload_HG_data.sh
+# step2_chunk_and_upload_HG_data.sh
 # Carve oversized archives into <50GiB parts and upload each to a HF dataset repo,
 # one part at a time so peak disk usage stays at one chunk.
 #
 # LAYOUT: parts are stored under a subdirectory chosen by filename prefix
 # (see subdir_for), alongside a <base>.sha256 sidecar holding the whole-file hash
-# of the ORIGINAL archive. download_and_extract_HG_data.sh consumes both.
+# of the ORIGINAL archive. step3_download_and_extract_HG_data.sh consumes both.
 #
 # RESUME: safe to re-run. Parts already on the Hub are skipped after their SHA-256
 # is matched against the Hub's, falling back to a size-only check when no local

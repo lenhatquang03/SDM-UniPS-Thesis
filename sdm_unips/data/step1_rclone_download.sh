@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# RUNNING COMMANDS: nohup ./rclone_download.sh >> rclone.log 2>&1 & 
+# RUNNING COMMANDS: nohup ./step1_rclone_download.sh >> rclone.log 2>&1 & 
 
 # GLOBAL VARS
 SRC_DIR="thesis_data:DataThesis/zipped"

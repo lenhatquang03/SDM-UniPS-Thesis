@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# extract_and_cleanup.sh
+# step1_5_extract_and_cleanup.sh
 # Extract zip archives one at a time, deleting each only after its extraction is
 # verified. Sequential by design: peak disk is ONE archive plus its output, not
 # the sum of all of them.
 #
 # USAGE
-#   ./extract_and_cleanup.sh <dest_dir> <archive.zip> [archive.zip ...]
+#   bash step1_5_extract_and_cleanup.sh <dest_dir> <archive.zip> [archive.zip ...]
 #
 # TOGGLES
 #   SKIP_TEST=1  skip the CRC pre-check (saves one full read per archive)

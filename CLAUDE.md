@@ -119,12 +119,26 @@ that contribute almost no gradient.
 
 **The tap is a forward pre-hook, not a model edit.** It sits on
 `stages[0][0].dwconv.wavelet_convs[0]`, whose input is exactly the raw
-`bands.reshape(n, 4C, h, w)` — the pure Haar coefficients, before any learned
-parameter. `WTConv2d.tap_subbands` cannot supply that: it stores the *filtered*
+`bands.reshape(n, 4C, h, w)` — the Haar coefficients of the **stem output**,
+before any WTConv parameter. `WTConv2d.tap_subbands` cannot supply that: it stores the *filtered*
 bands (scaled by a trainable gain that drifts during training) and is
 last-writer-wins across all 12 blocks, so after a forward it holds stage 3's
 4×4 bands. The hook adds no parameters and no buffers, so B1's `best.pt` loads
 here under the exact-match guard and `--pretrained` warm-starts cleanly.
+
+**The energy map is not stationary (corrected 2026-09-13).** An earlier draft
+called the tapped tensor "the pure Haar coefficients, before any learned
+parameter". It is `DWT(LayerNorm(Conv2d 4×4 stride 4 (tile)))`, and the stem
+conv and its LayerNorm are trainable (6,432 parameters): the raw bands have one
+learned layer upstream, the filtered bands three — fewer, not zero. A scene's
+sampling distribution therefore changes on every optimizer step, and again every
+epoch because the scene is re-rendered (new K images, Dirichlet mix, flips,
+normalization scale). Standardizing cancels a *uniform* rescale of `E`, not a
+change in *which* pixels respond most. Two consequences: every Phase-0/0b number
+below was measured on **B1's trained stem**, which a from-scratch B2 does not
+have in its early epochs; and the sampler can drift toward uniform during
+training with no error raised, so read `wess_ess` and `wess_tilt_int` across
+epochs, not only at launch.
 
 The energy is captured on the **tile** path (`x_grid`, K·N maps), never the
 resized one: `x_resized` is a bilinear downsample, i.e. a low-pass filter that
@@ -157,10 +171,14 @@ attributable to interior reallocation alone**
 the draw is `torch.multinomial(..., replacement=False)`, whose marginal
 inclusion probabilities are not proportional to `p` when `p` is peaked. High-`p`
 interior pixels saturate and the leftover budget spills onto low-`p` pixels,
-the rim included. Measured rim share of the draw against the `n_rim/n_valid`
-the design promises (τ=3, where `p` is nearly flat, reads it directly at
-33.4%): **35.7% at τ=1 (+2.3 pp), 42.6% at τ=0.5 (+9.2 pp)**. At the launch
-setting the guarantee holds to about two points, which is small enough to keep
+the rim included. Measured against the `n_rim/n_valid` the design promises
+(τ=3, where `p` is nearly flat, reads it directly), the **per-scene excess rim
+share is +1.3 pp mean / +0.9 pp median at τ=1, and +7.4 / +5.8 pp at τ=0.5**
+(n=431). The rim share itself reads 37.9 / 39.2 / 45.2% (mean) and
+33.4 / 35.7 / 42.6% (median) at τ=3 / 1 / 0.5. (An earlier draft quoted
+"+2.3 pp / +9.2 pp", a difference of medians rather than the per-scene excess;
+corrected 2026-09-13.) At the launch
+setting the guarantee holds to about one point, which is small enough to keep
 the attribution argument; below τ=1 it degrades fast and the argument weakens — a win cannot be explained away
 as "B2 just trained harder on the boundary, where GT normals sit at grazing
 angles and the mask edge is antialiased". `--wess_erode_cells` (2, in 64²
@@ -169,8 +187,10 @@ because that is the resolution at which the ring is defined. **The band is
 `1 + erode_cells` cells wide, not `erode_cells`** — `interior_mask` first drops
 every cell that straddles the boundary, then erodes — so the default is
 **24 px at R=512, not the ~16 px an earlier draft claimed** (corrected
-2026-09-09). Measured consequence: 39% of masked pixels fall in that band and
-are excluded from the reweighting, so WESS operates on 61% of the object.
+2026-09-09). Measured consequence: the band holds 38% of masked pixels on
+average (median 33%), so WESS operates on 62% of the object (median 67%). (An
+earlier draft's "39% / 61%" matches the τ=1 *draw* share, 39.2%, not the band
+itself; corrected 2026-09-13.)
 
 Order of operations inside the interior is fixed and was settled before
 implementation: **upsample → gather at the mask → standardize → softmax → mix
@@ -182,7 +202,7 @@ puts τ in units of σ.
 
 **`--wess_lam` is a mixture weight, not a second draw.** The proposal split the
 budget into 512 uniform + 1536 saliency-drawn, which needs bookkeeping to keep
-the two disjoint. The mixture has the same expected count per pixel, takes one
+the two disjoint. The mixture takes one
 `multinomial`, and converts the support argument from asymptotic into a hard
 guarantee: every masked pixel keeps `p ≥ lam/n_valid` however peaked the
 softmax gets. The sampler changes the *rate* at which a pixel is supervised,
@@ -191,6 +211,20 @@ reporting `E_uniform` defensible. **`--wess_lam 1` (or a large `--wess_tau`)
 recovers Model A's uniform draw exactly**, on the rim and in the interior
 alike; that is a free correctness check, and worth running for a few hundred
 steps before the real launch.
+
+**The shipped sampler does not reproduce the 512 / 1536 split (corrected
+2026-09-13).** An earlier draft said the mixture "has the same expected count
+per pixel" as that split. That holds for the Phase-0 `wess_sample`, where λ
+mixes over the whole mask, but not for `wess_sample_train`, where λ acts
+**inside the interior only** and the rim is uniform on top of it. Expected
+counts per 2048 at `--wess_erode_cells 2` (interior share 0.621, mean of n=431):
+**776 rim uniform + 318 interior uniform + 954 energy-directed (46.6%)**, against
+the proposal's 1536 (75%). 75% is unreachable while the rim keeps Model A's
+rate: the energy-directed share cannot exceed the interior share (~62%, at
+λ=0) without taking budget from the rim, which re-introduces the confound the
+exclusion removes, or narrowing the band, which lets rim energy leak back in.
+The `DEFAULT_LAM` comment in `wess.py` and the `--wess_lam` help in `train.py`
+still describe the old equivalence.
 
 **The A/B fairness contract is untouched.** The tap is armed only when
 `training=True and sample_ids is None`. Evaluation always supplies `sample_ids`
@@ -208,8 +242,15 @@ code that averages `loss` — no new plumbing:
   pixels and the per-step gradient is high-variance; near 1.0 the sampler is
   inert. **Measured on the shipped sampler (2026-09-09, n=431): 0.109 at τ=0.5,
   0.388 at τ=1, 0.665 at τ=1.5, 0.821 at τ=2, 0.935 at τ=3.** At the launch
-  setting τ=1 expect ~0.39; `wess_ess < 0.1` in the first hundred steps means
-  something is wrong, not merely aggressive.
+  setting τ=1 expect ~0.39 **on B1's trained stem**; `wess_ess < 0.1` is worth
+  investigating before continuing. Caveat (2026-09-13): these figures come from
+  `wess_probe.py`, which runs the same sampling code on different inputs —
+  held-out renders divided by the **max**, never flipped, through B1's weights.
+  Training divides each image by **U[mean, max]** while the mask channel is not
+  divided, so the RGB-to-mask balance entering the stem shifts and
+  standardization does not undo it; it also flips, and a from-scratch run starts
+  from a random stem. The first steps of a from-scratch B2 are not the condition
+  0.39 was measured under.
 
   (An earlier draft predicted the shipped sampler would read *lower* than
   Phase 0's 0.21 at τ=1, reasoning that excluding the rim removes what was
@@ -242,7 +283,9 @@ code that averages `loss` — no new plumbing:
   two measure different regions and the ~0.90 figure an earlier draft quoted was
   incommensurable (corrected 2026-09-09). The value to compare against is
   `n_int / n_valid` for the same erosion, which a uniform draw would also
-  produce: measured 0.666 at τ=3 (nearly uniform p). A drift below ~0.60 at τ=1
+  produce: 0.621 at τ=3 (nearly uniform p) and **0.608 at τ=1** — both means,
+  which is what the epoch summary averages. (An earlier draft quoted 0.666, the
+  τ=3 *median*; corrected 2026-09-13.) A drift below ~0.60 at τ=1
   means the erosion is not doing what it claims.
 - `wess_top10_frac` — share of the draw in the mask's top energy decile
   (uniform reads 0.10).
@@ -258,10 +301,13 @@ of scenes, i.e. the sampler does find pixels the model currently gets wrong. Acr
 scenes ρ(that gain, interior curvature tilt) = **+0.39**, the strongest coupling in
 the probe.
 
-**Quote the gain net of the peakedness offset: ≈ +0.63° median / +0.89° mean.**
-The shuffled-energy control (below) showed that a draw this peaked costs
-+0.16° — 15–20% of the raw figure — *whatever* it is peaked on, so the raw
-+0.79°/+1.05° over-states what alignment with geometry buys. The geometric
+**Quote the gain net of the peakedness offset: ≈ +0.63° median / +0.89° mean,
+as lower bounds.** The shuffled-energy control (below) showed that a clustered
+draw costs +0.16° *whatever* it is clustered on, so the raw +0.79°/+1.05°
+over-states what alignment with geometry buys. But the control's draw is more
+concentrated than the real one at the same τ (ESS 0.100 vs 0.231), so +0.16°
+over-states the offset the real draw pays and the net figures under-state the
+gain (corrected 2026-09-13; see **τ selection**). The geometric
 metrics need no such correction; they collapse to their nulls exactly.
 
 **Every headline figure above is a median unless stated.** Per-scene correlations
@@ -380,20 +426,33 @@ fallback and draws uniformly; that is by design, and it reads ESS exactly 1.0.
 **The rule was degenerate and the answer is only corroborated, not produced, by
 it.** Net gain falls monotonically in τ, so "maximise net gain" always lands on
 the smallest τ clearing the ESS floor — the floor decided, and 0.25 was a
-judgment call, not a derived quantity. An independent check does land on the
-same τ: the artifact share of the gain (null ÷ net) reads 44.5% at τ=0.5 then
-18.2 / 17.5 / 14.1 / 2.6% at τ=1…3, so τ=0.5 is disqualified for spending nearly
-half its apparent gain on clustering while τ ≥ 1 sits on a flat plateau where
-the largest net gain wins. That check was run *after* seeing the grid; treat it
-as corroboration, and report the ESS floor as the operative criterion.
+judgment call, not a derived quantity. An earlier draft cited a post-hoc
+corroboration — artifact share (null ÷ net) of 44.5% at τ=0.5 against
+18.2 / 17.5 / 14.1 / 2.6% at τ=1…3, "τ=0.5 spends nearly half its gain on
+clustering" — and **it does not survive (corrected 2026-09-13).** The null arm
+is matched in τ, not in concentration: the shuffled draw is peakier at every τ
+(ESS 0.026 / 0.162 / 0.474 / 0.722 / 0.910 against the real 0.109 / 0.388 /
+0.665 / 0.821 / 0.935), because permuting a smooth map and then upsampling
+shrinks σ. Interpolating the null linearly in ESS to the real arm's
+concentration gives artifact shares of **22.2 / 12.3 / 11.0 / 7.0%** at
+τ=0.5 / 1 / 1.5 / 2 (τ=3 lies outside the null's range) and a net gain of
+**+0.486°** at τ=1. The interpolation is post hoc and assumes the clustering
+cost depends on ESS alone. It leaves the selection unchanged — net gain still
+falls monotonically in τ and τ=0.5 still fails the floor — but τ=0.5 is no
+longer set apart by its artifact share. Report the ESS floor as the sole
+operative criterion, and the τ-matched net gains in the table as conservative.
 
 **What the shipped sampler actually does at τ=1**, in data terms rather than
-metric names: of 2048 pixels, ~36% land in the 24 px silhouette band at close to
-Model A's rate, and the remaining ~64% are reallocated within the interior
-toward high-energy cells — those interior pixels carry **1.20× the median GT
-curvature** of the mask (mean 1.37; higher than uniform in 90.3% of scenes) and
-B1's error on the whole draw is **+0.46 ± 0.06° above its error on a uniform
-draw** once the clustering artifact is subtracted, in 72.4% of scenes. The
+metric names: of 2048 pixels, ~39% (mean; median 36%) land in the 24 px
+silhouette band at close to Model A's rate, and the remaining ~61% land in the
+interior — a quarter of which is still uniform in expectation (λ), so ~47% of
+the budget is energy-directed. The drawn interior pixels carry **1.20× the
+interior's mean GT curvature** (median scene; mean 1.37; above 1.0 in 90.3% of
+scenes, above the uniform draw's own tilt in 89.6%), and B1's error on the whole
+draw is **+0.46 ± 0.06° above its error on a uniform draw** once the τ-matched
+clustering artifact is subtracted (conservative, see above). The raw gain is
+positive in 72.4% of scenes; the net gain has no per-scene value, since the two
+arms are separate runs. The
 interior curvature tilt is unchanged from Phase 0's 1.197 — excluding the rim
 did not sharpen geometric targeting, it removed a confound from the measurement.
 

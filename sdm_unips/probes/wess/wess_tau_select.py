@@ -8,8 +8,10 @@ reports, per tau:
     net_gain = mae_delta(real) - mae_delta(shuffled)
 
 the MAE gap attributable to E's *alignment with geometry*, with the clustering
-artifact measured by the falsification control subtracted at the matched
-configuration. Selecting on raw `mae_delta` would reward peakedness itself: a
+artifact measured by the falsification control subtracted at the same tau. The
+arms are matched in tau, NOT in concentration: the shuffled draw is peakier
+(ESS 0.162 vs 0.388 at tau=1, n=431), so the null over-states the clustering
+cost the real draw pays and `net_gain` is a conservative figure. Selecting on raw `mae_delta` would reward peakedness itself: a
 draw at ESS 0.100 costs +0.162 deg on randomly-placed clusters carrying no
 geometric content at all (control of 2026-09-07, n=431).
 
@@ -96,8 +98,9 @@ def main():
 
     # The sampler gate. `wess_sample` (Phase-0) and `wess_sample_train`
     # (shipped) are different distributions: the shipped one excludes the
-    # silhouette ring from E's statistics and from the softmax, which removes
-    # what was inflating e.std() and makes the same tau peakier. A tau chosen
+    # silhouette ring from E's statistics and from the softmax, which makes the
+    # interior softmax peakier at the same tau while the uniform rim share makes
+    # the whole distribution flatter (ESS 0.231 -> 0.388 at tau=1). A tau chosen
     # against the probe path does not transfer to training, so refuse to name
     # one unless the run used --shipped_sampler.
     shipped = (all(r.get('shipped_sampler') for r in real)

@@ -225,7 +225,11 @@ class Net(nn.Module):
 
         A forward PRE-hook on `wavelet_convs[0]`, whose input is exactly the raw
         `bands.reshape(n, 4C, h, w)` of the level-0 DWT -- the `X^LH/X^HL/X^HH`
-        the method is defined on, before any learned parameter touches them.
+        the method is defined on, before any WTConv parameter touches them. The
+        Haar filters are fixed, but their input is the stem output (4x4
+        stride-4 conv + LayerNorm), which is trainable, so the captured bands --
+        and the sampling distribution built from them -- change as training
+        proceeds.
         `WTConv2d.tap_subbands` cannot supply this: it stores the *filtered*
         bands (scaled by a trainable gain that drifts during training) and is
         last-writer-wins across all 12 blocks.
@@ -331,8 +335,8 @@ class Net(nn.Module):
                             E=None, mask_hw=None, H=None, W=None):
         """Choose which `n_sample` pixels a TRAINING step decodes.
 
-        This is the pixel-sampling policy under study: the thesis' Models B/C
-        replace it while everything else stays fixed. It is therefore
+        This is the pixel-sampling policy under study: Model B2 (WESS)
+        replaces it while everything else stays fixed. It is therefore
         deliberately the *only* place a training sample set is chosen, and it is
         deliberately never reached during evaluation -- `forward` takes an
         explicit `sample_ids`, which the val/test path always supplies. Without
@@ -346,9 +350,12 @@ class Net(nn.Module):
         it is what runs whenever `E` is unavailable.
 
         Model B2 (WESS) = the same draw with the interior's share of the budget
-        reallocated by wavelet sub-band energy; see `wess.py`. The silhouette
-        band keeps Model A's rate exactly, so the two samplers differ only in
-        how they spend the *interior* budget.
+        reallocated by wavelet sub-band energy -- three quarters of it in
+        expectation at `wess_lam = 0.25`, ~47% of the whole draw; see `wess.py`.
+        The silhouette band keeps Model A's rate exactly in distribution, so
+        the two samplers differ only in how they spend the *interior* budget.
+        The without-replacement draw spills ~1 pp extra onto the rim at
+        tau=1 (+7 pp at tau=0.5).
         """
         if valid_ids.numel() == 0:
             # No valid pixels: emit a placeholder; loss masking discards them.

@@ -27,12 +27,15 @@ over held-out scenes, and reports, per scene:
   correlation out of nothing.
 
 * **`curv_tilt`** -- mean GT curvature over the WESS-drawn pixels divided by
-  mean curvature over the mask. This is the headline: it says, in one number,
-  whether the sampler aims at geometry. A uniform draw reads 1.0.
+  mean curvature over the mask. A uniform draw reads 1.0. The full-mask number
+  is inflated by the silhouette, where `np.gradient` of the normal field spikes
+  at the mask edge; **`curv_tilt_interior`** (same ratio, eroded interior only)
+  is the honest headline.
 
-* The three sampler diagnostics (`wess_tilt`, `wess_ess`, `wess_top10_frac`)
-  that will be logged per step during the B2 run, so `--tau` can be chosen here
-  rather than guessed there.
+* The sampler diagnostics logged per step during the B2 run (`wess_tilt`,
+  `wess_ess`, `wess_top10_frac`, plus `wess_tilt_int` and `wess_interior_frac`
+  under `--shipped_sampler`), so `--tau` can be chosen here rather than guessed
+  there.
 
 * **MAE of the B1 checkpoint on WESS-drawn pixels against uniform-drawn ones.**
   If the high-energy pixels are not measurably harder for the current model,
@@ -40,10 +43,11 @@ over held-out scenes, and reports, per scene:
   knowing before spending the GPU time.
 
 * **raw vs filtered bands** (`--band both`): the rank correlation between the
-  energy of the pure Haar coefficients and of the same bands after the level-0
+  energy of the raw Haar coefficients and of the same bands after the level-0
   depthwise conv and its trainable 0.1-initialised gain. If they rank pixels
   the same, the choice does not matter; if they diverge, `raw` is preferred
-  because it cannot drift as training proceeds.
+  because it drifts less: the Haar filters are fixed, but the stem upstream of
+  them is trainable, so raw has one learned layer upstream and filtered three.
 
 Scope: the mixed training pool (hdlong + PolarPS) at `--train_resolution`,
 which is where WESS actually operates and the only place the tile decomposition
@@ -216,9 +220,13 @@ def shuffle_map(E, generator):
     A positive result is only evidence if the *same pipeline* reads null on
     input that cannot carry the signal. Permuting `E` destroys its spatial
     correspondence with the surface while preserving its value multiset
-    **exactly**, so the softmax is as peaked as before and the draw is as
-    concentrated as before -- what changes is only *where* the concentrated
-    mass sits.
+    **exactly** on the 64x64 grid. That does NOT make the draw as concentrated
+    as the real one: the permuted map is upsampled before it is standardized,
+    and bilinear interpolation of a decorrelated field shrinks sigma, so the
+    shuffled draw comes out peakier. Measured on the shipped sampler (n=431):
+    ESS 0.162 vs 0.388 at tau=1, 0.026 vs 0.109 at tau=0.5. The MAE null is
+    therefore matched in tau, not in concentration, and subtracting it
+    over-states the clustering cost the real draw pays.
 
     Under the shuffle, `rho(E, curvature)`, `rho(E, |grad I| | curvature)`,
     both curvature tilts and the MAE gain must collapse to their nulls (0, 0,
@@ -235,7 +243,8 @@ def shuffle_map(E, generator):
     ESS 0.614 -> +0.059 deg), most likely because `Regressor`'s spatial-axis
     transformer attends across pixels within the sample set, so a clustered
     draw degrades the decoder's context wherever the clusters land. Subtract it
-    before quoting the gain.
+    before quoting the gain -- and quote the result as a lower bound, since the
+    shuffled draw is more concentrated than the real one (see above).
 
     `wess_ess` is **not** a null target here, and it will not stay put --
     measured, not assumed. `wess_probabilities` upsamples the 64x64 map to the
@@ -352,8 +361,11 @@ def build_parser():
                         'standardized over the mask first, which is what makes '
                         'the unit stable across scenes and across training).')
     g.add_argument('--lam', type=float, default=wess.DEFAULT_LAM,
-                   help='Uniform mixing weight. 0.25 reproduces the proposal\'s '
-                        '512-of-2048 base set; 1.0 recovers Model A exactly.')
+                   help='Uniform mixing weight. With `wess_sample`, 0.25 '
+                        'reproduces the proposal\'s 512-of-2048 base set; with '
+                        '--shipped_sampler it acts inside the interior only '
+                        '(~47 percent of the draw energy-directed at '
+                        '--erode_cells 2). 1.0 recovers Model A exactly.')
     g.add_argument('--band', default='both', choices=['raw', 'filtered', 'both'],
                    help='Raw Haar coefficients, the level-0 filtered bands, or '
                         'both (reports how differently they rank pixels).')
@@ -386,7 +398,8 @@ def build_parser():
                         'map before it is used, so it keeps its value '
                         'histogram but loses all alignment with the surface. '
                         'Every geometric metric must collapse to its null; '
-                        'wess_ess must not move. Records are tagged '
+                        'wess_ess is NOT a null and falls (the upsampled '
+                        'permuted map is peakier). Records are tagged '
                         '"shuffled": true so a control run cannot be mistaken '
                         'for a real one.')
     g.add_argument('--no_figures', action='store_true',
@@ -460,9 +473,11 @@ def probe_scene(net, batch, args, device, gen):
             # calls: the rim is excluded from E's statistics and from the
             # softmax, and keeps only its uniform share of the draw. It is a
             # different distribution from `wess_sample`, not a variant of it --
-            # removing the rim removes what was inflating e.std(), so interior
-            # z-scores stop being squashed and the same tau comes out peakier.
-            # A tau chosen against `wess_sample` therefore does not transfer.
+            # removing the rim from E's statistics un-squashes the interior
+            # z-scores, so the interior softmax is peakier at the same tau --
+            # but a third of the mass is pinned uniform on the rim, so the
+            # distribution as a whole is FLATTER (ESS 0.231 -> 0.388 at tau=1,
+            # measured). A tau chosen against `wess_sample` does not transfer.
             ids, stats = wess.wess_sample_train(
                 primary, M[0, 0], valid_ids, H, H, int(args.pixel_samples),
                 tau=tau, lam=args.lam,

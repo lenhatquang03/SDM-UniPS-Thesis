@@ -1,17 +1,18 @@
-"""Model C (WESS) -- Wavelet-Energy Saliency Sampling.
+"""Model B2 (WESS) -- Wavelet-Energy Saliency Sampling.
 
-The training pixel sampler under study. `Net.sample_train_pixels` draws its
-2048 pixels uniformly over the mask; WESS draws them from a distribution built
+The training pixel sampler under study. Model A's `Net.sample_train_pixels`
+draws its 2048 pixels uniformly over the mask; WESS draws them from a distribution built
 from the sub-band energy of the WTConv backbone's *first* block, so the
 gradient of each optimizer step concentrates on creases, shadow boundaries and
 other high-frequency structure rather than on the flat regions that dominate a
 uniform draw and contribute almost no gradient.
 
-**Nothing here is wired into `Net`.** This module is imported by
-`wess_probe.py` (Phase 0) and, later, by `Net.sample_train_pixels`. Keeping it
-standalone means the Phase-0 measurements are taken on exactly the code that
-will ship, while `model.py`, `convnext.py` and `wtconv.py` stay byte-identical
-to Model B1's -- so the eventual B1 -> B2 diff is still readable as a `git diff`.
+**Wired into `Net` at two call sites.** `Net._install_wess_hook` taps the
+sub-bands and `Net.sample_train_pixels` calls `wess_sample_train`; the probes in
+`sdm_unips/probes/wess/` import the same functions, so the Phase-0/0b
+measurements ran the code that trains. `convnext.py` and `wtconv.py` are
+byte-identical to Model B1's; the B1 -> B2 diff is this file, `model.py`, and
+the flag and logging plumbing in `trainer.py` and `train.py`.
 
 Design decisions, each settled before implementation:
 
@@ -77,17 +78,25 @@ Design decisions, each settled before implementation:
   splits the budget into M_base = 512 uniform + M_adapt = 1536 saliency-drawn,
   which needs bookkeeping to keep the two draws disjoint. The mixture
   `P = lam * Uniform + (1 - lam) * P_wess` with `lam = 512 / 2048 = 0.25` has
-  the same expected count per pixel, takes one `multinomial`, and turns the
-  support argument into a hard guarantee: every masked pixel keeps
-  `p >= lam / n_valid` no matter how peaked the softmax gets. That is what
+  the same expected count per pixel *in `wess_sample`*, takes one
+  `multinomial`, and turns the support argument into a hard guarantee: every
+  masked pixel keeps `p >= lam / n_valid` no matter how peaked the softmax
+  gets. The shipped `wess_train_probabilities` applies `lam` inside the
+  interior only, with the rim uniform on top, so it does NOT reproduce the
+  512/1536 split: at `erode_cells=2` the expected split is 776 rim uniform +
+  318 interior uniform + 954 energy-directed (46.6%, n=431). The floor still
+  holds there. That is what
   makes training under E_P while reporting E_uniform defensible -- the sampler
   changes the *rate* at which a pixel is supervised, never whether it can be.
   `lam = 1` (or `tau -> inf`) recovers Model A's uniform sampler exactly, which
   is a free correctness check.
 
-* **The draw runs on a CPU generator**, mirroring `Trainer._eval_sample_ids`:
-  it makes the sample a function of the seed alone, independent of the device
-  and of how much CUDA RNG the rest of the step consumed.
+* **The Phase-0 draw (`_draw`) runs on a CPU generator**, mirroring
+  `Trainer._eval_sample_ids`: it makes the sample a function of the seed alone,
+  independent of the device and of how much CUDA RNG the rest of the step
+  consumed. The training draw (`wess_sample_train`) does not -- it runs on the
+  tensors' device with the ambient RNG, like Model A's `randperm`; see its
+  docstring.
 
 Everything is `detach()`ed. The draw is an index selection and carries no
 gradient; keeping the live tensor would pin the whole encoder graph.
@@ -105,7 +114,8 @@ from .decompose_tensors import merge_tensor_spatial
 DEFAULT_STAGE = 0
 DEFAULT_BLOCK = 0
 
-# Defaults for the draw. `lam` reproduces the proposal's 512/2048 base set.
+# Defaults for the draw. `lam = 512/2048` reproduces the proposal's base set in
+# `wess_sample` only; in `wess_sample_train` it acts inside the interior.
 DEFAULT_TAU = 1.0
 DEFAULT_LAM = 0.25
 
@@ -135,14 +145,16 @@ class SubbandTap:
 
     * `band='raw'`   -- a forward **pre**-hook on `wavelet_convs[0]`, whose
       input is exactly the raw DWT output `bands.reshape(n, 4C, h, w)`. This is
-      the `X^LH / X^HL / X^HH` of the proposal: pure Haar coefficients, no
-      learned parameters involved.
+      the `X^LH / X^HL / X^HH` of the proposal: Haar coefficients of the stem
+      output. The Haar filters are fixed, but the stem upstream of them (4x4
+      stride-4 conv + LayerNorm, 6,432 parameters) is trainable.
     * `band='filtered'` -- a forward hook on `wavelet_scale[0]`, i.e. the bands
       after the level-0 depthwise 5x5 and the per-channel gain. That gain is
       initialised at 0.1 and is trainable, so this variant is scaled by
       something that drifts during training. Phase 0 measures whether the two
       rank pixels differently; `raw` is the default because it is the quantity
-      the proposal defines and the one that cannot drift.
+      the proposal defines and it drifts less: one learned layer upstream (the
+      stem) against three for `filtered`.
 
     Both hooks fire on **each** of the encoder's two backbone calls. `last`
     therefore holds the tile path (`x_grid`, 4N), which is the one WESS wants,
@@ -285,11 +297,12 @@ def wess_sample(E, valid_ids, H, W, n_sample,
                 tau=DEFAULT_TAU, lam=DEFAULT_LAM, generator=None):
     """Draw `n_sample` flat decoder-grid indices. Returns `(ids, stats)`.
 
-    `stats` is the per-step instrumentation agreed for `train.jsonl`:
+    `stats` are the Phase-0 probe diagnostics (training logs
+    `train_draw_stats` instead):
 
     * `wess_tilt` -- mean energy of the drawn set over mean energy of the mask.
-      1.0 means the sampler is inert; this is the one number that says whether
-      `tau` is set sanely.
+      1.0 means the sampler is inert. (tau was ultimately chosen by the ESS
+      floor, not by this.)
     * `wess_ess` -- effective sample size `1 / sum(p^2)` as a fraction of the
       mask. Catches both failure modes at once: collapse (all mass on a handful
       of pixels) and degeneracy (indistinguishable from uniform, which reads
@@ -364,6 +377,11 @@ def draw_stats(e, p, sel):
 #    over the whole mask is inflated by the rim, so every interior z-score is
 #    squashed toward 0 and the softmax over the interior comes out nearly flat.
 #
+#    Outcome (tau grid on this sampler, n=431): the interior draw did get
+#    peakier -- `wess_tilt_int` 2.10 at tau=1 -- but the interior CURVATURE
+#    tilt stayed at 1.20 (median). Removing the rim removed a confound from the
+#    measurement; it did not sharpen geometric targeting.
+#
 # So the rim is excluded from E's statistics and from the softmax, but NOT from
 # the draw -- it keeps exactly its uniform share. WESS reallocates only the
 # interior's own share, among interior pixels:
@@ -385,14 +403,19 @@ def draw_stats(e, p, sel):
 #   silhouette, where GT normals sit at grazing angles and the mask edge is
 #   antialiased, is sampled identically to Model A -- so a win cannot be
 #   explained away as "B2 just trained harder on the boundary".
+#   Exact for the distribution only: `multinomial(replacement=False)` spills
+#   leftover budget onto low-p pixels when p is peaked, so the rim's share of
+#   the draw runs +1.3 pp (mean, per scene) over n_rim/n_valid at tau=1 and
+#   +7.4 pp at tau=0.5.
 #
 # The erosion runs on the 64x64 energy grid rather than at 512x512 because that
 # is the resolution at which the ring is actually defined, and because one cell
 # there is ~16 px of true localization anyway (see the module docstring).
 # ---------------------------------------------------------------------------
 
-# Ring width to exclude, in energy-grid cells. 2 cells ~ 16 px nominal / ~24 px
-# effective at R=512. Phase 0's `--erode 9` (~1 cell) still left tau=1 with 40%
+# Ring width to exclude, in energy-grid cells, eroded AFTER cells straddling the
+# edge are dropped -- so the band is 1 + erode_cells cells: 3 cells = 24 px at
+# R=512, holding 38% of masked pixels on average (n=431). Phase 0's `--erode 9` (~1 cell) still left tau=1 with 40%
 # of the draw outside the interior, so the ring is wider than one cell.
 DEFAULT_ERODE_CELLS = 2
 
@@ -490,8 +513,10 @@ def train_draw_stats(e, p, sel, is_int):
     interior*, which is the only region WESS is allowed to reweight. `wess_tilt`
     over the whole mask stays for comparability with the Phase-0 numbers, but it
     is diluted by the rim samples, which are uniform by construction.
-    `wess_interior_frac` should sit near the uniform value -- a drift away from
-    it means the erosion is not doing what it claims.
+    `wess_interior_frac` should sit near the uniform value, n_int/n_valid --
+    about 1 pp below it at tau=1 (0.608 vs 0.621, means, n=431) from the
+    without-replacement spill. A larger drift means the erosion is not doing
+    what it claims.
     """
     e = e.detach().float()
     n_valid = e.numel()

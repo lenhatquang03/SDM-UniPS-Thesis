@@ -3,8 +3,8 @@
 # verifies each against the Hub's SHA-256, extracts, and deletes everything it downloaded.
 #
 # USAGE
-#   ./download_and_extract_HG_data.sh <download_dir> [basename ...]
-#   ./download_and_extract_HG_data.sh                     # prompts for both
+#   ./step3_download_and_extract_HG_data.sh <download_dir> [basename ...]
+#   ./step3_download_and_extract_HG_data.sh                     # prompts for both
 # With no basenames, every archive found across the repos is processed.
 # <download_dir> is where parts land, where archives are extracted, and where the
 # downloaded zips are deleted from.
@@ -14,8 +14,9 @@
 #   bsdtar, which reads zip from a stream; unzip cannot (it seeks to the central
 #   directory at the end of the file).
 # STREAM=0: download every part, concatenate, verify the whole-file hash from the
-#   <base>.sha256 sidecar, unzip, then delete the merged zip. Needs ~3x the space
-#   but keeps every part on disk until extraction succeeds.
+#   <base>.sha256 sidecar, unzip, then delete the merged zip. Each part is deleted
+#   as soon as it is appended, so peak disk is the merged zip plus one part plus
+#   the extracted output; nothing is extracted until every part has passed.
 #
 # PROGRESS: every read that can take minutes goes through `dd status=progress`
 # rather than cat/sha256sum, so no phase is silent. dd writes to stderr using
@@ -254,7 +255,8 @@ for base in "${BASES[@]}"; do
   fi
 
   # SPACE: streaming needs one part plus the extracted output; merging needs
-  # every part plus a merged copy plus the output. 1.1x is a guess for the
+  # the merged copy (every part's bytes, one extra part at a time) plus the
+  # output. The 2x-total figure below is a conservative bound for merging. 1.1x is a guess for the
   # uncompressed size - zip's real figure needs the central directory.
   avail=$(df -B1 --output=avail "$DOWNLOAD_DIR" | tail -1)
   largest=0
@@ -390,7 +392,9 @@ for base in "${BASES[@]}"; do
       fi
     fi
     # On failure the merged zip is kept deliberately: re-running unzip is cheap,
-    # re-downloading it is not. Delete it by hand once you are done with it.
+    # re-downloading it is not. Retry with unzip by hand -- re-running this
+    # script truncates the file (`: > "$merged"`) and downloads it again.
+    # Delete it by hand once you are done with it.
     if (( ok == 0 )) && [[ -s "$merged" ]]; then
       echo "  kept ${merged} for retry - delete it manually when finished."
     fi
@@ -405,7 +409,8 @@ for base in "${BASES[@]}"; do
   fi
 done
 
-# Remove the staging dir only if it is empty; anything left is a deliberate keep.
+# Remove the staging dir only if it is empty. Anything left is a merged zip kept
+# for retry, or the .cache/huggingface/ metadata `hf download --local-dir` writes.
 find "$WORK" -type d -empty -delete 2>/dev/null
 if [[ -d "$WORK" ]]; then
   echo

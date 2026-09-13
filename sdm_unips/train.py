@@ -324,14 +324,19 @@ def build_argparser():
                         'indistinguishable from uniform.')
     p.add_argument('--wess_lam', type=float, default=0.25,
                    help='Uniform mixture weight inside the interior '
-                        '(0.25 = the proposal\'s 512-of-2048 base set). Every '
+                        '(default 0.25). The rim keeps Model A\'s uniform rate '
+                        'on top, so at --wess_erode_cells 2 about 47%% of the '
+                        '2048 pixels are energy-directed, not the proposal\'s '
+                        '512-uniform / 1536-saliency split. Every '
                         'masked pixel keeps p >= lam/n_valid, so the sampler '
                         'changes the RATE at which a pixel is supervised, '
                         'never whether it can be. 1.0 = Model A.')
     p.add_argument('--wess_erode_cells', type=int, default=2,
                    help='Silhouette band excluded from the energy statistics '
                         'and from the softmax, in 64x64 energy-grid cells '
-                        '(2 ~ 16 px at R=512). Those pixels keep Model A\'s '
+                        '(2 = a 24 px band at R=512: cells straddling the '
+                        'mask edge are dropped before eroding, so the band is '
+                        '1 + erode_cells cells). Those pixels keep Model A\'s '
                         'uniform rate; WESS reallocates the interior only. 0 '
                         'keeps only the erosion implied by dropping cells that '
                         'straddle the mask edge, which Phase 0 showed is not '
@@ -343,7 +348,7 @@ def build_argparser():
                         'surviving one blown-out specular image).')
 
     # Data ---------------------------------------------------------------
-    # K is fixed at 10 per scene inside HdlongLoader / PolarPSLoader.
+    # K is --k_per_scene (default 10), enforced in HdlongLoader / PolarPSLoader.
     p.add_argument('--train_resolution', type=int, default=512)
     p.add_argument('--max_scenes', type=int, default=0,
                    help='Cap the training set size. 0 = no cap.')
