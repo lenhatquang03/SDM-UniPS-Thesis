@@ -20,7 +20,7 @@ The rule, fixed before the grid ran:
   3. ties within --tie_se standard errors -> take the LARGER tau
 
 Usage:
-    python sdm_unips/wess_tau_select.py \
+    python sdm_unips/probes/wess/wess_tau_select.py \
         --real ~/result_overview/wess_tau_grid/wess_probe.jsonl \
         --shuffled ~/result_overview/wess_tau_grid_shuffled/wess_probe.jsonl
 """

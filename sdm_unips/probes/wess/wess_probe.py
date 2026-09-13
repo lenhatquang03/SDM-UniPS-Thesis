@@ -58,7 +58,7 @@ run's values probes provably the same held-out scenes the run validated on.
 
 Usage:
 
-    python sdm_unips/wess_probe.py \
+    python sdm_unips/probes/wess/wess_probe.py \
       --checkpoint ~/runs/modelB1_wtconv/checkpoints/best.pt \
       --hdlong_dir /path/to/hdlong-complexv1 \
       --polarps_dir /path/to/PolarPS \
@@ -87,7 +87,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# sdm_unips/, two levels up -- for `modules` and `train`.
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 
 from modules.io.dataloader.mixed import build_mixed_split, MixedEvalDataset
 from modules.loss import losses

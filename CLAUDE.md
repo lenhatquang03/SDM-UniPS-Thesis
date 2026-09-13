@@ -151,11 +151,26 @@ p(interior pixel) = (n_int / n_valid) * [ lam / n_int + (1 - lam) * softmax_int 
 
 The two blocks sum to `n_rim/n_valid + n_int/n_valid = 1` exactly, so nothing is
 renormalized. The rim keeps Model A's rate, which means **any A/B difference is
-attributable to interior reallocation alone** — a win cannot be explained away
+attributable to interior reallocation alone**
+
+**— with one measured caveat.** That equality is exact for the *distribution*;
+the draw is `torch.multinomial(..., replacement=False)`, whose marginal
+inclusion probabilities are not proportional to `p` when `p` is peaked. High-`p`
+interior pixels saturate and the leftover budget spills onto low-`p` pixels,
+the rim included. Measured rim share of the draw against the `n_rim/n_valid`
+the design promises (τ=3, where `p` is nearly flat, reads it directly at
+33.4%): **35.7% at τ=1 (+2.3 pp), 42.6% at τ=0.5 (+9.2 pp)**. At the launch
+setting the guarantee holds to about two points, which is small enough to keep
+the attribution argument; below τ=1 it degrades fast and the argument weakens — a win cannot be explained away
 as "B2 just trained harder on the boundary, where GT normals sit at grazing
 angles and the mask edge is antialiased". `--wess_erode_cells` (2, in 64²
-energy-grid cells ≈ 16 px at R=512) sets the excluded band; the erosion runs on
-the energy grid because that is the resolution at which the ring is defined.
+energy-grid cells) sets the excluded band; the erosion runs on the energy grid
+because that is the resolution at which the ring is defined. **The band is
+`1 + erode_cells` cells wide, not `erode_cells`** — `interior_mask` first drops
+every cell that straddles the boundary, then erodes — so the default is
+**24 px at R=512, not the ~16 px an earlier draft claimed** (corrected
+2026-09-09). Measured consequence: 39% of masked pixels fall in that band and
+are excluded from the reweighting, so WESS operates on 61% of the object.
 
 Order of operations inside the interior is fixed and was settled before
 implementation: **upsample → gather at the mask → standardize → softmax → mix
@@ -191,11 +206,17 @@ code that averages `loss` — no new plumbing:
 - `wess_ess` — effective sample size `1/Σp²` as a fraction of the mask. **The
   one to watch on launch.** Below ~0.1 the draw has collapsed onto a handful of
   pixels and the per-step gradient is high-variance; near 1.0 the sampler is
-  inert. Phase 0 measured a **median** 0.21 at τ=1 (mean 0.23, min 0.01, max
-  0.72) *with* the rim included, and excluding the
-  rim removes what was inflating σ, so the shipped sampler will read lower at
-  the same τ. If the first hundred steps show `wess_ess < 0.1`, raise
-  `--wess_tau`.
+  inert. **Measured on the shipped sampler (2026-09-09, n=431): 0.109 at τ=0.5,
+  0.388 at τ=1, 0.665 at τ=1.5, 0.821 at τ=2, 0.935 at τ=3.** At the launch
+  setting τ=1 expect ~0.39; `wess_ess < 0.1` in the first hundred steps means
+  something is wrong, not merely aggressive.
+
+  (An earlier draft predicted the shipped sampler would read *lower* than
+  Phase 0's 0.21 at τ=1, reasoning that excluding the rim removes what was
+  inflating σ. That is backwards and was corrected 2026-09-09: it reads
+  **higher** at every τ (0.231 → 0.388 at τ=1). ESS is a property of the whole
+  distribution, and a third of the shipped mass is pinned *uniform* on the rim,
+  which flattens p more than the peakier interior softmax sharpens it.)
 
   **Peakedness has a measured cost, so treat 0.1 as a floor and not a target.**
   The shuffled-energy control showed a draw at ESS 0.100 raises MAE by +0.16°
@@ -215,12 +236,18 @@ code that averages `loss` — no new plumbing:
 - `wess_tilt` — the same over the whole mask, kept for comparability with the
   Phase-0 records; diluted by the rim samples, which are uniform by construction.
 - `wess_interior_frac` — share of the draw landing inside the eroded interior.
-  Should sit near the uniform value (~0.90); a drift away from it means the
-  erosion is not doing what it claims.
+  **Expect ~0.61 at `--wess_erode_cells 2`, NOT ~0.90.** Do not compare it
+  against the probe's `interior_frac_uniform`: that uses the probe's `--erode 9`
+  (~4 px) while the sampler's interior is `interior_mask`'s ~24 px band, so the
+  two measure different regions and the ~0.90 figure an earlier draft quoted was
+  incommensurable (corrected 2026-09-09). The value to compare against is
+  `n_int / n_valid` for the same erosion, which a uniform draw would also
+  produce: measured 0.666 at τ=3 (nearly uniform p). A drift below ~0.60 at τ=1
+  means the erosion is not doing what it claims.
 - `wess_top10_frac` — share of the draw in the mask's top energy decile
   (uniform reads 0.10).
 
-**Phase 0 (premise validation), n = 431, the full val split.** `sdm_unips/wess_probe.py`
+**Phase 0 (premise validation), n = 431, the full val split.** `sdm_unips/probes/wess/wess_probe.py`
 loads B1's `best.pt`, taps the sub-bands and asks whether `E` points at geometry
 before any GPU time is spent training on it. It answered yes: ρ(E, GT curvature)
 median **+0.46** (mean +0.43), positive in **98.6%** of scenes and above +0.2 in
@@ -327,7 +354,50 @@ zero), and the correlations reproduce the original run bit-exactly. Re-run it
 after any edit to `wess_probabilities`; it is the cheapest guard on the mixture
 algebra.
 
-**Probe:** `python -u sdm_unips/wess_probe.py --checkpoint <B1>/checkpoints/best.pt
+**τ selection (Phase 0b), 2026-09-09, n = 431, `--shipped_sampler`.** τ and λ
+were chosen from the probe alone — no training run, no val loss — so the A/B
+comparison stays one run per variant. λ was **fixed at 0.25** on the support
+argument rather than swept, to keep the selection surface to one knob. The rule
+was written before the grid ran: keep τ with `wess_ess ≥ 0.25` and
+`wess_tilt_int ≥ 1.15`, maximise `net_gain = mae_delta(real) −
+mae_delta(shuffled)`, ties within 1 SE → larger τ. Scored by
+`sdm_unips/probes/wess/wess_tau_select.py`, which checks the integrity gate first and
+refuses to name a τ unless both arms carry `"shipped_sampler": true`.
+
+| τ | ESS | `wess_tilt_int` | raw gain | null | **net gain** | keep |
+|---|---|---|---|---|---|---|
+| 0.5 | 0.109 | 2.545 | +0.825 | +0.254 | +0.571 ± 0.082 | no (ESS) |
+| **1.0** | **0.388** | **2.097** | +0.545 | +0.084 | **+0.461 ± 0.063** | **yes** |
+| 1.5 | 0.665 | 1.668 | +0.336 | +0.050 | +0.286 ± 0.048 | yes |
+| 2.0 | 0.821 | 1.448 | +0.227 | +0.028 | +0.198 ± 0.038 | yes |
+| 3.0 | 0.935 | 1.260 | +0.120 | +0.003 | +0.117 ± 0.034 | yes |
+
+**Selected: `--wess_tau 1.0 --wess_lam 0.25`.** Integrity gate passed (max
+|Δ`mae_uniform`| = 0.000e+00 across all 431 scenes). One scene
+(`teether-toy-002@ceramic_44_basecolor-1K`) hits the `MIN_INTERIOR_PIXELS = 256`
+fallback and draws uniformly; that is by design, and it reads ESS exactly 1.0.
+
+**The rule was degenerate and the answer is only corroborated, not produced, by
+it.** Net gain falls monotonically in τ, so "maximise net gain" always lands on
+the smallest τ clearing the ESS floor — the floor decided, and 0.25 was a
+judgment call, not a derived quantity. An independent check does land on the
+same τ: the artifact share of the gain (null ÷ net) reads 44.5% at τ=0.5 then
+18.2 / 17.5 / 14.1 / 2.6% at τ=1…3, so τ=0.5 is disqualified for spending nearly
+half its apparent gain on clustering while τ ≥ 1 sits on a flat plateau where
+the largest net gain wins. That check was run *after* seeing the grid; treat it
+as corroboration, and report the ESS floor as the operative criterion.
+
+**What the shipped sampler actually does at τ=1**, in data terms rather than
+metric names: of 2048 pixels, ~36% land in the 24 px silhouette band at close to
+Model A's rate, and the remaining ~64% are reallocated within the interior
+toward high-energy cells — those interior pixels carry **1.20× the median GT
+curvature** of the mask (mean 1.37; higher than uniform in 90.3% of scenes) and
+B1's error on the whole draw is **+0.46 ± 0.06° above its error on a uniform
+draw** once the clustering artifact is subtracted, in 72.4% of scenes. The
+interior curvature tilt is unchanged from Phase 0's 1.197 — excluding the rim
+did not sharpen geometric targeting, it removed a confound from the measurement.
+
+**Probe:** `python -u sdm_unips/probes/wess/wess_probe.py --checkpoint <B1>/checkpoints/best.pt
 <same --hdlong_dir/--polarps_dir/--scene_manifest as the run> --num_scenes 0
 --tau 1.0 2.0 --band raw --no_figures --out_dir <dir>`. Roughly 3 s/scene plus
 ~1–2 min of startup; drop `--no_figures` for per-scene panels. Note `python -u`:
