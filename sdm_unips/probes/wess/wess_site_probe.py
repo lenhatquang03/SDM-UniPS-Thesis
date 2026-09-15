@@ -34,8 +34,11 @@ passes use identical maps.
 Outputs in --out_dir: `site_probe.jsonl` (one record per scene),
 `tau_search.json` (ESS curves and the chosen temperatures), `run_args.json`.
 
-Dataset flags are train.py's own, so `--config sdm_unips/configs/modelB2_wess.yaml`
-supplies the roots, manifest, seed and split of the B2 runs.
+Dataset flags are train.py's own. Their defaults here are the probe machine's
+(`wess_probe.PROBE_DATA_DEFAULTS`: the /mnt/8TData roots and B1's scene
+manifest); seed, fractions and resolutions keep train.py's defaults, which are
+the B1/B2 values. Do not pass a training YAML via --config: its roots are the
+training box's and override these defaults.
 """
 
 from __future__ import print_function, division
@@ -64,13 +67,14 @@ from modules.model import wess
 
 import tap_sites
 import train as train_mod
-from wess_probe import (curvature_map, observation_gradient, spearman,
-                        partial_spearman, shuffle_map, load_weights,
+from wess_probe import (PROBE_DATA_DEFAULTS, curvature_map, observation_gradient,
+                        spearman, partial_spearman, shuffle_map, load_weights,
                         resolve_checkpoint)
 
 
 def build_parser():
     p = train_mod.build_argparser()
+    p.set_defaults(**PROBE_DATA_DEFAULTS)
     g = p.add_argument_group('WESS tap-site screen')
     g.add_argument('--checkpoint', required=True,
                    help='Model B1 weights (best.pt, final.pt, a .pytmodel, or a '

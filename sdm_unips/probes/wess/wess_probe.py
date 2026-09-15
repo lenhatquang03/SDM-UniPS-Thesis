@@ -102,6 +102,20 @@ from modules.model import wess
 import train as train_mod
 
 
+# Where the probes run: the machine holding Model B1's run and the earlier probe
+# records. Applied as parser defaults (here and in wess_site_probe.py), so a
+# probe needs no dataset flags on that machine; a flag given explicitly still
+# wins. Seed, split fractions, K and resolutions keep train.py's defaults, which
+# are the B1/B2 values. Do not pass a training YAML via --config: its roots are
+# the training box's and would override these.
+PROBE_DATA_DEFAULTS = dict(
+    hdlong_dir=['/mnt/8TData/Datasets/UniPS/hdlong-complexv1',
+                '/mnt/8TData/Datasets/UniPS/MerlMix'],
+    polarps_dir=['/mnt/8TData/Datasets/UniPS/PolarPS'],
+    scene_manifest='/mnt/18TData/ps1/runs/modelB1_wtconv/scene_manifest.json',
+)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint loading
 # ---------------------------------------------------------------------------
@@ -347,6 +361,7 @@ def write_panel(path, tiles, ncol=4):
 # ---------------------------------------------------------------------------
 def build_parser():
     p = train_mod.build_argparser()
+    p.set_defaults(**PROBE_DATA_DEFAULTS)
     g = p.add_argument_group('WESS Phase-0 probe')
     g.add_argument('--checkpoint', required=True,
                    help="Model B1 weights: a .pt / .pytmodel file, or a "
