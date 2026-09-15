@@ -134,7 +134,9 @@ def load_weights(net, path, device):
     a bare `Net`, upstream's weights came from a DataParallel one), and a
     partial match. Anything short of a full match raises.
     """
-    params = torch.load(path, map_location=device)
+    # weights_only=False: best.pt carries optimizer and RNG state, which
+    # PyTorch >= 2.6 refuses to unpickle by default.
+    params = torch.load(path, map_location=device, weights_only=False)
     if isinstance(params, dict) and 'model' in params and 'optimizer' in params:
         params = params['model']
     if any(k.startswith('module.') for k in params):
