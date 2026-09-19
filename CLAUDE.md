@@ -8,6 +8,8 @@ SDM-UniPS is a **CVPR 2023 Highlight** paper implementation for **Universal Phot
 
 **Scope:** this fork targets **surface-normal prediction only**.
 
+**UPerHead GroupNorm (2026-09-19): applies to every variant.** The fusion head now has `GroupNorm(32, 256)` between each conv and ReLU (`modules/model/uper.py`). Upstream's head let the PSP `bottleneck` ReLU, the only route from backbone stage 3 / `fusion.comm.2` to the loss, go dead. That froze about 35M parameters in several runs, and its later revival collapsed B2 τ=0.5 at epoch 61. The same commit adds a finite gradient-explosion guard (`--explode_factor`, default 100; 0 disables) and per-branch gradient logging (`gn_*` fields and a `[branch-dead]` warning; `--no_branch_grads` disables). "Model A = the unmodified SDM-UniPS architecture" therefore no longer holds: A is SDM-UniPS with a normalized UPerHead. Every checkpoint trained before this change is superseded and does not load here; evaluate old runs from the commit before it. Full account, with evidence and data flow: `docs/dead_coarse_branch.md`.
+
 The current branch (`architecture/training-pipeline`) targets **Model A** (the baseline SDM-UniPS architecture, no modifications), trained on a mix of `hdlong-complexv1` and `PolarPS` for the author's thesis: *"Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens."* The branch `modelA-vflip-mean-max-scale` adds more versatile augmentations, the model is also to be trained on the `MerlMix` dataset. Models B and C (WTConv, WESS, latent-carrier deformable attention) will live on dedicated branches.
 
 ## Running Inference
