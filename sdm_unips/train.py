@@ -586,6 +586,17 @@ def build_argparser():
                    help='Optimizer steps in the --max_skip_rate rolling window. '
                         'The guard stays disarmed until the window is full, so '
                         'this doubles as its grace period.')
+    p.add_argument('--explode_factor', type=float, default=100.0,
+                   help='Skip an optimizer step whose FINITE pre-clip gradient '
+                        'norm exceeds this multiple of the median of the last '
+                        '--skip_rate_window applied steps; it then counts toward '
+                        'both abort guards above. Healthy runs peaked at 43.7x; '
+                        'the B2 tau=0.5 collapse read ~300x at its first logged '
+                        'step (docs/dead_coarse_branch.md). 0 disables.')
+    p.add_argument('--no_branch_grads', action='store_true',
+                   help='Do not log per-branch gradient norms (gn_* fields, '
+                        'computed on logged steps only) or warn when a branch '
+                        'reads exactly 0 for ~200 optimizer steps.')
     p.add_argument('--amp', action='store_true',
                    help='Legacy alias: equivalent to --amp_dtype fp16')
     p.add_argument('--amp_dtype', default='bf16', choices=['bf16', 'fp16', 'none'])
