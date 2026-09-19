@@ -64,6 +64,7 @@ import math
 import os
 import random
 import re
+import statistics
 from collections import deque
 from contextlib import nullcontext
 
@@ -168,6 +169,66 @@ class NonFiniteGradientAbort(RuntimeError):
       intermittent failure (say every other batch) that halves the effective
       training run without ever producing two skips in a row.
     """
+
+
+def is_grad_explosion(grad_norm, recent_norms, factor, window):
+    """Is this FINITE pre-clip gradient norm an explosion? (--explode_factor)
+
+    True when `grad_norm > factor * median(recent_norms)`, where `recent_norms`
+    holds the norms of the last `window` APPLIED optimizer steps. Disarmed until
+    the window is full (the same grace period as --max_skip_rate) and whenever
+    `factor <= 0` or the median is 0. Such a step is skipped exactly like a
+    non-finite one, so the two abort guards above cover it too.
+
+    Why a finite guard exists (docs/dead_coarse_branch.md): Model B2 tau=0.5
+    ran five epochs on gradient norms of 1e9-1e17. Every one was finite, so
+    clip_grad_norm_ scaled it to 1.0 and the step was applied; nothing aborted.
+    The healthy runs' largest logged norm was 43.7x its rolling median; the
+    collapse read ~300x at its first logged step.
+    """
+    if factor <= 0 or len(recent_norms) < window:
+        return False
+    med = statistics.median(recent_norms)
+    return med > 0 and grad_norm > factor * med
+
+
+# Per-branch gradient norms (--no_branch_grads disables). Parameter-name
+# prefixes, first match wins; `module.` (DataParallel) is stripped first. The
+# groups follow the four backbone scales through the fusion head, so a branch
+# that stops learning shows up as a group whose norm is exactly 0 -- which is
+# how the dead coarse branch (stage 3 -> comm.2 -> PSP) looked in B2 lam=0.5
+# and tau=0.5, where nothing in the logs could show it.
+_BB = 'image_encoder.backbone.backbone.0.'
+_FU = 'image_encoder.fusion.'
+BRANCH_PREFIXES = (
+    ('gn_stem',    (_BB + 'downsample_layers.0.',)),
+    ('gn_stage0',  (_BB + 'stages.0.', _BB + 'norm0.')),
+    ('gn_stage1',  (_BB + 'downsample_layers.1.', _BB + 'stages.1.', _BB + 'norm1.')),
+    ('gn_stage2',  (_BB + 'downsample_layers.2.', _BB + 'stages.2.', _BB + 'norm2.')),
+    ('gn_stage3',  (_BB + 'downsample_layers.3.', _BB + 'stages.3.', _BB + 'norm3.')),
+    ('gn_comm0',   (_FU + 'comm.0.',)),
+    ('gn_comm1',   (_FU + 'comm.1.',)),
+    ('gn_comm2',   (_FU + 'comm.2.',)),
+    ('gn_psp',     (_FU + 'fusion.psp_modules.', _FU + 'fusion.bottleneck.')),
+    ('gn_fpn',     (_FU + 'fusion.lateral_convs.', _FU + 'fusion.fpn_convs.',
+                    _FU + 'fusion.fpn_bottleneck.')),
+    ('gn_glc_upsample',    ('glc_upsample.',)),
+    ('gn_glc_aggregation', ('glc_aggregation.',)),
+    ('gn_regressor',       ('regressor.',)),
+)
+# Consecutive computations (one per logged optimizer step) at exactly zero
+# before a group is reported dead: 20 x --log_every 10 = ~200 optimizer steps.
+DEAD_BRANCH_CHECKS = 20
+
+
+def branch_of(name):
+    """Log key of the branch a parameter belongs to ('gn_other' if none)."""
+    if name.startswith('module.'):
+        name = name[len('module.'):]
+    for key, prefixes in BRANCH_PREFIXES:
+        if name.startswith(prefixes):
+            return key
+    return 'gn_other'
 
 
 def _step_decay_with_warmup(optimizer, warmup_steps, steps_per_epoch,
@@ -328,6 +389,26 @@ class Trainer:
                           f'{self.skip_rate_window} steps')
         print('[Trainer] Non-finite gradients skip the optimizer step; abort on '
               + (' or '.join(guards) if guards else 'NOTHING (both guards disabled)'))
+        # Finite-explosion guard (see `is_grad_explosion`). The window holds the
+        # pre-clip norms of APPLIED steps only, so a run of exploding steps
+        # cannot drag the median up after it and disarm itself.
+        self.explode_factor = float(getattr(args, 'explode_factor', 100.0))
+        self._norm_window = deque(maxlen=self.skip_rate_window)
+        print(f'[Trainer] Finite-explosion guard: '
+              + (f'skip a step whose grad norm exceeds {self.explode_factor:g} x '
+                 f'the median of the last {self.skip_rate_window} applied steps'
+                 if self.explode_factor > 0 else 'OFF (--explode_factor 0)'))
+        # Per-branch gradient norms, computed on logged optimizer steps only.
+        self.branch_grads = not bool(getattr(args, 'no_branch_grads', False))
+        self.log_every = max(1, int(getattr(args, 'log_every', 10)))
+        groups = {}
+        for name, p in self.net.named_parameters():
+            groups.setdefault(branch_of(name), []).append(p)
+        self._branch_groups = list(groups.items())
+        self._branch_zero_run = {key: 0 for key in groups}
+        if self.branch_grads:
+            print('[Trainer] Per-branch grad norms logged as gn_*: '
+                  + ', '.join(f'{k}({len(v)})' for k, v in self._branch_groups))
         self.detect_anomaly = bool(getattr(args, 'detect_anomaly', False))
         if self.detect_anomaly:
             print('[Trainer] torch.autograd anomaly detection ENABLED '
@@ -545,7 +626,31 @@ class Trainer:
             print('[grad-nan] re-run with --detect_anomaly for the exact '
                   'backward-order origin and the raising op.')
 
-    def _note_skip(self, grad_norm):
+    @torch.no_grad()
+    def _branch_grad_norms(self):
+        """Pre-clip gradient L2 norm per branch (`BRANCH_PREFIXES`), in float64.
+
+        float64 because the failure this exists to expose produced norms of
+        1e17, whose square overflows float32. Also warns once when a branch has
+        read exactly 0 for `DEAD_BRANCH_CHECKS` consecutive logged steps.
+        """
+        out = {}
+        for key, params in self._branch_groups:
+            norms = [torch.linalg.vector_norm(p.grad, dtype=torch.float64)
+                     for p in params if p.grad is not None]
+            val = (float(torch.linalg.vector_norm(torch.stack(norms)))
+                   if norms else 0.0)
+            out[key] = val
+            run = self._branch_zero_run[key] + 1 if val == 0.0 else 0
+            self._branch_zero_run[key] = run
+            if run == DEAD_BRANCH_CHECKS:
+                print(f'[branch-dead] {key}: gradient exactly 0 on the last '
+                      f'{run} logged steps (~{run * self.log_every} optimizer '
+                      f'steps) -- this branch is not learning. See '
+                      f'docs/dead_coarse_branch.md.')
+        return out
+
+    def _note_skip(self, grad_norm, reason='non-finite gradient'):
         """Record a skipped optimizer step; abort if they run consecutively.
 
         One line per skip, deliberately: a run that skips 40% of its steps
@@ -560,7 +665,7 @@ class Trainer:
         # so a bad start is visible before the guard is armed to act on it.
         seen = len(self._skip_window)
         rate = (sum(self._skip_window) / seen) if seen else 0.0
-        print(f'[grad-skip] step {self.global_step + 1}: non-finite gradient '
+        print(f'[grad-skip] step {self.global_step + 1}: {reason} '
               f'(total_norm={float(grad_norm):.4g}) — optimizer step SKIPPED  '
               f'[consecutive={self._consecutive_skips}'
               f'/{self.max_consecutive_skips or "off"}  '
@@ -570,7 +675,7 @@ class Trainer:
                 and self._consecutive_skips >= self.max_consecutive_skips):
             raise NonFiniteGradientAbort(
                 f'{self._consecutive_skips} consecutive optimizer steps skipped '
-                f'for non-finite gradients (limit --max_consecutive_skips='
+                f'for non-finite or exploding gradients (limit --max_consecutive_skips='
                 f'{self.max_consecutive_skips}); the model has received no '
                 f'update in that span, so training is aborting rather than '
                 f'silently learning nothing. See the [grad-nan] report above '
@@ -594,7 +699,7 @@ class Trainer:
             return
         raise NonFiniteGradientAbort(
             f'{rate:.1%} of the last {self.skip_rate_window} optimizer steps '
-            f'were skipped for non-finite gradients, over the limit '
+            f'were skipped for non-finite or exploding gradients, over the limit '
             f'--max_skip_rate={self.max_skip_rate:.1%}; the run is only '
             f'training at {1.0 - rate:.0%} of its nominal rate and the LR '
             f'schedule has advanced regardless, so it is aborting rather than '
@@ -746,8 +851,15 @@ class Trainer:
         against.
         """
         clip_val = self.args.grad_clip if self.args.grad_clip > 0 else float('inf')
+        # Per-branch norms are read BEFORE clipping (clip_grad_norm_ rescales the
+        # gradients in place), and only on the steps train.py will log.
+        want_branch = (self.branch_grads
+                       and (self.global_step + 1) % self.log_every == 0)
+        branch = None
+        exploded = False
         if self.amp_dtype == 'fp16':
             self.scaler.unscale_(self.optimizer)
+            branch = self._branch_grad_norms() if want_branch else None
             grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
             # Post-unscale_, so this is the true gradient norm — the same test
             # GradScaler applies internally to decide whether to skip. A handful
@@ -756,11 +868,19 @@ class Trainer:
             # generous. No detailed [grad-nan] report: under loss scaling an
             # overflow is a scale problem, not a numerics bug.
             skipped = not bool(torch.isfinite(grad_norm))
+            exploded = (not skipped) and is_grad_explosion(
+                float(grad_norm), self._norm_window, self.explode_factor,
+                self.skip_rate_window)
             if skipped:
                 self._note_skip(grad_norm)
-            self.scaler.step(self.optimizer)   # itself a no-op when non-finite
+            elif exploded:
+                skipped = True
+                self._note_skip(grad_norm, reason=self._explosion_reason(grad_norm))
+            if not exploded:
+                self.scaler.step(self.optimizer)   # itself a no-op when non-finite
             self.scaler.update()
         else:
+            branch = self._branch_grad_norms() if want_branch else None
             grad_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_val)
             # Check BEFORE stepping. `optimizer.step()` with a NaN gradient
             # writes NaN into that parameter, the next forward spreads it
@@ -771,14 +891,24 @@ class Trainer:
             # scales by total_norm, and NaN/NaN is NaN. The isfinite() costs no
             # extra sync — train.py already calls .item() on grad_norm to log it.
             skipped = not bool(torch.isfinite(grad_norm))
+            exploded = (not skipped) and is_grad_explosion(
+                float(grad_norm), self._norm_window, self.explode_factor,
+                self.skip_rate_window)
             if skipped:
                 self._report_bad_grads(grad_norm)   # full detail, first time only
                 self._note_skip(grad_norm)          # may raise the abort
+            elif exploded:
+                # Finite, so clipping would have scaled it to --grad_clip and
+                # applied it -- which is how tau=0.5 trained on 1e9-1e17 norms
+                # for five epochs. Skip it and let the abort guards count it.
+                skipped = True
+                self._note_skip(grad_norm, reason=self._explosion_reason(grad_norm))
             else:
                 self.optimizer.step()
 
         if not skipped:
             self._consecutive_skips = 0
+            self._norm_window.append(float(grad_norm))
         # Record every optimizer step, skipped or not — the window's denominator
         # is steps *attempted*, so the rate is meaningful. `_note_skip` above may
         # already have aborted on the consecutive guard, which is the more urgent
@@ -799,10 +929,19 @@ class Trainer:
         # 0.0/1.0 per optimizer step, so `avg_grad_skipped` on the epoch summary
         # reads directly as this epoch's skip rate.
         log['grad_skipped'] = float(skipped)
+        log['grad_exploded'] = float(exploded)
         log['lr'] = self.optimizer.param_groups[0]['lr']
         log['grad_norm'] = (grad_norm.detach() if torch.is_tensor(grad_norm)
                             else float(grad_norm))
+        if branch is not None:
+            log.update(branch)
         return log
+
+    def _explosion_reason(self, grad_norm):
+        med = statistics.median(self._norm_window)
+        return (f'exploding gradient ({float(grad_norm) / med:.3g}x the median '
+                f'{med:.3g} of the last {len(self._norm_window)} applied steps, '
+                f'limit --explode_factor={self.explode_factor:g})')
 
     def train_step(self, batch):
         """Run one MICRO-batch. Only every `accum_steps`-th call optimizes.
@@ -1005,6 +1144,7 @@ class Trainer:
                 'skipped_steps': self.skipped_steps,
                 'consecutive_skips': self._consecutive_skips,
                 'skip_window': list(self._skip_window),
+                'norm_window': list(self._norm_window),
                 'micro_in_cycle': self._micro_in_cycle,
             },
             'rng': self._capture_rng(),
@@ -1160,6 +1300,10 @@ class Trainer:
         self.skipped_steps = int(ts.get('skipped_steps', 0))
         self._consecutive_skips = int(ts.get('consecutive_skips', 0))
         self._skip_window = deque(ts.get('skip_window', []),
+                                  maxlen=self.skip_rate_window)
+        # Absent from pre-guard checkpoints: the guard then re-arms after a
+        # fresh window, the same grace period as a new run.
+        self._norm_window = deque(ts.get('norm_window', []),
                                   maxlen=self.skip_rate_window)
         # NOT restored from the checkpoint: a resume always begins at an epoch
         # boundary with no accumulated gradients in flight, so the next
