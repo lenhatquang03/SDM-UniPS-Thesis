@@ -4,6 +4,23 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# GroupNorm before every ReLU of the head (docs/dead_coarse_branch.md).
+# Upstream took this head from mmsegmentation but dropped the norm that
+# mmsegmentation's ConvModule puts between conv and ReLU. Without it the
+# PSP `bottleneck` ReLU -- the ONLY route from backbone stage 3 / comm.2 to the
+# loss -- can drift all-negative and stay dead, freezing ~35M parameters, and a
+# later revival blew up Model B2 (tau=0.5) at epoch 61. GroupNorm re-centres
+# each group's pre-activations on every forward, so the ReLU cannot go dead.
+# `norm=False` rebuilds upstream's head exactly (same modules, same parameter
+# names, same init); it exists for the equality test, not as a training switch.
+GN_GROUPS = 32
+
+
+def _act(channels, norm):
+    """The activation tail of one conv block: [GroupNorm,] ReLU."""
+    return [nn.GroupNorm(GN_GROUPS, channels), nn.ReLU()] if norm else [nn.ReLU()]
+
+
 class PPM(nn.ModuleList):
     """Pooling Pyramid Module used in PSPNet.
     Args:
@@ -17,7 +34,7 @@ class PPM(nn.ModuleList):
         align_corners (bool): align_corners argument of F.interpolate.
     """
 
-    def __init__(self, pool_scales, in_channels, channels):
+    def __init__(self, pool_scales, in_channels, channels, norm=True):
         super(PPM, self).__init__()
         self.pool_scales = pool_scales
         self.in_channels = in_channels
@@ -27,7 +44,7 @@ class PPM(nn.ModuleList):
                 nn.Sequential(
                     nn.AdaptiveAvgPool2d(pool_scale),
                     nn.Conv2d(self.in_channels, self.channels, kernel_size=1),
-                    nn.ReLU()
+                    *_act(self.channels, norm)
                     )
             )
 
@@ -55,7 +72,7 @@ class UPerHead(nn.Module):
             Module applied on the last feature. Default: (1, 2, 3, 6).
     """
 
-    def __init__(self, in_channels = (96, 192, 384, 768), channels = 256, pool_scales=(1, 2, 3, 6),):
+    def __init__(self, in_channels = (96, 192, 384, 768), channels = 256, pool_scales=(1, 2, 3, 6), norm=True):
         super(UPerHead, self).__init__()
         # PSP Module
         self.in_channels = in_channels
@@ -63,31 +80,32 @@ class UPerHead(nn.Module):
         self.psp_modules = PPM(
             pool_scales,
             self.in_channels[-1],
-            self.channels
+            self.channels,
+            norm=norm
             )
 
         self.bottleneck = nn.Sequential(
             nn.Conv2d(self.in_channels[-1] + len(pool_scales) * self.channels, self.channels, kernel_size=3, padding=1),
-            nn.ReLU())
+            *_act(self.channels, norm))
         # FPN Module
         self.lateral_convs = nn.ModuleList()
         self.fpn_convs = nn.ModuleList()
         for in_channels in self.in_channels[:-1]:  # skip the top layer
             l_conv = nn.Sequential(
             nn.Conv2d(in_channels, self.channels, kernel_size=1, padding=0),
-            nn.ReLU())
+            *_act(self.channels, norm))
 
 
             fpn_conv = nn.Sequential(
             nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=1),
-            nn.ReLU())
+            *_act(self.channels, norm))
 
             self.lateral_convs.append(l_conv)
             self.fpn_convs.append(fpn_conv)
 
         self.fpn_bottleneck = nn.Sequential(
             nn.Conv2d(len(self.in_channels) * self.channels, self.channels, kernel_size=3, padding=1),
-            nn.ReLU())
+            *_act(self.channels, norm))
 
 
     def psp_forward(self, inputs):
