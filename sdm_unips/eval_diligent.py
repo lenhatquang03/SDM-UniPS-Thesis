@@ -1,7 +1,7 @@
 """
 DiLiGenT benchmark evaluation for SDM-UniPS, mimicking Table 2 of the paper.
 
-Standalone: it needs nothing but an exported checkpoint directory, so it can be
+Standalone: it needs nothing but a checkpoint directory holding `best.pt`, so it can be
 run at any time after training, as many times as you like. It drives the exact
 upstream inference path (`dataio` -> `realdata` -> `builder`) that produced the
 published numbers, rather than a bespoke loader, so our figures are directly
@@ -174,6 +174,44 @@ def write_exr(path, arr):
 
 
 # ---------------------------------------------------------------------------
+# Weights
+# ---------------------------------------------------------------------------
+def stage_best_weights(ckpt_dir, weights_root):
+    """Extract `<ckpt_dir>/best.pt`'s model weights into a builder-readable dir.
+
+    `builder.load_models` reads the single `*.pytmodel` under
+    `<checkpoint>/normal/`, and loads it with torch's default
+    `weights_only=True`, which refuses a full training checkpoint (it carries
+    RNG states and the args snapshot). So the bare `state_dict` is written to
+    `<weights_root>/normal/normal.pytmodel` and the builder is pointed at
+    `weights_root`; its exact-match guard still applies unchanged.
+
+    Returns (weights_root, provenance dict for the report).
+    """
+    best = os.path.join(ckpt_dir, 'best.pt')
+    if not os.path.isfile(best):
+        raise SystemExit(f'--checkpoint: no best.pt in {ckpt_dir}')
+    ckpt = torch.load(best, map_location='cpu', weights_only=False)
+    if not (isinstance(ckpt, dict) and 'model' in ckpt):
+        raise SystemExit(f'{best}: not a training checkpoint (no "model" entry)')
+
+    normal_dir = os.path.join(weights_root, 'normal')
+    os.makedirs(normal_dir, exist_ok=True)
+    for stale in glob.glob(os.path.join(normal_dir, '*.pytmodel')):
+        os.remove(stale)
+    torch.save(ckpt['model'], os.path.join(normal_dir, 'normal.pytmodel'))
+
+    loop = ckpt.get('loop_state') or {}
+    info = {'path': os.path.abspath(best),
+            'global_step': ckpt.get('global_step'),
+            'epoch': loop.get('epoch'),
+            'best_val_loss': loop.get('best_val_loss')}
+    print(f'[DiLiGenT] weights: {info["path"]} (epoch {info["epoch"]}, '
+          f'step {info["global_step"]}, best_val_loss {info["best_val_loss"]})')
+    return weights_root, info
+
+
+# ---------------------------------------------------------------------------
 # Seeding
 # ---------------------------------------------------------------------------
 def seed_everything(base_seed, objkey, K, trial):
@@ -235,8 +273,8 @@ def build_argparser():
     p.add_argument('--diligent_dir', required=True,
                    help="DiLiGenT 'pmsData' root holding the *PNG scene dirs")
     p.add_argument('--checkpoint', required=True,
-                   help="Checkpoint dir containing normal/*.pytmodel "
-                        "(i.e. <session>/checkpoints)")
+                   help="Checkpoint dir containing best.pt "
+                        "(i.e. <session>/checkpoints); its model weights are evaluated")
     p.add_argument('--out_dir', default='diligent_eval',
                    help='Where the report, JSONL log, EXRs and staging tree go')
 
@@ -315,10 +353,13 @@ def main():
             print(f'[DiLiGenT] WARNING: K={K} exceeds the {n_avail} images some '
                   f'scene provides; it will be clipped to that scene\'s count.')
 
+    weights_root, weights_info = stage_best_weights(
+        args.checkpoint, os.path.join(out_dir, '_weights'))
+
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     ns = SimpleNamespace(
         session_name=scratch,
-        checkpoint=args.checkpoint,
+        checkpoint=weights_root,
         max_image_res=args.max_image_res,
         max_image_num=K_list[0],
         test_ext='.data',
@@ -398,7 +439,9 @@ def main():
 
     table = format_table(per_obj_K, objkeys, K_list, show_paper=True)
     header = (f'# DiLiGenT evaluation (MAE, degrees)\n\n'
-              f'- checkpoint: `{args.checkpoint}`\n'
+              f'- weights: `{weights_info["path"]}` (epoch {weights_info["epoch"]}, '
+              f'step {weights_info["global_step"]}, '
+              f'best_val_loss {weights_info["best_val_loss"]})\n'
               f'- trials per (object, K): {args.trials}   base seed: {args.seed}\n'
               f'- canonical_resolution: {args.canonical_resolution}   '
               f'pixel_samples: {args.pixel_samples}\n'
