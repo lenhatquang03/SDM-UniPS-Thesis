@@ -445,6 +445,14 @@ def build_argparser():
                         'masked pixel keeps p >= lam/n_valid, so the sampler '
                         'changes the RATE at which a pixel is supervised, '
                         'never whether it can be. 1.0 = Model A.')
+    p.add_argument('--wess_iw', action='store_true',
+                   help='Importance-weight each drawn pixel\'s loss by '
+                        '1/(n_valid * p), so the EXPECTED training loss is '
+                        'Model A\'s uniform mean over the mask and WESS only '
+                        'changes the variance of the gradient, not its target. '
+                        'Weights are 1 on the rim and at most 1/wess_lam in '
+                        'the interior. Off (default) = the unweighted B2 loss. '
+                        'Training only: val/test are never weighted.')
     p.add_argument('--wess_erode_cells', type=int, default=2,
                    help='Silhouette band excluded from the energy statistics '
                         'and from the softmax, in 64x64 energy-grid cells '
@@ -777,7 +785,7 @@ SCHEDULE_SENSITIVE_ARGS = (
     # so changing one at resume warns rather than aborting -- same treatment as
     # --lr. It does mean a resumed run can silently be a different sampler than
     # the one that produced the earlier epochs, hence the warning.
-    'wess_tau', 'wess_lam', 'wess_erode_cells', 'wess_top_k',
+    'wess_tau', 'wess_lam', 'wess_erode_cells', 'wess_top_k', 'wess_iw',
 )
 
 

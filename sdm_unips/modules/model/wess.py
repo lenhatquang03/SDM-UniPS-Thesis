@@ -480,7 +480,8 @@ def wess_train_probabilities(E, valid_ids, interior_flat, H, W,
 
 def wess_sample_train(E, mask_hw, valid_ids, H, W, n_sample,
                       tau=DEFAULT_TAU, lam=DEFAULT_LAM,
-                      erode_cells=DEFAULT_ERODE_CELLS, generator=None):
+                      erode_cells=DEFAULT_ERODE_CELLS, generator=None,
+                      return_weights=False):
     """Draw `n_sample` flat decoder-grid indices for one training scene.
 
     Unlike `wess_sample` (the Phase-0 probe path) the draw runs on the tensors'
@@ -490,19 +491,40 @@ def wess_sample_train(E, mask_hw, valid_ids, H, W, n_sample,
     sync per batch element per step. `--resume` restores the CUDA and CPU
     streams alike, so this is resumable on the same terms Model A is.
 
-    Returns `(ids, stats)`.
+    Returns `(ids, stats)`, or `(ids, stats, weights)` with `return_weights`.
+
+    `weights` are the importance weights of the drawn pixels,
+    `1 / (n_valid * p[sel])`: multiplying each drawn pixel's loss by its weight
+    makes the expected training loss exactly equal Model A's uniform mean over
+    the mask (`--wess_iw`). For that to be exact the draw switches to WITH
+    replacement whenever weights are requested, so the drawn `ids` differ from
+    the unweighted call's and may repeat a pixel. Without `return_weights` the
+    draw is unchanged. Rim pixels get exactly 1; interior pixels are capped at
+    `1 / lam` because every interior pixel keeps `p >= lam / n_valid`.
     """
     if valid_ids.numel() == 0:
         zeros = torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
-        return zeros, {'wess_tilt': float('nan'), 'wess_tilt_int': float('nan'),
-                       'wess_ess': float('nan'), 'wess_top10_frac': float('nan'),
-                       'wess_interior_frac': float('nan'), 'n_valid': 0}
+        stats = {'wess_tilt': float('nan'), 'wess_tilt_int': float('nan'),
+                 'wess_ess': float('nan'), 'wess_top10_frac': float('nan'),
+                 'wess_interior_frac': float('nan'), 'n_valid': 0}
+        if return_weights:
+            return zeros, stats, torch.ones(n_sample, device=valid_ids.device)
+        return zeros, stats
 
     interior = interior_mask(mask_hw, E.shape[-2:], erode_cells)
     p, e, is_int = wess_train_probabilities(E, valid_ids, interior, H, W,
                                             tau=tau, lam=lam)
-    replace = p.numel() < n_sample
+    # --wess_iw draws WITH replacement: each draw is then an independent pick
+    # with P(pixel i) = p_i, so E[count_i] = m * p_i exactly and the weighted
+    # loss is exactly unbiased for the uniform mean. Without replacement a
+    # pixel is capped at one inclusion, high-p pixels saturate, and the IW
+    # estimate is only approximately unbiased. Costs ~m^2 / (2 * ESS * n)
+    # repeated slots (~36 of 2048 at tau=1). Plain B2 is unchanged.
+    replace = return_weights or p.numel() < n_sample
     sel = torch.multinomial(p, n_sample, replacement=replace, generator=generator)
+    if return_weights:
+        weights = 1.0 / (p.numel() * p[sel].detach().float())
+        return valid_ids[sel], train_draw_stats(e, p, sel, is_int), weights
     return valid_ids[sel], train_draw_stats(e, p, sel, is_int)
 
 

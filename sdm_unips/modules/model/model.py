@@ -185,7 +185,7 @@ class Net(nn.Module):
     def __init__(self, pixel_samples, device,
                  wess_tau=wess_mod.DEFAULT_TAU, wess_lam=wess_mod.DEFAULT_LAM,
                  wess_erode_cells=wess_mod.DEFAULT_ERODE_CELLS,
-                 wess_top_k=2):
+                 wess_top_k=2, wess_iw=False):
         super().__init__()
         self.device = device
         self.pixel_samples = pixel_samples
@@ -199,6 +199,10 @@ class Net(nn.Module):
         self.wess_lam = float(wess_lam)
         self.wess_erode_cells = int(wess_erode_cells)
         self.wess_top_k = int(wess_top_k)
+        # `--wess_iw`: importance-weight each drawn pixel's loss by
+        # 1 / (n_valid * p) so the expected loss is Model A's uniform mean.
+        # Off = no weights are produced and the loss is the unweighted B2 loss.
+        self.wess_iw = bool(wess_iw)
         # Populated by the sub-band hook during a training forward, read by
         # `sample_train_pixels`, cleared immediately after. Never a Parameter
         # and never in the state_dict, so checkpoints are unaffected.
@@ -206,6 +210,8 @@ class Net(nn.Module):
         self._wess_bands = None
         self._wess_stats_acc = []
         self.last_wess_stats = None
+        self._sample_weights_acc = []
+        self.last_sample_weights = None   # [B, n_sample] or None
 
 
         self.input_dim = 4 # RGB + mask
@@ -359,16 +365,32 @@ class Net(nn.Module):
         """
         if valid_ids.numel() == 0:
             # No valid pixels: emit a placeholder; loss masking discards them.
+            if self.wess_iw:
+                self._sample_weights_acc.append(
+                    torch.ones(n_sample, device=valid_ids.device))
             return torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
 
         if E is not None and mask_hw is not None:
-            ids, stats = wess_mod.wess_sample_train(
-                E, mask_hw, valid_ids, H, W, n_sample,
-                tau=self.wess_tau, lam=self.wess_lam,
-                erode_cells=self.wess_erode_cells)
+            if self.wess_iw:
+                ids, stats, w = wess_mod.wess_sample_train(
+                    E, mask_hw, valid_ids, H, W, n_sample,
+                    tau=self.wess_tau, lam=self.wess_lam,
+                    erode_cells=self.wess_erode_cells, return_weights=True)
+                stats['wess_iw_w_mean'] = float(w.mean())
+                stats['wess_iw_w_max'] = float(w.max())
+                self._sample_weights_acc.append(w)
+            else:
+                ids, stats = wess_mod.wess_sample_train(
+                    E, mask_hw, valid_ids, H, W, n_sample,
+                    tau=self.wess_tau, lam=self.wess_lam,
+                    erode_cells=self.wess_erode_cells)
             self._wess_stats_acc.append(stats)
             return ids
 
+        if self.wess_iw:
+            # Uniform draw: every importance weight is exactly 1.
+            self._sample_weights_acc.append(
+                torch.ones(n_sample, device=valid_ids.device))
         if valid_ids.numel() >= n_sample:
             perm = torch.randperm(valid_ids.numel(), device=valid_ids.device)
             return valid_ids[perm[:n_sample]]
@@ -445,6 +467,7 @@ class Net(nn.Module):
             """
             E_maps = self._wess_saliency(nImgArray, canonical_resolution)
             self._wess_stats_acc = []
+            self._sample_weights_acc = []
 
             pred_n_list, idx_list = [], []
             p = 0
@@ -469,6 +492,13 @@ class Net(nn.Module):
 
             self.last_wess_stats = self._mean_wess_stats()
             self._wess_bands = None
+            # Importance weights exist only when this forward drew its own
+            # pixels with --wess_iw on; evaluation (sample_ids given) never
+            # reaches the sampler, so it stays None and val/test are unweighted.
+            self.last_sample_weights = (
+                torch.stack(self._sample_weights_acc, dim=0)
+                if self.wess_iw and sample_ids is None else None)
+            self._sample_weights_acc = []
 
             pred_n = torch.stack(pred_n_list, dim=0)         # [B, n_sample, 3]
             sample_idx = torch.stack(idx_list, dim=0)        # [B, n_sample]

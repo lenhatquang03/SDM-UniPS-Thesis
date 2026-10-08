@@ -301,6 +301,7 @@ class Trainer:
             wess_erode_cells=getattr(args, 'wess_erode_cells',
                                      wess.DEFAULT_ERODE_CELLS),
             wess_top_k=getattr(args, 'wess_top_k', 2),
+            wess_iw=getattr(args, 'wess_iw', False),
         ).to(device)
         self.net.with_grad()
         # Name the variant in the log: the architecture is fixed by the branch,
@@ -804,7 +805,13 @@ class Trainer:
             canonical_resolution=can_res, training=True, sample_ids=sample_ids,
         )
 
-        loss = losses.normal_loss(pred_n, N, M, sample_idx)
+        # --wess_iw: the model's own draw carries importance weights. The eval
+        # path supplied `sample_ids`, so `last_sample_weights` is None there
+        # and val/test losses stay unweighted.
+        weights = None
+        if not deterministic_eval:
+            weights = getattr(net_unwrapped(self.net), 'last_sample_weights', None)
+        loss = losses.normal_loss(pred_n, N, M, sample_idx, weights=weights)
         with torch.no_grad():
             mae = losses.angular_error_deg(pred_n, N, M, sample_idx)
         log = {'loss': loss.detach(), 'mae_deg': mae.detach()}

@@ -25,12 +25,22 @@ def _gather_pixels(gt_map, sample_idx):
     return out.permute(0, 2, 1).contiguous()               # [B, n_sample, C]
 
 
-def normal_loss(pred_n, gt_n_map, mask_map, sample_idx):
-    """MSE (L2) loss between predicted unit-normal and GT, masked (Sec. 4 of paper)."""
+def normal_loss(pred_n, gt_n_map, mask_map, sample_idx, weights=None):
+    """MSE (L2) loss between predicted unit-normal and GT, masked (Sec. 4 of paper).
+
+    `weights` ([B, n_sample], optional): per-pixel importance weights from
+    `--wess_iw`. They multiply each pixel's squared error but NOT the
+    denominator, so the loss stays a plain mean over the drawn pixels of
+    `w * err`, whose expectation is the uniform mean over the mask. None (the
+    default) leaves the computation exactly as before.
+    """
     gt_n = _gather_pixels(gt_n_map, sample_idx)            # [B, n_sample, 3]
     mask = _gather_pixels(mask_map, sample_idx)            # [B, n_sample, 1]
-    sq = ((pred_n - gt_n) ** 2).sum(dim=-1, keepdim=True)
+    sq = ((pred_n - gt_n) ** 2).sum(dim=-1, keepdim=True)  # [B, n_sample, 1]
     denom = mask.sum().clamp_min(1.0)
+    # weights (B, n_sample) --> weights.unsqueeze(-1) (B, n_sample, 1) for broadcasting
+    if weights is not None:
+        sq = sq * weights.unsqueeze(-1).to(sq.dtype)
     return (sq * mask).sum() / denom
 
 
