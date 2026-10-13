@@ -5,7 +5,8 @@
 # USAGE
 #   ./step3_download_and_extract_HG_data.sh <download_dir> [basename ...]
 #   ./step3_download_and_extract_HG_data.sh                     # prompts for both
-# With no basenames, every archive found across the repos is processed.
+# With no basenames, the DEFAULT_BASES list below is processed.
+# ALL_ARCHIVES=1 with no basenames processes every archive found across the repos.
 # <download_dir> is where parts land, where archives are extracted, and where the
 # downloaded zips are deleted from.
 #
@@ -26,6 +27,23 @@ set -uo pipefail
 # Searched in order; the first repo containing a given path wins.
 REPOS=("HUST-CVLab-PS/UniPS" "culacgiontan0312/UniPS")
 # REPOS=("culacgiontan0312/UniPS") # Trial run
+
+# Archives downloaded when no basenames are given (names as they appear on the Hub,
+# with any .partNN suffix stripped).
+DEFAULT_BASES=(
+  # culacgiontan0312/UniPS
+  "DiLiGenT.zip"            # diligent/DiLiGenT.zip
+  "merlmix.zip"             # merlmix/merlmix.zip.part00..05
+  "obj_ax.zip"              # polarps/obj_ax.zip.part00..02
+  # HUST-CVLab-PS/UniPS
+  "hdlong_config.zip"       # hdlong-zips/
+  "hdlong_view1.zip"
+  "hdlong_view2.zip"
+  "hdlong_view3.zip"
+  "obj_blob01x.zip"         # polarps-zips/
+  "obj_blob03x.zip"
+  "obj_blob05x.zip"
+)
 
 RETRIES=3
 RETRY_WAIT=30
@@ -48,11 +66,15 @@ if [[ -n "$DOWNLOAD_DIR" ]]; then
   BASES=("$@")
 else
   read -r -p "Download dir (absolute path; parts, extraction and cleanup all happen here): " DOWNLOAD_DIR
-  read -r -p "Archive basenames (blank for every archive in the repos): " -a BASES
+  read -r -p "Archive basenames (blank for the built-in DEFAULT_BASES list): " -a BASES
 fi
 
 [[ -n "$DOWNLOAD_DIR" ]] || { echo "No download dir given."; exit 1; }
-# No basenames means every archive in the repos.
+# No basenames: use the built-in list, unless ALL_ARCHIVES=1 asks for every archive.
+if (( ${#BASES[@]} == 0 && ${ALL_ARCHIVES:-0} != 1 )); then
+  BASES=("${DEFAULT_BASES[@]}")
+fi
+# Still no basenames (ALL_ARCHIVES=1) means every archive in the repos.
 WANT_ALL=$(( ${#BASES[@]} == 0 ))
 
 # Parts are staged in a hidden subdir so they never collide with extracted output.
