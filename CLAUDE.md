@@ -494,13 +494,6 @@ python sdm_unips/main.py \
   --checkpoint CHECKPOINT_PATH
 ```
 
-**Key inference flags:**
-- `--scalable`: Enable memory-efficient mode for high-resolution images (512×512 patch decomposition; trades some accuracy for lower VRAM)
-- `--max_image_res`: Max input resolution (default 4096)
-- `--max_image_num`: Max images to load per object (default 10)
-- `--canonical_resolution`: Internal encoding resolution (default 256)
-- `--pixel_samples`: Pixels sampled per batch during inference (default 10000)
-
 The checkpoint directory must contain `<checkpoint>/normal/*.pytmodel`.
 
 ## Running Training
@@ -868,23 +861,15 @@ aborts on a change.
 - `--hdlong_dir`, `--polarps_dir`: roots for the two mixed sources (either or
   both). Each takes **one or more** roots (`nargs='+'`) — see **Several roots
   per source** below
-- `--train_dir`: auto-detect root (scenes classified into hdlong/polarps by on-disk markers)
 - `--max_scenes`: cap on the **combined** scene pool before the split (thesis uses 8000)
 - `--k_per_scene`: 10 — images drawn per scene, and the minimum a scene must
   supply to enter the pool. Split-critical: raising it shrinks the pool
-- `--scene_manifest`: reuse a pinned scene list instead of rescanning
-- `--strict_scenes`: abort if any scene fails validation (default: skip it)
 - `--max_bad_scene_frac`: 0.05 — abort if more than this fraction fails
   validation (0 disables); catches a half-mounted dataset or a wrong `--k_per_scene`
 - `--val_fraction`: held-out fraction for validation (default 0.1; **0 = no
   val split**, which also means no `best.pt`)
 - `--test_fraction`: held-out fraction for the final test report (default 0.1;
   **0 = no test split**, for a run judged by an external benchmark)
-- `--test_trials`: deterministic K-image draws per test scene, averaged (default 3; keep small)
-- `--val_every_epochs`: epochs between validation passes / best.pt checks (default 1)
-- `--patience`: early-stopping patience in validation checks (default 10; 0 disables)
-- `--min_delta`: min val-loss decrease counted as improvement (default 0.0)
-- `--batch_size`: 8 (**micro**-batch) — `--pixel_samples`: m=2048
 - `--accum_steps`: 1 — micro-batches per optimizer step; effective batch is
   `--batch_size × --accum_steps`. Use it to keep the recipe's effective batch
   of 8 on a GPU too small to hold it in one pass (`--batch_size 2
@@ -899,21 +884,8 @@ aborts on a change.
 - `--train_resolution`: 512 — `--canonical_resolution`: 256
   (There are deliberately **no architecture flags**: the variant is the branch.
   See **Model variants** above.)
-- K is `--k_per_scene` (default 10), enforced in `HdlongLoader` / `PolarPSLoader` and as the pool's validity threshold.
-- `--lr`: 1e-4 — `--weight_decay`: 0.05
 - `--lr_schedule`: default `cosine`; `wsd` is recommended and `step` exists —
   see **LR schedule** below
-- `--decay_fraction`: 0.2 — `--decay_from_step`: 0 — `--decay_now` (wsd only)
-- `--auto_decay` (off) — `--auto_decay_rel`: 0.01 — `--auto_decay_patience`: 2
-  — `--auto_decay_min_epoch`: 8. In-process decay trigger; see **LR schedule**
-- `--warmup_epochs`: 5.0 (linear)
-- `--amp_dtype`: `bf16` (recommended on H100), `fp16` (legacy), or `none`
-- `--grad_clip`: 1.0
-- `--max_consecutive_skips`: 20 — `--max_skip_rate`: 0.3 over
-  `--skip_rate_window`: 200 (either 0 disables that guard) — see below
-- `--keep_last`: 3 (epoch checkpoints to retain; `best.pt` is kept separately)
-  — `--ckpt_every`: 1000 optimizer steps, `--keep_last_steps`: 2 (mid-epoch
-  crash insurance; see **Checkpoints** below)
 - `--resume`: continue an interrupted run (`auto`, a checkpoint dir, or a
   file) — see **Resuming** below. `--allow_config_change` downgrades the
   split-config guard to a warning
@@ -933,7 +905,6 @@ aborts on a change.
   checkpoint store the resolved values, so `--resume` is unaffected by how the
   arguments arrived. `sdm_unips/configs/modelB2_wess.yaml` is B2's launch
   config. Needs PyYAML
-- `--smoke_test` + `--smoke_epochs`: short dry-run for Kaggle
 
 The final test evaluation runs automatically after the last epoch on the
 held-out `--test_fraction` split, averaged over `--test_trials` deterministic
@@ -1298,42 +1269,6 @@ fragmentation-driven OOMs that occur while `nvidia-smi` still shows free VRAM.
 
 ## Data Format
 
-**Inference layout:**
-```
-YOUR_DATA_PATH/
-└── OBJECT_NAME.data/
-    ├── L*.png          # input images (8-bit or 16-bit)
-    ├── mask.png        # optional object mask
-    └── Normal_gt.png   # optional ground-truth for MAE evaluation
-```
-
-**Inference output layout** (written to `SESSION_NAME/results/OBJECT_NAME.data/`):
-```
-normal.png
-error.png      # only if Normal_gt.png provided
-```
-
-**Training layout (hdlong-complexv1 / MerlMix + PolarPS):**
-```
-HDLONG_ROOT/            # one or more; MerlMix uses this exact layout
-└── SCENE_NAME/
-    ├── light_means.config        # required marker; lists point/dir/env means
-    ├── cam_0000N/
-    │   ├── binary_mask.exr
-    │   ├── local_normal.exr      # GT, RGB-encoded as (n+1)/2 in [0,1]
-    │   ├── point_light_000NN.exr # 20 per cam, divided by point_mean
-    │   ├── dir_light_000NN.exr   # 20 per cam, divided by dir_mean
-    │   └── env_light_000NN.exr   # 10 per cam, divided by env_mean
-    └── ...
-
-POLARPS_ROOT/
-└── SCENE_NAME/
-    ├── normal.exr                # required marker; mask derived from magnitude
-    └── <material-mix-subdir>/
-        ├── light-01/S0.exr
-        ├── light-02/S0.exr
-        └── ... (32 lights total per scene)
-```
 The dataset class auto-detects scene type via these markers (`light_means.config` ⇒ hdlong, `normal.exr` ⇒ PolarPS). **MerlMix carries the hdlong layout and marker**, so it is passed as an additional `--hdlong_dir` root and needs no loader, `kind`, or preprocessing of its own. It synthesizes each training render via a Dirichlet (α, β, γ) mix of one randomly chosen point/dir/env light triple (hdlong) or by drawing one of 32 `S0.exr` images (PolarPS). hdlong is upsampled from 256×256 to `--train_resolution`.
 
 **Augmentation (training only).** Two label-preserving symmetries and one
@@ -1405,20 +1340,6 @@ keep an in-process cache.
 
 ## Architecture
 
-The system has three logical stages.
-
-### 1. Encoding — `modules/model/model.py` → `ScaleInvariantSpatialLightImageEncoder`
-Each input image is encoded at a fixed 256×256 canonical resolution regardless of original resolution. A **ConvNeXt-T** backbone (`modules/model/convnext.py`, depths `[3,3,9,3]`, dims `[96,192,384,768]`) extracts 4-scale features fused by **UPerHead** (`modules/model/uper.py`). On the `modelB-wtconv` branch each block's depthwise convolution is `modules/model/wtconv.py:WTConv2d` instead of the 7×7 conv; it is shape-preserving, so everything in this section and below is unchanged. Light-axis transformer blocks are stacked at counts `[0,1,2,4]` per scale. The output is a *Global Light-aware Context* (GLC) feature map at ¼ resolution. For high-res inputs (or `--scalable` inference), images are decomposed into G×G sub-tensors via `modules/model/decompose_tensors.py`, processed independently, then recomposed; a downsized-image feature map is added back to promote inter-tile interaction.
-
-### 2. Aggregation — `modules/model/model.py` → `GLC_Aggregation`
-A `CommunicationBlock` transformer (`modules/model/transformer.py`) performs **cross-image attention**: at each sampled pixel, K image features attend to each other along the light axis. PMA collapses K → 1 (paper's pixel-sampling Transformer). No positional embeddings on samples (paper Sec. 3).
-
-### 3. Regression — `modules/model/model.py` → `Regressor`
-At the full decoder resolution (up to 4096×4096 in inference, 512 by default in training), per-pixel prediction. A spatial-axis communication transformer refines features across pixels in a sample set, then a `384→192→3` MLP predicts the unit normal.
-
-### Inference orchestration — `modules/builder/builder.py`
-`Builder` loads the checkpoint, wraps `Net`, and runs the pixel-sampling loop in `--pixel_samples` chunks across all valid pixels. In scalable mode it handles patch decomposition at the encoder level and Gaussian feature smoothing (`modules/utils/gauss_filter.py`) at patch boundaries.
-
 **GLC smoothing is gated on P > 4, as the paper specifies — a deliberate
 deviation from upstream's released code.** The paper's scale-invariant encoder
 says *"Optionally, when P is larger than 4, we apply depth-wise Gaussian
@@ -1446,14 +1367,7 @@ includes DiLiGenT via `eval_diligent.py` and every `--scalable` patch
 numbers produced after it. Re-run the full ablation rather than mixing the two.
 
 ### Training orchestration — `modules/builder/trainer.py`
-`Trainer` builds `Net`, `AdamW`, the LR scheduler (step decay or cosine, both with epoch-based warmup), and `GradScaler` (AMP only for fp16). `Net.forward(..., training=True)` samples exactly `pixel_samples` valid-mask pixels per batch element with gradients on (no `.detach()`), and returns flat per-pixel predictions plus the sampled flat indices. The loss (`modules/loss/losses.py:normal_loss`) gathers GT at those indices and computes masked MSE on normals (Sec. 4). Each save also writes `normal.pytmodel` so checkpoints are drop-in for inference.
-
 `train_step` runs one **micro**-batch: it zeroes gradients only at the start of an accumulation cycle, divides the loss by `--accum_steps` before `backward()` (so the accumulated gradient is the *mean* over the effective batch), and optimizes on every `accum_steps`-th call, flagging that in `log['stepped']`. Clipping therefore sees the complete effective-batch gradient, which is what `--grad_clip 1.0` is calibrated against. `Trainer.flush_accum()` applies a short trailing cycle at each epoch boundary so the last micro-batches are not discarded by the next `zero_grad`; `steps_per_epoch` is `ceil(len(train_loader) / accum_steps)` to match.
-
-### Data loading
-- Inference: `modules/io/dataloader/realdata.py` — auto bounding-box cropping, square aspect ratio, mean-luminance normalization, optional masking, GT MAE (`modules/utils/compute_mae.py`).
-- Training (thesis mix): `modules/io/dataloader/hdlong.py` (per-camera Dirichlet light mixing for hdlong-complexv1), `modules/io/dataloader/polarps.py` (random K of 32 S0 lights), unified by `modules/io/dataloader/mixed.py:MixedTrainDataset`. `modules/io/dataloader/scene_check.py` validates the pool before the split, owns the shared "usable unit" helpers the loaders draw from, and owns multi-root keying (`as_roots` / `build_roots`). Every hdlong-structured dataset — hdlong-complexv1 and MerlMix alike — goes through `hdlong.py`; MerlMix is an extra `--hdlong_dir` root, not a new module. The per-image normalization statistics, the U[mean, max] draw taken from them, and the PolarPS-only sidecar cache all live in `modules/io/dataloader/scale_cache.py`. `mixed.py:build_mixed_split` performs the deterministic, per-source-proportional scene-level train/val/test split and returns all three disjoint datasets in one pass (same seed ⇒ identical, disjoint splits) and `train.py` wraps the two held-out splits for evaluation. K is `--k_per_scene` (default 10) per scene. (`modules/io/dataio.py` is upstream's *inference* loader, untouched — it has no train/val/test accessors.)
-- Held-out val and test: both wrapped by `mixed.py:MixedEvalDataset` (length `n_scenes × n_trials`, per-index-seeded so renders are worker-count-independent and reproducible). Val uses `n_trials=1` and runs every `--val_every_epochs`; test uses `--test_trials` and runs **once after the final epoch** via `train.py:run_test_eval`. Both sweep `train.py:run_eval_pass` → `Trainer.val_step` (scene-count-weighted mean, non-finite dropped). `--test_fraction 0` builds no test loader (`--val_fraction` must be > 0, so the val loader always exists); `sdm_unips/eval_diligent.py` is the external benchmark used when the test split is off.
 
 ## Environment
 

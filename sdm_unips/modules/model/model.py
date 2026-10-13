@@ -18,6 +18,7 @@ from . import uper
 from ..utils import gauss_filter
 from ..utils.ind2sub import *
 from . import wess as wess_mod
+from . import carrier_dat
 from .decompose_tensors import *
 
 class ImageFeatureExtractor(nn.Module):
@@ -212,6 +213,9 @@ class Net(nn.Module):
         self.last_wess_stats = None
         self._sample_weights_acc = []
         self.last_sample_weights = None   # [B, n_sample] or None
+        # Model C diagnostic: surviving carriers per scene (<= 64), averaged over
+        # the micro-batch of a training forward; None on evaluation forwards.
+        self.last_carrier_stats = None
 
 
         self.input_dim = 4 # RGB + mask
@@ -222,7 +226,18 @@ class Net(nn.Module):
         self.glc_aggregation = GLC_Aggregation(256+self.input_dim, num_agg_transformer=2, dim_aggout=384, dim_feedforward=1024, use_efficient_attention=False).to(self.device)
 
 
-        self.regressor = Regressor(384, num_enc_sab=1, use_efficient_attention=True, dim_feedforward=1024).to(self.device)
+        # --- Model C: local deformable context + carrier-token regressor ---
+        # Design record: ~/reports/modelC_design/modelC_carrier_dat_design.md.
+        # `dat` enriches each drawn pixel's per-image GLC feature from 16
+        # deformed points of that image's map; `carrier_init` pools 64 carriers
+        # from the same maps, which go through glc_upsample/glc_aggregation like
+        # pixels (shared weights, C8) and then join the pixels in the regressor.
+        self.dat = carrier_dat.DeformablePixelAttention(
+            dim=256, dim_obs=self.input_dim, num_heads=8, num_groups=4,
+            num_points=4, offset_range=4.0, dim_feedforward=1024).to(self.device)
+        self.carrier_init = carrier_dat.CarrierInit(dim=256, grid=8).to(self.device)
+        self.pos_embed = carrier_dat.PositionMLP(dim=384, hidden=512).to(self.device)
+        self.regressor = carrier_dat.CarrierRegressor(384, num_layers=2, dim_feedforward=1024).to(self.device)
 
         self._install_wess_hook()
 
@@ -263,27 +278,55 @@ class Net(nn.Module):
         mode_change(self.glc_upsample, False)
         mode_change(self.glc_aggregation, False)
         mode_change(self.regressor, False)
+        mode_change(self.dat, False)
+        mode_change(self.carrier_init, False)
+        mode_change(self.pos_embed, False)
 
     def with_grad(self):
         mode_change(self.image_encoder, True)
         mode_change(self.glc_upsample, True)
         mode_change(self.glc_aggregation, True)
         mode_change(self.regressor, True)
+        mode_change(self.dat, True)
+        mode_change(self.carrier_init, True)
+        mode_change(self.pos_embed, True)
 
 
-    def _decode_pixels(self, glc, I_dec, target, ids, num_imgs, H, W, C):
+    def _scene_context(self, glc, I_dec, M_dec, b, target):
+        """Per-scene state shared by every pixel chunk of one batch element.
+
+        Only what is a function of the scene alone lives here: the DAT offset
+        field and the carriers' C0 (pooled, light-aggregated, position-embedded).
+        Anything downstream of C0 depends on the chunk's pixels and must be
+        recomputed per chunk -- caching it would leak one chunk into the next.
+        """
+        glc_n = glc[target, :, :, :]
+        field = self.dat.offset_field(glc_n)
+        tokens, pos = self.carrier_init(glc_n, I_dec[target, :, :, :], M_dec[b, 0])
+        if tokens.shape[0] == 0:
+            return {'field': field, 'carriers': None}
+        o_c = tokens[:, :, :self.input_dim]
+        c = self.glc_upsample(tokens)
+        c = self.glc_aggregation(torch.cat([o_c, c], dim=2))          # [c, 384]
+        c = c + self.pos_embed(pos)
+        return {'field': field, 'carriers': c}
+
+    def _decode_pixels(self, glc, I_dec, target, ids, num_imgs, H, W, C, ctx):
         """Decode predictions for the given pixel indices `ids` of one batch element."""
         o_ = I_dec[target, :, :, :].reshape(num_imgs, C, H * W).permute(2, 0, 1)  # [HW, N, C]
         o_ids = o_[ids, :, :]                                                    # [m, N, C]
-        coords = ind2coords(np.array((H, W)), ids).expand(num_imgs, -1, -1, -1).to(self.device)
-        glc_ids = F.grid_sample(glc[target, :, :, :], coords, mode='bilinear', align_corners=False)
+        coords = ind2coords(np.array((H, W)), ids).to(self.device)              # [1, 1, m, 2]
+        glc_n = glc[target, :, :, :]
+        glc_ids = F.grid_sample(glc_n, coords.expand(num_imgs, -1, -1, -1), mode='bilinear', align_corners=False)
         glc_ids = glc_ids.reshape(num_imgs, -1, len(ids)).permute(2, 0, 1)       # [m, N, F]
+        glc_ids = self.dat(glc_n, glc_ids, o_ids, coords, ctx['field'])         # [m, N, F]
 
         x = torch.cat([o_ids, glc_ids], dim=2)
         glc_ids = self.glc_upsample(x)
         x = torch.cat([o_ids, glc_ids], dim=2)
         x = self.glc_aggregation(x)
-        x_n = self.regressor(x, len(ids))
+        x = x + self.pos_embed(coords.reshape(-1, 2))
+        x_n = self.regressor(x, ctx['carriers'])
         # Gradient-safe unit normalization. F.normalize computes sqrt(sum(x^2))
         # then clamp_min(eps); for a near-zero predicted vector that yields
         # sqrt'(0)=inf times the clamped-region gradient 0 -> 0*inf = NaN, which
@@ -291,7 +334,6 @@ class Net(nn.Module):
         # Folding eps inside the sqrt keeps the gradient finite everywhere.
         norm = torch.sqrt((x_n * x_n).sum(dim=1, keepdim=True) + 1e-12)
         return x_n / norm
-
 
     def _wess_saliency(self, nImgArray, canonical_resolution):
         """Per-batch-element 64x64 energy maps, or None if the tap is empty.
@@ -469,7 +511,7 @@ class Net(nn.Module):
             self._wess_stats_acc = []
             self._sample_weights_acc = []
 
-            pred_n_list, idx_list = [], []
+            pred_n_list, idx_list, carrier_counts = [], [], []
             p = 0
             for b in range(B):
                 num_imgs = int(nImgArray[b])
@@ -486,11 +528,16 @@ class Net(nn.Module):
                         E=None if E_maps is None else E_maps[b],
                         mask_hw=M_dec[b, 0], H=H, W=W)
 
-                X_n = self._decode_pixels(glc, I_dec, target, ids, num_imgs, H, W, C)
+                ctx = self._scene_context(glc, I_dec, M_dec, b, target)
+                carrier_counts.append(0 if ctx['carriers'] is None else ctx['carriers'].shape[0])
+                X_n = self._decode_pixels(glc, I_dec, target, ids, num_imgs, H, W, C, ctx)
                 pred_n_list.append(X_n)
                 idx_list.append(ids)
 
             self.last_wess_stats = self._mean_wess_stats()
+            self.last_carrier_stats = (
+                {'carrier_count': sum(carrier_counts) / len(carrier_counts)}
+                if sample_ids is None else None)
             self._wess_bands = None
             # Importance weights exist only when this forward drew its own
             # pixels with --wess_iw on; evaluation (sample_ids given) never
@@ -529,8 +576,9 @@ class Net(nn.Module):
             else:
                 idset = [ids]
 
+            ctx = self._scene_context(glc, I_dec, M_dec, b, target)
             for ids in idset:
-                X_n = self._decode_pixels(glc, I_dec, target, ids, int(nImgArray[b]), H, W, C)
+                X_n = self._decode_pixels(glc, I_dec, target, ids, int(nImgArray[b]), H, W, C, ctx)
                 nout[b, ids, :] = X_n.detach()
 
         return nout.permute(0, 2, 1).reshape(B, 3, H, W)

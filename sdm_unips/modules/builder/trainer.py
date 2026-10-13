@@ -221,6 +221,8 @@ BRANCH_PREFIXES = (
     ('gn_glc_upsample',    ('glc_upsample.',)),
     ('gn_glc_aggregation', ('glc_aggregation.',)),
     ('gn_regressor',       ('regressor.',)),
+    ('gn_dat',             ('dat.',)),
+    ('gn_carrier',         ('carrier_init.', 'pos_embed.')),
 )
 # Consecutive computations (one per logged optimizer step) at exactly zero
 # before a group is reported dead: 20 x --log_every 10 = ~200 optimizer steps.
@@ -307,8 +309,9 @@ class Trainer:
         # Name the variant in the log: the architecture is fixed by the branch,
         # not by a flag, so this line is the only record in `train.log` of which
         # model produced the run.
-        print(f"[Trainer] Target = Normal  Backbone = ConvNeXt-T + WTConv "
-              f"(Model B1)  Params = {get_n_params(self.net):,}")
+        print(f"[Trainer] Target = Normal  Backbone = ConvNeXt-T + WTConv  "
+              f"Decoder = deformable pixel attention + carrier regressor "
+              f"(Model C)  Params = {get_n_params(self.net):,}")
 
         # NOTE: resuming is NOT done here. It has to happen after the optimizer
         # and scheduler exist, or their state cannot be restored — which is
@@ -825,6 +828,12 @@ class Trainer:
         stats = getattr(net_unwrapped(self.net), 'last_wess_stats', None)
         if stats is not None and not deterministic_eval:
             log.update(stats)
+        # Model C: mean surviving carriers per scene (<= 64), logged the same
+        # way, so each epoch summary carries `avg_carrier_count`. Far below 64
+        # means most windows are background and carrier coverage is thin.
+        carriers = getattr(net_unwrapped(self.net), 'last_carrier_stats', None)
+        if carriers is not None and not deterministic_eval:
+            log.update(carriers)
         return loss, log
 
     def _report_nan(self, batch):
