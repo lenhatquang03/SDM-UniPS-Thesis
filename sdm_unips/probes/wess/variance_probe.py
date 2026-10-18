@@ -18,6 +18,11 @@ than B1"):
             iw       WESS tau=1 lam=0.25 S0 energy, with replacement, loss x 1/(n p)
             shuffled same as iw with the 64x64 energy map's cells permuted
                      (still unbiased, no geometric content)
+            uniform2 a second, independent uniform draw (Model A's sampler again):
+                     the measured NULL of both integrity statistics. Its D and its
+                     V ratio against `uniform` must come out ~1.
+            uniform_rep uniform WITH replacement, unweighted: separates the effect
+                     of drawing with replacement from the effect of WESS.
   Null      ratio ~ 1; shuffled >= 1.
   Decision  SUPPORTED iff GM(iw) < 1 AND GM(shuffled) >= 1 AND
             mean_s[log r_iw - log r_shuffled] < -2 SE (paired over scenes).
@@ -30,8 +35,11 @@ than B1"):
                                        which is Model C's question.
 
 Integrity checks printed per checkpoint:
+  * D null (added 2026-10-18 after the first run read D ~ 15 for both WESS
+    arms with no measured null): median D(uniform2) must be < 2. If it is not,
+    the D statistic itself is wrong and NO D value below can be read.
   * unbiasedness: D = ||g_bar_arm - g_bar_uniform||^2 / ((V_arm + V_uniform)/R).
-    Under equal means E[D] = 1; a median far above ~2 means an arm is biased.
+    Under equal means E[D] = 1; read each arm's D against D(uniform2).
   * importance-weight mean per draw ~ 1, max <= 1/lam.
   * eval() is on (dropout off), so the draw is the only source of randomness.
 
@@ -63,7 +71,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(HERE, '..', '..'))
 
-ARMS = ('uniform', 'iw', 'shuffled')
+ARMS = ('uniform', 'iw', 'shuffled', 'uniform2', 'uniform_rep')
+NULL_ARMS = ('uniform2', 'uniform_rep')
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +105,23 @@ def summarize(path):
     wmean = st.mean(r['w_mean']['iw'] for r in recs)
     wmax = max(r['w_max']['iw'] for r in recs)
     print('INTEGRITY')
-    print(f'  unbiasedness D (median, expect ~1): iw {Di:.2f}   shuffled {Ds:.2f}'
-          f'   {"OK" if max(Di, Ds) < 2.5 else "CHECK: an arm looks biased"}')
+    has_null = all('uniform2' in r['D'] for r in recs)
+    if has_null:
+        Dn = st.median(r['D']['uniform2'] for r in recs)
+        Dr = st.median(r['D']['uniform_rep'] for r in recs)
+        vn = math.exp(st.mean(math.log(r['V']['uniform2'] / r['V']['uniform']) for r in recs))
+        vr = math.exp(st.mean(math.log(r['V']['uniform_rep'] / r['V']['uniform']) for r in recs))
+        null_ok = Dn < 2.0
+        print(f'  D NULL (uniform2 vs uniform, median, must be < 2): {Dn:.2f}   '
+              f'{"PASS" if null_ok else "FAIL -- the D statistic itself is wrong; no D below is readable"}')
+        print(f'  V NULL (uniform2 / uniform, GM, expect ~1): {vn:.3f}')
+        print(f'  uniform with replacement: D {Dr:.2f}, V ratio {vr:.3f}  (replacement effect alone)')
+        if null_ok:
+            print(f'  unbiasedness D (median), read against the null {Dn:.2f}: iw {Di:.2f}   shuffled {Ds:.2f}'
+                  f'   {"consistent with unbiased" if max(Di, Ds) < 2.0 else "WESS arms biased: their mean gradient differs from uniform"}')
+    else:
+        print('  no null arm in these records (run before 2026-10-18): D has no measured baseline')
+        print(f'  unbiasedness D (median): iw {Di:.2f}   shuffled {Ds:.2f}')
     print(f'  iw weights: mean over scenes {wmean:.3f} (expect ~1), max {wmax:.3f} (expect <= 4)\n')
     ok = gm_i < 1 and gm_s >= 1 and md < -2 * sd
     print('DECISION (pre-registered):')
@@ -181,9 +205,12 @@ def run(args):
         return tap_sites.site_map('S0', learned, {}, sc['M'][0, 0], args.top_k)
 
     def draw(arm, sc, E):
-        if arm == 'uniform':
+        if arm in ('uniform', 'uniform2'):
             perm = torch.randperm(sc['valid_ids'].numel(), device=sc['valid_ids'].device)
             return sc['valid_ids'][perm[:m]], None
+        if arm == 'uniform_rep':
+            pick = torch.randint(0, sc['valid_ids'].numel(), (m,), device=sc['valid_ids'].device)
+            return sc['valid_ids'][pick], None
         ids, _, w = wess.wess_sample_train(E, sc['M'][0, 0], sc['valid_ids'], sc['H'], sc['H'], m,
                                            tau=args.tau, lam=args.lam,
                                            erode_cells=args.erode_cells, return_weights=True)
@@ -211,7 +238,8 @@ def run(args):
             E = energy_map(sc)
             g_sh = torch.Generator()
             g_sh.manual_seed(tap_sites.shuffle_seed(args.seed, i, 'S0'))
-            E_arm = {'uniform': None, 'iw': E, 'shuffled': shuffle_map(E, g_sh)}
+            E_arm = {'uniform': None, 'iw': E, 'shuffled': shuffle_map(E, g_sh),
+                     'uniform2': None, 'uniform_rep': None}
 
             acc = {a: Welford() for a in ARMS}
             w_mean = {a: [] for a in ARMS}
@@ -229,7 +257,7 @@ def run(args):
             V = {a: acc[a].var_trace() for a in ARMS}
             R = args.draws
             D = {a: float(((acc[a].mean - acc['uniform'].mean) ** 2).sum()) /
-                 ((V[a] + V['uniform']) / R) for a in ('iw', 'shuffled')}
+                 ((V[a] + V['uniform']) / R) for a in ARMS if a != 'uniform'}
             kind, scene_dir = eval_set.scenes[i % eval_set.n_scenes]
             rec = {'kind': 'scene', 'index': i, 'source': kind,
                    'scene': os.path.basename(scene_dir.rstrip('/')),
@@ -246,7 +274,8 @@ def run(args):
             torch.cuda.empty_cache()
             print(f'[var-probe {i + 1}/{n_scenes}] {rec["scene"][:30]:30s} '
                   f'iw/u {V["iw"] / V["uniform"]:.3f}  shuf/u {V["shuffled"] / V["uniform"]:.3f}  '
-                  f'D iw {D["iw"]:.2f} shuf {D["shuffled"]:.2f}  ({rec["sec"]}s, '
+                  f'D iw {D["iw"]:.2f} shuf {D["shuffled"]:.2f} NULL u2 {D["uniform2"]:.2f} '
+                  f'rep {D["uniform_rep"]:.2f}  ({rec["sec"]}s, '
                   f'total {time.time() - t0:.0f}s)', flush=True)
 
     print(f'\n[var-probe] records: {out_path}')
