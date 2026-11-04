@@ -1,0 +1,157 @@
+\documentclass[Main.tex]{subfiles}
+\newcommand{\underwrite}[3][]{% \underwrite[<thickness>]{<numerator>}{<denominator>}
+  \genfrac{}{}{#1}{}{\textstyle #2}{\scriptstyle #3}
+}
+
+\renewcommand{\thesection}{\arabic{section}}
+
+\begin{document}
+\begin{titlepage}
+\thispagestyle{empty}
+% \thisfancypage{
+% \setlength{\fboxsep}{3pt}
+% \fbox}{} 
+\begin{center}
+
+{\textbf{\large{HANOI UNIVERSITY OF SCIENCE AND TECHNOLOGY }}}\\[4cm]
+
+{\textbf{\huge{GRADUATION THESIS}}}\\[1cm]
+{\textbf{\Large{Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens}}\\[1cm]
+
+{\textbf{\large{LÊ NHẬT QUANG}}}\\
+{\large{quang.ln225522@sis.hust.edu.vn}}\\[0.5cm]
+
+{\textbf{\large{Program: Data Science and Artificial Intelligence}}}\\
+
+\vspace{4cm}
+% Please add the following required packages to your document preamble:
+% \usepackage{graphicx}
+\begin{table}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{ll}
+ \multicolumn{1}{l}{\textbf{Supervisor:}} & Ngô Thành Trung \hspace{0.5cm} 
+  \\[0.5cm]
+ \multicolumn{1}{l}{\textbf{Department:}} & Computer Engineering \hspace{0.5cm} \\ [0.5cm]
+ \multicolumn{1}{l}{\textbf{School:}} & School of Information and Communications Technology \hspace{0.5cm} \\ [5.5cm]
+% \underline{\hspace{3cm}}  \\[0.5cm]
+%   & \multicolumn{1}{r}{Chữ kí GVHD}     \\[0.5cm]
+% \textbf{Khoa:} & Kỹ thuật máy tính                 \\[0.5cm]
+% \textbf{Trường:} & Công nghệ Thông tin và Truyền thông \\[5cm]
+\multicolumn{2}{c}{\textbf{HANOI, 06/2022}}                                            
+\end{tabular}%
+}
+\end{table}}
+\end{center}
+
+\end{titlepage}
+
+\chapter{Improving SDM-UniPS: a Roadmap}
+\section{Frequency-Domain Feature Extraction}
+
+\textbf{Original Mechanism in SDM-UniPS} \\
+The baseline SDM-UniPS framework utilizes a \textbf{ConvNeXt-T} backbone in its Scale-invariant Spatial-light Feature Encoder. This backbone architecture is founded upon the ConvNeXt block, which employs a \textbf{$7 \times 7$ spatial depthwise convolution} to capture local dependencies and provide a large receptive field, mimicking the behavior of non-local Vision Transformers.
+
+\textbf{Limitations of the Original Structure} \\
+In high-precision \textbf{Photometric Stereo (PS)}, surface normals are mathematically derived from intensity gradients; therefore, the preservation of high-frequency shading cues is crucial. The $7 \times 7$ spatial kernels in ConvNeXt possess a fundamental "Receptive Field vs. Detail" trade-off:
+\begin{itemize}
+    \item \textbf{Low-Pass Filtering Bias:} To capture global geometry, spatial kernels must be large. However, as kernel size increases, the operation increasingly acts as a low-pass filter that suppresses high-frequency signals.
+    \item \textbf{Gradient Smoothing:} In PS, a sharp change in intensity (e.g., at a shadow boundary or a surface crease) corresponds to a sharp change in the normal vector. Spatial convolutions "average" these intensities with neighboring pixels, effectively blurring the resulting normal map and increasing the \textbf{Mean Angular Error (MAE)} at surface discontinuities.
+    \item \textbf{Spectral Mixing:} A standard convolution treats the "base shape" (low-frequency) and the "fine texture" (high-frequency) as a single signal, leading to a loss of the micro-geometric cues necessary for high-accuracy reconstruction.
+\end{itemize}
+
+\textbf{Proposed Spectral Representation} \\
+We propose replacing the $7 \times 7$ spatial depthwise convolution within the ConvNeXt block with a \textbf{WTConv (Wavelet Convolution)} layer. This transitions the feature extraction process from a purely spatial domain to a \textbf{spectral decomposition} framework. The WTConv layer implements a 2D Discrete Wavelet Transform (DWT) using a depthwise convolution with a stride of 2, utilizing the four fixed Haar wavelet filters:
+\begin{equation}
+    f_{LL} = \frac{1}{2} \begin{bmatrix} 1 & 1 \\ 1 & 1 \end{bmatrix}, \quad
+    f_{LH} = \frac{1}{2} \begin{bmatrix} 1 & -1 \\ 1 & -1 \end{bmatrix}, \quad
+    f_{HL} = \frac{1}{2} \begin{bmatrix} 1 & 1 \\ -1 & -1 \end{bmatrix}, \quad
+    f_{HH} = \frac{1}{2} \begin{bmatrix} 1 & -1 \\ -1 & 1 \end{bmatrix}
+\end{equation}
+The DWT decomposes the input feature map $X \in \mathbb{R}^{H \times W \times C}$ into four frequency sub-bands $X_k \in \mathbb{R}^{\frac{H}{2} \times \frac{W}{2} \times C}$ for $k \in \{LL, LH, HL, HH\}$:
+\begin{equation}
+    \{X_{LL}, X_{LH}, X_{HL}, X_{HH}\} = \text{DWT}(X)
+\end{equation}
+To exploit these multi-frequency representations, the model performs depthwise convolutions on these sub-bands independently using learnable kernels $W_k$. This approach enables the backbone to achieve a \textbf{massive effective receptive field} through the low-frequency component ($X_{LL}$) while explicitly preserving high-frequency geometric gradients in the detail sub-bands ($X_{LH}, X_{HL}, X_{HH}$). Finally, the refined sub-bands are reconstructed into the spatial domain via an Inverse Wavelet Transform (IWT):
+\begin{equation}
+    Y = \text{IWT}(W_{LL} * X_{LL}, W_{LH} * X_{LH}, W_{HL} * X_{HL}, W_{HH} * X_{HH})
+\end{equation}
+By separating frequency components and processing them in parallel, the architecture avoids the low-pass filtering bias of standard large-kernel convolutions, ensuring that micro-geometric shading cues essential for \textbf{Photometric Stereo} are not averaged into the background.
+
+\textbf{Compatibility and Data Flow} \\
+The proposed WTConv is integrated as a \textbf{drop-in replacement} for the original ConvNeXt layer. Given a $512 \times 512 \times 3$ input image, the SDM-UniPS \textbf{Interleaved Sub-Sampling (ISS)} strategy generates four $256 \times 256 \times 3$ patches. These patches are processed by the backbone's Stride-4 stem to yield $64 \times 64 \times C$ feature maps. The WTConv layer accepts these $64 \times 64$ tensors, performs spectral processing via $32 \times 32$ wavelet sub-bands, and utilizes an Inverse Wavelet Transform (IWT) to reconstruct the original $64 \times 64 \times C$ shape. This maintains absolute compatibility with the global $128 \times 128$ feature merging logic and the downstream 2,048-pixel sampling process.
+
+\textbf{Research Expectation} \\
+The primary expectation of this spectral shift is a significant enhancement in the \textbf{angular accuracy of surface normals} at geometric discontinuities. By explicitly modeling high-frequency sub-bands, we expect the model to exhibit a more robust response to complex shading effects and shadow boundaries, which are traditionally problematic for spatial-only encoders.
+
+\section{Frequency-Aware Saliency Sampling}
+\textbf{Original Mechanism in SDM-UniPS} \\
+The SDM-UniPS framework manages high-resolution inputs by employing an \textbf{Interleaved Sub-Sampling (ISS)} strategy, which selects a sparse set of $M=2048$ pixels to be processed by the Transformer-based normal estimation heads. This selection process is essentially \textbf{stochastic or uniform}, ensuring that the sampled points are distributed evenly across the spatial domain to maintain a global representation of the object's geometry.
+
+\textbf{Limitations of the Original Structure} \\
+Uniform sampling is fundamentally sub-optimal for surfaces with varying geometric complexity. In most Photometric Stereo datasets, a large portion of the image consists of smooth, low-frequency regions (e.g., flat surfaces or broad curves), while the most critical geometric information is concentrated in \textbf{high-frequency areas} such as creases, pores, and sharp edges. By allocating the same sampling budget to a flat region as to a complex texture, SDM-UniPS suffers from:
+\begin{itemize}
+    \item \textbf{Information Under-sampling:} Critical surface discontinuities are represented by too few points, leading to smoothed-out details in the final normal map.
+    \item \textbf{Computational Inefficiency:} A significant portion of the 2,048-pixel budget is "wasted" on redundant points in smooth regions where the normal gradient is near-zero.
+\end{itemize}
+
+\textbf{Proposed Wavelet-Energy Saliency Sampling (WESS)} \\
+We propose replacing the uniform ISS selection with \textbf{Wavelet-Energy Saliency Sampling (WESS)}. This mechanism derives saliency from the high-frequency coefficients $\{LH, HL, HH\}$ produced by the WT layer in the first backbone block. We define the pixel-wise saliency $E_{i,j}$ as the $L_2$ norm of these components across all $C$ channels to capture a robust geometric energy signal:
+\begin{equation}
+    E_{i,j} = \sqrt{\sum_{c=1}^{C} \left[ \left(X^{LH}_{i,j,c}\right)^2 + \left(X^{HL}_{i,j,c}\right)^2 + \left(X^{HH}_{i,j,c}\right)^2 \right]}
+\end{equation}
+To convert this energy into a sampling probability, we apply a normalized exponential mapping (Softmax) with a temperature parameter $\tau$ to control the "sharpness" of the focal distribution:
+\begin{equation}
+    P_{i,j} = \frac{\exp(E_{i,j} / \tau)}{\sum_{h,w} \exp(E_{h,w} / \tau)}
+\end{equation}
+A high $\tau$ value approaches uniform sampling, while a low $\tau$ aggressively focuses the budget on the sharpest geometric features. Following the \textbf{Adaptive Densification} logic found in \textbf{3D Gaussian Splatting} and \textbf{LINO-UniPS}, the $M=2048$ budget is split into a \textbf{Base Set} ($M_{base}=512$) for global structure preservation and an \textbf{Adaptive Set} ($M_{adapt}=1536$) for detail densification. Sampling solely based on $P_{i,j}$ would risk "spatial blindness" in smooth regions; the Base Set ensures the model maintains the global geometric orientation necessary for consistent normal estimation.
+
+\textbf{Compatibility and Data Flow} \\
+The WESS module is designed to operate within the interleaved processing pipeline of SDM-UniPS. Given a \textbf{$512 \times 512 \times 3$} input image, the \textbf{ISS} strategy generates four \textbf{$256 \times 256 \times 3$} patches. Following the Stride-4 stem and the first WT layer, each patch produces four \textbf{$32 \times 32$} wavelet sub-band maps. To synchronize with the global feature map $\mathcal{F}_k$:
+\begin{itemize}
+    \item The four $32 \times 32$ energy maps are re-interleaved (inverse-shuffled) to form a \textbf{$64 \times 64$} global energy map.
+    \item This map is upsampled via bilinear interpolation to \textbf{$128 \times 128$} to match the spatial dimensions of the fused feature map $\mathcal{F}_k$.
+\end{itemize}
+Because the energy map and the features undergo identical interleaved sampling and re-shuffling, the index $(i, j)$ in the $128 \times 128$ PDF points to the exact same physical region as in $\mathcal{F}_k$, ensuring spatial consistency for the $2048$ sampled vectors.
+
+\textbf{Research Expectation} \\
+WESS is expected to improve Photometric Stereo reconstruction in two critical dimensions. First, by prioritizing high-entropy spectral regions, we anticipate a significant reduction in \textbf{Mean Angular Error (MAE)} at surface discontinuities and micro-textures that uniform sampling typically smooths over. Second, this importance sampling strategy is expected to \textbf{accelerate training convergence}. By focusing the Spatial-axis Transformer on the most informative geometric gradients, the model receives a denser supervision signal per iteration, effectively reducing the total training epochs required to reach the desired accuracy.
+
+\section{Latent Global-Local Modeling}
+
+\textbf{Original Mechanism in SDM-UniPS} \\
+The original SDM-UniPS employs a \textbf{Non-local Interaction with Pixel-sampling Transformer} to refine surface normal estimations. In this structure, standard Multi-Head Self-Attention (MHSA) is performed exclusively among the $M=2048$ sampled pixel features. This interaction is characterized as \textbf{Homogeneous Spatial Interaction}; although the pixels themselves are sampled with different priorities via ISS, the attention mechanism treats the sequence as a 1D set, attending to all points with a fixed, data-independent receptive field.
+
+\textbf{Limitations of the Original Structure} \\
+While the WESS strategy (introduced in Section 1.2) ensures that high-frequency edges are densely represented, the subsequent transformer refinement suffers from \textbf{Sparsity-induced Contextual Attenuation}:
+\begin{itemize}
+    \item \textbf{Inter-regional Isolation:} Because self-attention is restricted to the 2,048 sampled tokens, the model cannot access the "missing" 14,336 pixels from the $128 \times 128$ global feature map. This limits the model's ability to capture subtle, global shading gradients that span across smooth, unsampled surfaces.
+    \item \textbf{Fixed Point Constraint:} Standard MHSA is spatially rigid; it can only process information at the exact coordinates provided by the sampling mask. It lacks the ability to "probe" neighboring dense features to resolve sub-pixel geometric ambiguities near sharp discontinuities.
+\end{itemize}
+
+\textbf{Proposed Latent Global-Local Modeling} \\
+We propose to improve the Pixel-sampling Transformer by integrating \textbf{Deformable Attention (DAT)} and \textbf{Latent Carrier Tokens}, supervised by a geometric repulsion constraint:
+\begin{itemize}
+    \item \textbf{Carrier Tokens (Global Contextualization):} We introduce 64 learned latent vectors $T \in \mathbb{R}^{64 \times D}$. These tokens perform cross-attention with the \textbf{entire} $128 \times 128$ global feature map $\mathcal{F}_k$ \textit{only once} at the start to "carry" a dense statistical summary of the global shading and lighting context into the transformer block:
+    \begin{equation}
+        Z_{global} = \text{Softmax}\left(\frac{T K_{\mathcal{F}}^T}{\sqrt{d}}\right) V_{\mathcal{F}}
+    \end{equation}
+    \item \textbf{Deformable Attention (Local Refinement):} We replace standard MHSA with Deformable Attention. For each of the 2,112 queries $q$ (2,048 WESS sampled pixels + 64 carrier pixels), an offset network predicts a set of displacements $\Delta p$. The transformer then utilizes bilinear interpolation $\phi$ to sample keys and values from the \textbf{dense $128 \times 128$ feature map} at these deformed locations $(p + \Delta p)$:
+    \begin{equation}
+        \text{Attn}(q, p) = \sum_{m=1}^{M} W_m \left[ \phi(\mathcal{F}_k, p + \Delta p_m) \right]
+    \end{equation}
+    \item \textbf{Diverse Repulsion Loss:} To prevent the offset network from collapsing multiple sampling points onto the same high-gradient coordinate, we introduce a Diverse Repulsion Loss $\mathcal{L}_{rep}$. This loss acts as a spatial penalty that enforces a minimum distance between deformed points within a local neighborhood $\mathcal{N}(i)$:
+    \begin{equation}
+        \mathcal{L}_{rep} = \sum_{i=1}^{m} \sum_{j \in \mathcal{N}(i)} \exp \left( - \frac{\| (p_i + \Delta p_i) - (p_j + \Delta p_j) \|^2}{d^2} \right)
+    \end{equation}
+    where $d$ represents a predefined distance threshold. This ensures that the 2,048 queries maintain high spatial coverage and probe diverse geometric features across the surface.
+\end{itemize}
+
+\textbf{Compatibility and Data Flow} \\
+The proposed model remains consistent with the $512 \times 512 \times 3$ input pipeline. After the interleaved backbone processing and UperNet fusion, a global feature map $\mathcal{F}_k$ of size \textbf{$128 \times 128 \times D$} is generated. 
+The WESS module selects 2,048 query coordinates from this map. Simultaneously, the 64 Carrier Tokens attend to all 16,384 pixels of $\mathcal{F}_k$ to form a global summary. The Transformer then processes a combined sequence of \textbf{2,112 tokens}. Crucially, the DAT offset network allows these queries to sample from the full $128 \times 128$ grid, effectively bypassing the 2,048-pixel bottleneck for key/value acquisition. Post-interaction, the 64 Carrier Tokens are decoupled, and the 2,048 refined features are passed to the normal prediction head.
+
+\textbf{Research Expectation} \\
+By combining Latent Carrier Tokens with DAT, we expect to resolve the trade-off between sparse sampling and global consistency. The model should demonstrate significantly lower \textbf{Mean Angular Error (MAE)} by utilizing the Carrier Tokens to maintain global lighting awareness while using Deformable Attention to achieve "sub-pixel" geometric precision at surface boundaries.
+
+\end{document}

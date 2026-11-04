@@ -1,0 +1,206 @@
+\documentclass[Main.tex]{subfiles}
+\newcommand{\underwrite}[3][]{% \underwrite[<thickness>]{<numerator>}{<denominator>}
+  \genfrac{}{}{#1}{}{\textstyle #2}{\scriptstyle #3}
+}
+
+\renewcommand{\thesection}{\arabic{section}}
+
+\begin{document}
+\begin{titlepage}
+\thispagestyle{empty}
+\begin{center}
+
+{\textbf{\large{HANOI UNIVERSITY OF SCIENCE AND TECHNOLOGY }}}\\[4cm]
+
+{\textbf{\huge{GRADUATION THESIS}}}\\[1cm]
+% Working title; to be revisited once the November runs are in.
+{\textbf{\Large{Optimizing Universal Photometric Stereo via Wavelet-Energy Saliency and Latent Carrier Tokens}}\\[1cm]
+
+{\textbf{\large{LÊ NHẬT QUANG}}}\\
+{\large{quang.ln225522@sis.hust.edu.vn}}\\[0.5cm]
+
+{\textbf{\large{Program: Data Science and Artificial Intelligence}}}\\
+
+\vspace{4cm}
+\begin{table}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{ll}
+ \multicolumn{1}{l}{\textbf{Supervisor:}} & Ngô Thành Trung \hspace{0.5cm}
+  \\[0.5cm]
+ \multicolumn{1}{l}{\textbf{Department:}} & Computer Engineering \hspace{0.5cm} \\ [0.5cm]
+ \multicolumn{1}{l}{\textbf{School:}} & School of Information and Communications Technology \hspace{0.5cm} \\ [5.5cm]
+\multicolumn{2}{c}{\textbf{HANOI, 11/2026}}
+\end{tabular}%
+}
+\end{table}}
+\end{center}
+
+\end{titlepage}
+
+% =====================================================================
+\chapter*{Thesis Outline Proposal}
+
+This document proposes the structure of the thesis for the supervisor's review. The thesis is an
+iterative investigation of modifications to SDM-UniPS in which each result motivated the next
+step, so its core is organized as one chapter per modification rather than as a single
+methodology chapter followed by a single results chapter. The template's research-thesis
+structure is kept where it applies: the Introduction uses the template's sections, the Literature
+Review respects its length limit, the chapter on the baseline and experimental framework plays
+the role of the template's Methodology and Simulation Method, and every modification chapter
+follows the same internal order (method, then results, then analysis), with an overview at the
+start of each chapter and a conclusion at its end.
+
+\section*{Research questions}
+
+\begin{enumerate}[label=\textbf{RQ\arabic*.}, leftmargin=*]
+  \item Does a wavelet-convolution backbone improve SDM-UniPS?
+  \item Does wavelet-energy saliency sampling improve SDM-UniPS, and if not, why?
+  \item Does a carrier-token / deformable-attention decoder improve SDM-UniPS, and does it remove
+    the penalty of non-uniform sampling?
+  \item Once the sample-set bias is removed by decoupling the context set from the query set, can
+    non-uniform sampling improve accuracy?
+\end{enumerate}
+
+% =====================================================================
+\section*{Front matter}
+Title page, declaration of originality, acknowledgement (100--150 words), abstract (200--350
+words, one paragraph, written last), table of contents, list of figures, list of tables, list of
+abbreviations.
+
+% =====================================================================
+\section*{Chapter 1. Introduction \normalfont{(3--6 pages)}}
+\begin{itemize}
+  \item[1.1] \textbf{Problem Statement.} Surface-normal recovery under unknown, spatially varying
+    lighting (universal photometric stereo), and why it matters.
+  \item[1.2] \textbf{Background and Problems of Research.} Current methods up to SDM-UniPS, and the
+    three limitations targeted: (i) large depthwise kernels low-pass the shading gradients normals
+    are read from, (ii) training pixels are drawn uniformly regardless of where information lies,
+    and (iii) the decoder's context comes only from the sampled pixels.
+  \item[1.3] \textbf{Research Objectives and Conceptual Framework.} Scope (normals only, fixed
+    camera, trained on synthetic data, evaluated on DiLiGenT), RQ1--RQ4, and the modification
+    proposed for each limitation.
+  \item[1.4] \textbf{Contributions.}
+  \item[1.5] \textbf{Organization of Thesis.}
+\end{itemize}
+
+% =====================================================================
+\section*{Chapter 2. Background and Literature Review \normalfont{(at most 10 pages)}}
+\begin{itemize}
+  \item[2.1] \textbf{Background.} Only concepts later chapters use: image formation (radiometry,
+    BRDF, Lambertian model); photometric stereo settings (calibrated, uncalibrated, universal),
+    normal maps and angular error; building blocks (ConvNeXt, UPerNet, attention, Haar discrete
+    wavelet transform, deformable attention, importance sampling).
+  \item[2.2] \textbf{Related works}, by topic: classical photometric stereo (condensed from
+    Project III); learning-based calibrated photometric stereo; uncalibrated and universal
+    photometric stereo, ending at SDM-UniPS; frequency and wavelet methods in vision (WTConv,
+    FUPS-Net); non-uniform and importance sampling in training; efficient attention (deformable
+    attention, carrier tokens).
+  \item[2.3] \textbf{Summary and research gap.}
+\end{itemize}
+
+% =====================================================================
+\section*{Chapter 3. Baseline and Experimental Framework}
+\begin{itemize}
+  \item[3.1] \textbf{SDM-UniPS walkthrough}, with one figure marking every modification point.
+  \item[3.2] \textbf{Training pipeline} for the inference-only release: loss and the uniform
+    2,048-pixel training draw, augmentation, per-image normalization, optimization (AdamW,
+    warmup--stable--decay schedule), and deviations from the released code.
+  \item[3.3] \textbf{Baseline correction.} The dead coarse branch of the fusion head and the
+    GroupNorm fix, which together define Model A.
+  \item[3.4] \textbf{Datasets.} hdlong-complexv1, PolarPS (synthesis of the training renders,
+    scene-level splits) and DiLiGenT.
+  \item[3.5] \textbf{Evaluation protocol.} Fixed evaluation pixels and renders, so every variant is
+    evaluated on identical data; DiLiGenT at $K = 4, 8, 16$ images with 10 paired trials per
+    object; the noise reference from two trainings of the same model.
+  \item[3.6] \textbf{Implementation details.} Hardware, schedule, hyperparameters.
+\end{itemize}
+
+% =====================================================================
+\section*{Chapter 4. B1: Wavelet Convolution Backbone \normalfont{(RQ1)}}
+Motivation; WTConv as a drop-in replacement for the $7\times7$ depthwise convolution; results
+against Model A, reproduced by a second training of B1.
+
+% =====================================================================
+\section*{Chapter 5. B2: Wavelet-Energy Saliency Sampling \normalfont{(RQ2)}}
+\begin{itemize}
+  \item[5.1] \textbf{Premise validation.} Does the energy map point at surface curvature
+    (Phase 0, with a shuffled-energy control)?
+  \item[5.2] \textbf{Sampler design.} Energy map, exclusion of the silhouette band, mixture with
+    the uniform draw.
+  \item[5.3] \textbf{Analysis of the sampling objective.} (i) Every masked pixel keeps a
+    probability of at least $\lambda / n$; (ii) the mismatch between training and validation: the
+    unweighted sampler minimizes $\sum_i p_i \ell_i$ while validation measures
+    $\frac{1}{n}\sum_i \ell_i$; (iii) importance weights $w_i = 1/(n p_i)$: expectation 1 under the
+    draw, maximum $1/\lambda$, and unbiased when a pixel's loss does not depend on the other pixels
+    drawn with it; (iv) the sample-set bias when that condition fails. Items (ii) and (iv) are the
+    two hypotheses the diagnosis tests. Full derivations in an appendix.
+  \item[5.4] \textbf{Temperature and mixture sweep.}
+  \item[5.5] \textbf{Diagnosis.} In order: the focus-on-creases claim is not supported
+    (curvature deciles); the shifted training target is ruled out (importance-weighted run);
+    variance reduction is refuted; a sample-set bias is measured.
+\end{itemize}
+
+% =====================================================================
+\section*{Chapter 6. C: Carrier Tokens and Deformable Attention \normalfont{(RQ3)}}
+Motivation from the sample-set bias of Chapter 5; design and cost; C with uniform sampling against
+B1; the $2\times2$ decoder $\times$ sampler comparison with its pre-registered verdict.
+
+% =====================================================================
+\section*{Chapter 7. Decoupled Context/Query Decoder \normalfont{(RQ4, November 2026)}}
+\begin{itemize}
+  \item[7.1] \textbf{Design.} Built on B1: a uniform context set attends within itself as in B1;
+    each query attends to the context set only. Why this makes the importance-weighted loss
+    unbiased again (builds on Section 5.3).
+  \item[7.2] \textbf{Run Z} (WESS with importance weights). Against B2-IW, which differs only in
+    the decoder; against B1.
+  \item[7.3] \textbf{Run Y} (learned loss-prediction sampler). Against Z, which differs only in
+    the sampler. Conditional on time; otherwise moved to future work.
+\end{itemize}
+
+% =====================================================================
+\section*{Chapter 8. Discussion}
+All variants in one table; cost against gain; the gap between synthetic and real data (why models
+that win on synthetic held-out data do not win on DiLiGenT at high $K$); threats to validity.
+
+% =====================================================================
+\section*{Chapter 9. Conclusions}
+\begin{itemize}
+  \item[9.1] \textbf{Summary.} Answers to RQ1--RQ4 and limitations.
+  \item[9.2] \textbf{Suggestion for Future Works.}
+\end{itemize}
+
+\section*{References and Appendices}
+References in IEEE style. Appendices: full hyperparameter tables, per-object DiLiGenT results,
+derivations for Section 5.3, probe protocols, training infrastructure (resuming, warm-starting, checkpoint backup).
+
+% =====================================================================
+\section*{Status of experiments}
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\hline
+\textbf{Run} & \textbf{Content} & \textbf{Status} \\
+\hline
+A        & SDM-UniPS with GroupNorm fusion head            & done \\
+B1       & WTConv backbone (and a second training)         & done \\
+B2       & WESS, temperature and mixture sweep             & done \\
+B2-IW    & WESS with importance weights                    & done \\
+C        & Carrier tokens + deformable attention, uniform  & done \\
+C + WESS & Carrier tokens + deformable attention, WESS     & done \\
+Z        & Decoupled decoder (on B1), WESS with importance weights & November 2026 \\
+Y        & Decoupled decoder (on B1), learned sampler      & November 2026, conditional \\
+\hline
+\end{tabular}
+\end{table}
+
+\section*{Changes from the initial roadmap}
+\begin{itemize}
+  \item The WESS draw is a single mixture of a uniform and an energy-based distribution, with the
+    silhouette band kept at the uniform rate, instead of a 512 + 1,536 split of the budget.
+  \item Model C has no repulsion loss.
+  \item The decoupled decoder and the learned sampler were not in the roadmap; they follow from the
+    sample-set bias measured in the WESS diagnosis.
+\end{itemize}
+
+\end{document}
