@@ -138,7 +138,50 @@ class MultiHeadSelfAttentionBlock(nn.Module):
 
         
         O_ = O if getattr(self, 'ln1', None) is None else self.ln1(O)
-        O = O + self.dropout2(self.fc_o2(self.dropout1(F.gelu(self.fc_o1(O_))))) 
+        O = O + self.dropout2(self.fc_o2(self.dropout1(F.gelu(self.fc_o1(O_)))))
+        return O
+
+    def forward_cross_self(self, x, y):
+        """Decoupled-decoder cross-attention (Model Z).
+
+        Queries come from `x` ([b, m, F]); each query attends to the key set
+        `y` ([b, n, F]) PLUS its own key/value taken from its own input `x_i`.
+        So the key set of query i is y union {x_i}: its own token, as in a
+        self-attention block, and never another query. The softmax runs over
+        the concatenated logits, so the self term is an exact member of the
+        normalisation, not an added bias.
+
+        Matches `forward` in every other respect: LayerNorm on the query path
+        only (`ln0`), raw `x` for keys/values (as `SAB` feeds raw `X`), the
+        residual on the projected query, and the feed-forward tail. The scale
+        is 1/sqrt(head_dim), i.e. the efficient-attention path's scale, since
+        the Regressor that this replaces runs in efficient mode. Attention
+        dropout is applied to the normalised probabilities, as in the Normal
+        path. Pure-function math, no new parameters.
+        """
+        b, m, _ = x.shape
+        n = y.shape[1]
+        h = self.num_heads
+        d = self.dim_V // h
+        xq = x if getattr(self, 'ln0', None) is None else self.ln0(x)
+        Qf = self.fc_q(xq)                                           # [b,m,dV]
+        Q = Qf.view(b, m, h, d).permute(0, 2, 1, 3)                  # [b,h,m,d]
+        K = self.fc_k(y).view(b, n, h, d).permute(0, 2, 1, 3)        # [b,h,n,d]
+        V = self.fc_v(y).view(b, n, h, d).permute(0, 2, 1, 3)        # [b,h,n,d]
+        Ks = self.fc_k(x).view(b, m, h, d).permute(0, 2, 1, 3)       # [b,h,m,d]
+        Vs = self.fc_v(x).view(b, m, h, d).permute(0, 2, 1, 3)       # [b,h,m,d]
+
+        scale = d ** -0.5
+        logit_y = torch.einsum('bhid,bhjd->bhij', Q, K) * scale      # [b,h,m,n]
+        logit_s = (Q * Ks).sum(dim=-1, keepdim=True) * scale         # [b,h,m,1]
+        probs = torch.softmax(torch.cat([logit_y, logit_s], dim=-1), dim=-1)
+        probs = self.dropout_attn(probs)
+        A = torch.einsum('bhij,bhjd->bhid', probs[..., :n], V) + probs[..., n:] * Vs
+        A = A.permute(0, 2, 1, 3).reshape(b, m, self.dim_V)
+
+        O = Qf + A   # residual on the projected query, as in forward()
+        O_ = O if getattr(self, 'ln1', None) is None else self.ln1(O)
+        O = O + self.dropout2(self.fc_o2(self.dropout1(F.gelu(self.fc_o1(O_)))))
         return O
 
 

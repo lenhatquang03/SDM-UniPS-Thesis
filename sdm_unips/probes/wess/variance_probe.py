@@ -43,13 +43,25 @@ Integrity checks printed per checkpoint:
   * importance-weight mean per draw ~ 1, max <= 1/lam.
   * eval() is on (dropout off), so the draw is the only source of randomness.
 
+Decoder arms (Model Z port, 2026-11-14). Each sampler arm is also run through
+the DECOUPLED decoder: queries are the arm's draw, and the context set U is a
+fresh uniform draw per draw (independent seed), passed to Net.forward as
+`context_ids`. These arms carry the suffix `@dec`. Their reference is
+`uniform@dec`, not `uniform`. Two statistics are added:
+  * D(uniform@dec vs uniform): coupled vs decoupled uniform at the same weights.
+    Near 1 means the two decoders agree on the expected gradient (supports B1 as X).
+  * D(iw@dec), D(shuffled@dec): the WESS arms under the decoupled decoder. Near 1
+    means the coupling bias is gone (Z's premise).
+The decoupled-arm decision rules are pre-registered (context_handoff_Z.md, 2026-11-14),
+before any run. Rules 0-3 there are what the summary prints.
+
 Checkpoints (one run each):
   late   B1 best.pt                      /workspace/runs/modelB1_wtconv/checkpoints/best.pt
   early  Run 1 (B2-IW) epoch 19, from HF /workspace/runs/modelB2_iw/early_ckpt/epoch_19/sdm-ckpt/modelB2_iw/latest.pt
 
 Run on the training box only (full forward + backward at 512, K=10):
   python -u sdm_unips/probes/wess/variance_probe.py --checkpoint <ckpt> \
-      --out_dir <dir> [--num_scenes 20 --draws 16]
+      --out_dir <dir> [--num_scenes 20 --draws 16] [--decoders coupled decoupled]
   python sdm_unips/probes/wess/variance_probe.py --summarize <dir>/variance_probe.jsonl
 Dataset flags default to the probe machine's (PROBE_DATA_DEFAULTS), exactly as
 wess_site_probe.py; pass --hdlong_dir/--polarps_dir/--scene_manifest if the
@@ -73,59 +85,40 @@ sys.path.append(os.path.join(HERE, '..', '..'))
 
 ARMS = ('uniform', 'iw', 'shuffled', 'uniform2', 'uniform_rep')
 NULL_ARMS = ('uniform2', 'uniform_rep')
+DECODERS = ('coupled', 'decoupled')
+# Reference arm for D, per decoder. Coupled arms are read against Model A's draw.
+REF = {'coupled': 'uniform', 'decoupled': 'uniform@dec'}
+
+
+def arm_name(arm, dec):
+    return arm if dec == 'coupled' else f'{arm}@dec'
 
 
 # ---------------------------------------------------------------------------
 # Summary (stdlib only, so it also runs off the box)
 # ---------------------------------------------------------------------------
-def summarize(path):
-    recs = [json.loads(l) for l in open(path) if l.strip()]
-    recs = [r for r in recs if r.get('kind') == 'scene']
-    if not recs:
-        raise SystemExit(f'no scene records in {path}')
-    li = [math.log(r['V']['iw'] / r['V']['uniform']) for r in recs]
-    ls = [math.log(r['V']['shuffled'] / r['V']['uniform']) for r in recs]
+def _se(x):
+    return st.stdev(x) / math.sqrt(len(x)) if len(x) > 1 else float('nan')
+
+
+def _variance_block(recs, sfx, label, preregistered):
+    """Geometric-mean variance ratios and the pre-registered variance decision,
+    for the arms with suffix `sfx` ('' coupled, '@dec' decoupled)."""
+    ref = 'uniform' + sfx
+    li = [math.log(r['V']['iw' + sfx] / r['V'][ref]) for r in recs]
+    ls = [math.log(r['V']['shuffled' + sfx] / r['V'][ref]) for r in recs]
     d = [a - b for a, b in zip(li, ls)]
-    n = len(recs)
-
-    def mse(x):
-        return st.mean(x), (st.stdev(x) / math.sqrt(len(x)) if len(x) > 1 else float('nan'))
-
-    mi, si = mse(li)
-    ms, ss = mse(ls)
-    md, sd = mse(d)
+    mi, si = st.mean(li), _se(li)
+    ms, ss = st.mean(ls), _se(ls)
+    md, sd = st.mean(d), _se(d)
     gm_i, gm_s = math.exp(mi), math.exp(ms)
-    print(f'checkpoint: {recs[0]["checkpoint"]}')
-    print(f'{n} scenes, R = {recs[0]["draws"]} draws per arm\n')
-    print(f'  V_iw / V_uniform        GM {gm_i:.3f}   (mean log {mi:+.3f} +- {si:.3f})')
-    print(f'  V_shuffled / V_uniform  GM {gm_s:.3f}   (mean log {ms:+.3f} +- {ss:.3f})')
-    print(f'  log r_iw - log r_shuf   {md:+.3f} +- {sd:.3f}  (paired over scenes)\n')
-    Di = st.median(r['D']['iw'] for r in recs)
-    Ds = st.median(r['D']['shuffled'] for r in recs)
-    wmean = st.mean(r['w_mean']['iw'] for r in recs)
-    wmax = max(r['w_max']['iw'] for r in recs)
-    print('INTEGRITY')
-    has_null = all('uniform2' in r['D'] for r in recs)
-    if has_null:
-        Dn = st.median(r['D']['uniform2'] for r in recs)
-        Dr = st.median(r['D']['uniform_rep'] for r in recs)
-        vn = math.exp(st.mean(math.log(r['V']['uniform2'] / r['V']['uniform']) for r in recs))
-        vr = math.exp(st.mean(math.log(r['V']['uniform_rep'] / r['V']['uniform']) for r in recs))
-        null_ok = Dn < 2.0
-        print(f'  D NULL (uniform2 vs uniform, median, must be < 2): {Dn:.2f}   '
-              f'{"PASS" if null_ok else "FAIL -- the D statistic itself is wrong; no D below is readable"}')
-        print(f'  V NULL (uniform2 / uniform, GM, expect ~1): {vn:.3f}')
-        print(f'  uniform with replacement: D {Dr:.2f}, V ratio {vr:.3f}  (replacement effect alone)')
-        if null_ok:
-            print(f'  unbiasedness D (median), read against the null {Dn:.2f}: iw {Di:.2f}   shuffled {Ds:.2f}'
-                  f'   {"consistent with unbiased" if max(Di, Ds) < 2.0 else "WESS arms biased: their mean gradient differs from uniform"}')
-    else:
-        print('  no null arm in these records (run before 2026-10-18): D has no measured baseline')
-        print(f'  unbiasedness D (median): iw {Di:.2f}   shuffled {Ds:.2f}')
-    print(f'  iw weights: mean over scenes {wmean:.3f} (expect ~1), max {wmax:.3f} (expect <= 4)\n')
+    print(label)
+    print(f'  V_iw / V_{ref}        GM {gm_i:.3f}   (mean log {mi:+.3f} +- {si:.3f})')
+    print(f'  V_shuffled / V_{ref}  GM {gm_s:.3f}   (mean log {ms:+.3f} +- {ss:.3f})')
+    print(f'  log r_iw - log r_shuf   {md:+.3f} +- {sd:.3f}  (paired over scenes)')
     ok = gm_i < 1 and gm_s >= 1 and md < -2 * sd
-    print('DECISION (pre-registered):')
-    print(f'  GM(iw) < 1: {gm_i < 1}   GM(shuffled) >= 1: {gm_s >= 1}   '
+    tag = 'pre-registered' if preregistered else 'pre-registered 2026-11-14, see context_handoff_Z.md'
+    print(f'  DECISION ({tag}): GM(iw) < 1: {gm_i < 1}   GM(shuffled) >= 1: {gm_s >= 1}   '
           f'paired gap < -2 SE: {md < -2 * sd}')
     if ok:
         print('  -> SUPPORTED: WESS-IW lowers gradient variance; the energy map carries '
@@ -135,6 +128,62 @@ def summarize(path):
               'not a gradient-size proxy; the weights add noise (consistent with B2-IW < B2 tau=1).')
     else:
         print('  -> NOT SUPPORTED: the reduction is not distinguishable from the shuffled control.')
+    print()
+
+
+def summarize(path):
+    recs = [json.loads(l) for l in open(path) if l.strip()]
+    recs = [r for r in recs if r.get('kind') == 'scene']
+    if not recs:
+        raise SystemExit(f'no scene records in {path}')
+    has_c = all('iw' in r['V'] and 'uniform' in r['V'] and 'shuffled' in r['V'] for r in recs)
+    has_d = all('iw@dec' in r['V'] and 'uniform@dec' in r['V'] for r in recs)
+    print(f'checkpoint: {recs[0]["checkpoint"]}')
+    print(f'{len(recs)} scenes, R = {recs[0]["draws"]} draws per arm\n')
+
+    if has_c:
+        _variance_block(recs, '', 'COUPLED decoder (B1/B2 path)', preregistered=True)
+        Di = st.median(r['D']['iw'] for r in recs)
+        Ds = st.median(r['D']['shuffled'] for r in recs)
+        wmean = st.mean(r['w_mean']['iw'] for r in recs)
+        wmax = max(r['w_max']['iw'] for r in recs)
+        print('INTEGRITY (coupled)')
+        if all('uniform2' in r['D'] for r in recs):
+            Dn = st.median(r['D']['uniform2'] for r in recs)
+            Dr = st.median(r['D']['uniform_rep'] for r in recs)
+            vn = math.exp(st.mean(math.log(r['V']['uniform2'] / r['V']['uniform']) for r in recs))
+            vr = math.exp(st.mean(math.log(r['V']['uniform_rep'] / r['V']['uniform']) for r in recs))
+            null_ok = Dn < 2.0
+            print(f'  D NULL (uniform2 vs uniform, median, must be < 2): {Dn:.2f}   '
+                  f'{"PASS" if null_ok else "FAIL -- the D statistic itself is wrong; no D below is readable"}')
+            print(f'  V NULL (uniform2 / uniform, GM, expect ~1): {vn:.3f}')
+            print(f'  uniform with replacement: D {Dr:.2f}, V ratio {vr:.3f}  (replacement effect alone)')
+            if null_ok:
+                print(f'  unbiasedness D (median), read against the null {Dn:.2f}: iw {Di:.2f}   shuffled {Ds:.2f}'
+                      f'   {"consistent with unbiased" if max(Di, Ds) < 2.0 else "WESS arms biased: their mean gradient differs from uniform"}')
+        else:
+            print('  no null arm in these records (run before 2026-10-18): D has no measured baseline')
+            print(f'  unbiasedness D (median): iw {Di:.2f}   shuffled {Ds:.2f}')
+        print(f'  iw weights: mean over scenes {wmean:.3f} (expect ~1), max {wmax:.3f} (expect <= 4)\n')
+
+    if has_d:
+        print('DECOUPLED decoder (Model Z), same weights, same checkpoint')
+        Dn = st.median(r['D']['uniform2@dec'] for r in recs)
+        print(f'  D NULL (uniform2@dec vs uniform@dec, median, must be < 2): {Dn:.2f}   '
+              f'{"PASS" if Dn < 2.0 else "FAIL -- D is not calibrated under this decoder"}')
+        if all('uniform@dec_vs_uniform' in r['D'] for r in recs):
+            Dg = st.median(r['D']['uniform@dec_vs_uniform'] for r in recs)
+            print(f'  decoder gap D (uniform@dec vs uniform, coupled, median): {Dg:.2f}   '
+                  f'{"decoders agree on the expected gradient (near null; supports B1 as X)" if Dg < 2.0 else "decoders DIFFER in expected gradient"}')
+        Di_d = st.median(r['D']['iw@dec'] for r in recs)
+        Ds_d = st.median(r['D']['shuffled@dec'] for r in recs)
+        if has_c:
+            Di_c = st.median(r['D']['iw'] for r in recs)
+            print(f'  coupled contrast: D(iw) coupled median {Di_c:.2f}')
+        print(f'  bias under decoupled decoder (median): iw@dec {Di_d:.2f}   shuffled@dec {Ds_d:.2f}   '
+              f'{"consistent with unbiased (coupling bias removed)" if max(Di_d, Ds_d) < 2.0 else "still biased under the decoupled decoder"}')
+        print()
+        _variance_block(recs, '@dec', 'DECOUPLED decoder: variance', preregistered=True)
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +241,16 @@ def run(args):
                                 subset_name='VarianceProbe/val', noun='probe', announce=True)
     n_scenes = min(args.num_scenes, len(eval_set))
     m = int(args.pixel_samples)
-    print(f'[var-probe] {n_scenes} scenes x {args.draws} draws x {len(ARMS)} arms | '
-          f'{n_params:,} params | tau {args.tau} lam {args.lam} | amp {args.amp_dtype}', flush=True)
+
+    # Arm list: sampler arms x the decoders requested. Index k fixes each arm's
+    # seed, and coupled-only runs keep the pre-port seeds, so old records stay
+    # reproducible. Each arm has its own seeds because D assumes independent arms.
+    decs = [d for d in DECODERS if d in args.decoders]
+    KEYS = [(arm, dec) for dec in decs for arm in ARMS]
+    NAMES = [arm_name(arm, dec) for arm, dec in KEYS]
+    print(f'[var-probe] {n_scenes} scenes x {args.draws} draws x {len(KEYS)} arms '
+          f'({", ".join(decs)}) | {n_params:,} params | tau {args.tau} lam {args.lam} | '
+          f'amp {args.amp_dtype}', flush=True)
 
     def energy_map(sc):
         """S0 energy, identical to the shipped sampler's (tap_sites.site_map('S0'))."""
@@ -216,12 +273,15 @@ def run(args):
                                            erode_cells=args.erode_cells, return_weights=True)
         return ids, w
 
-    def grad_vector(sc, ids, w):
+    def grad_vector(sc, ids, w, ctx=None):
+        """Gradient of the step loss. ctx=None: coupled decoder (sample_ids path).
+        ctx given: decoupled decoder with that context set U (context_ids path)."""
         net.zero_grad(set_to_none=True)
         with torch.autocast('cuda', dtype=amp, enabled=amp is not None):
             pred, idx, _ = net(sc['I'], sc['M'], sc['n_imgs'].to(device),
                                decoder_resolution=sc['dec'], canonical_resolution=sc['can'],
-                               training=True, sample_ids=ids[None])
+                               training=True, sample_ids=ids[None],
+                               context_ids=None if ctx is None else ctx[None])
         loss = losses.normal_loss(pred.float(), sc['N_dev'], sc['M'], idx,
                                   weights=None if w is None else w[None])
         grads = torch.autograd.grad(loss, params, allow_unused=True)
@@ -241,42 +301,64 @@ def run(args):
             E_arm = {'uniform': None, 'iw': E, 'shuffled': shuffle_map(E, g_sh),
                      'uniform2': None, 'uniform_rep': None}
 
-            acc = {a: Welford() for a in ARMS}
-            w_mean = {a: [] for a in ARMS}
-            w_max = {a: 0.0 for a in ARMS}
+            acc = {nm: Welford() for nm in NAMES}
+            w_mean = {nm: [] for nm in NAMES}
+            w_max = {nm: 0.0 for nm in NAMES}
             ts = time.time()
-            for ai, arm in enumerate(ARMS):
+            for k, ((arm, dec), nm) in enumerate(zip(KEYS, NAMES)):
                 for r in range(args.draws):
-                    torch.manual_seed((args.seed * 1_000_003 + i * 9_973 + ai * 101 + r) % (2 ** 31 - 1))
+                    qseed = (args.seed * 1_000_003 + i * 9_973 + k * 101 + r) % (2 ** 31 - 1)
+                    torch.manual_seed(qseed)
                     ids, w = draw(arm, sc, E_arm[arm])
+                    ctx = None
+                    if dec == 'decoupled':
+                        # Fresh uniform context per draw, own seed: U is part of the
+                        # step's randomness, so it is inside V, as in training.
+                        torch.manual_seed((qseed + 400_000_003) % (2 ** 31 - 1))
+                        ctx = net.sample_context_pixels(sc['valid_ids'], m)
                     if w is not None:
-                        w_mean[arm].append(float(w.mean()))
-                        w_max[arm] = max(w_max[arm], float(w.max()))
-                    acc[arm].add(grad_vector(sc, ids, w))
+                        w_mean[nm].append(float(w.mean()))
+                        w_max[nm] = max(w_max[nm], float(w.max()))
+                    acc[nm].add(grad_vector(sc, ids, w, ctx))
 
-            V = {a: acc[a].var_trace() for a in ARMS}
+            V = {nm: acc[nm].var_trace() for nm in NAMES}
             R = args.draws
-            D = {a: float(((acc[a].mean - acc['uniform'].mean) ** 2).sum()) /
-                 ((V[a] + V['uniform']) / R) for a in ARMS if a != 'uniform'}
+
+            def pair_D(a, b):
+                return float(((acc[a].mean - acc[b].mean) ** 2).sum()) / ((V[a] + V[b]) / R)
+
+            D = {}
+            for nm, (arm, dec) in zip(NAMES, KEYS):
+                ref = REF[dec]
+                if nm != ref and ref in acc:
+                    D[nm] = pair_D(nm, ref)
+            if 'uniform@dec' in acc and 'uniform' in acc:
+                D['uniform@dec_vs_uniform'] = pair_D('uniform@dec', 'uniform')
+
             kind, scene_dir = eval_set.scenes[i % eval_set.n_scenes]
             rec = {'kind': 'scene', 'index': i, 'source': kind,
                    'scene': os.path.basename(scene_dir.rstrip('/')),
                    'checkpoint': args.checkpoint, 'draws': R, 'tau': args.tau, 'lam': args.lam,
+                   'decoders': decs,
                    'n_valid': int(sc['valid_ids'].numel()), 'V': V, 'D': D,
-                   'grad_mean_norm': {a: float(acc[a].mean.norm()) for a in ARMS},
-                   'w_mean': {a: (st.mean(w_mean[a]) if w_mean[a] else 1.0) for a in ARMS},
-                   'w_max': {a: (w_max[a] if w_mean[a] else 1.0) for a in ARMS},
+                   'grad_mean_norm': {nm: float(acc[nm].mean.norm()) for nm in NAMES},
+                   'w_mean': {nm: (st.mean(w_mean[nm]) if w_mean[nm] else 1.0) for nm in NAMES},
+                   'w_max': {nm: (w_max[nm] if w_mean[nm] else 1.0) for nm in NAMES},
                    'sec': round(time.time() - ts, 1)}
             fh.write(json.dumps(rec) + '\n')
             fh.flush()
-            for a in ARMS:
-                acc[a].mean = None
+            for nm in NAMES:
+                acc[nm].mean = None
             torch.cuda.empty_cache()
-            print(f'[var-probe {i + 1}/{n_scenes}] {rec["scene"][:30]:30s} '
-                  f'iw/u {V["iw"] / V["uniform"]:.3f}  shuf/u {V["shuffled"] / V["uniform"]:.3f}  '
-                  f'D iw {D["iw"]:.2f} shuf {D["shuffled"]:.2f} NULL u2 {D["uniform2"]:.2f} '
-                  f'rep {D["uniform_rep"]:.2f}  ({rec["sec"]}s, '
-                  f'total {time.time() - t0:.0f}s)', flush=True)
+            line = f'[var-probe {i + 1}/{n_scenes}] {rec["scene"][:30]:30s} '
+            if 'iw' in V:
+                line += f'iw/u {V["iw"] / V["uniform"]:.3f}  shuf/u {V["shuffled"] / V["uniform"]:.3f}  '
+                line += f'D iw {D["iw"]:.2f} shuf {D["shuffled"]:.2f} NULL u2 {D["uniform2"]:.2f}  '
+            if 'iw@dec' in V:
+                line += f'| dec: iw/u {V["iw@dec"] / V["uniform@dec"]:.3f}  D iw {D["iw@dec"]:.2f} '
+                line += f'shuf {D["shuffled@dec"]:.2f} NULL u2 {D["uniform2@dec"]:.2f}  '
+            line += f'({rec["sec"]}s, total {time.time() - t0:.0f}s)'
+            print(line, flush=True)
 
     print(f'\n[var-probe] records: {out_path}')
     summarize(out_path)
@@ -298,6 +380,9 @@ def build_parser():
     g.add_argument('--lam', type=float, default=wess.DEFAULT_LAM)
     g.add_argument('--erode_cells', type=int, default=wess.DEFAULT_ERODE_CELLS)
     g.add_argument('--top_k', type=int, default=2)
+    g.add_argument('--decoders', nargs='+', default=list(DECODERS), choices=DECODERS,
+                   help='coupled = B1/B2 decoder; decoupled = Model Z decoder with a per-draw '
+                        'uniform context set. Default: both (paired on the same weights).')
     return p
 
 

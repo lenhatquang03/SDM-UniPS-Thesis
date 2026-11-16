@@ -453,6 +453,15 @@ def build_argparser():
                         'Weights are 1 on the rim and at most 1/wess_lam in '
                         'the interior. Off (default) = the unweighted B2 loss. '
                         'Training only: val/test are never weighted.')
+    # Model Z: decode the sampled queries against a uniform context set U
+    # (training forward only; evaluation stays coupled). Off = B1/B2 decoder.
+    p.add_argument('--decouple_context', action='store_true',
+                   help='Model Z: each training step decodes a uniform context '
+                        'set U (2048 px, no replacement) and the sampler\'s query '
+                        'set Q. Queries attend to U and to themselves, never to '
+                        'each other, so a query\'s loss does not depend on the '
+                        'rest of the draw. Loss on Q only. Off (default) = the '
+                        'coupled B1/B2 decoder. Val/test are unaffected.')
     p.add_argument('--wess_erode_cells', type=int, default=2,
                    help='Silhouette band excluded from the energy statistics '
                         'and from the softmax, in 64x64 energy-grid cells '
@@ -758,6 +767,9 @@ ROOT_LIST_ARGS = ('hdlong_dir', 'polarps_dir', 'train_dir')
 # invalidating the headline number. Hard error unless --allow_config_change.
 SPLIT_CRITICAL_ARGS = (
     'seed', 'val_fraction', 'test_fraction', 'max_scenes',
+    # Changes the training forward itself (which pixels are decoded and what
+    # the loss sees). A run that flips it mid-way is no single model: abort.
+    'decouple_context',
     'hdlong_dir', 'polarps_dir', 'train_dir',
     # K decides which scenes can supply a sample, so it decides the pool.
     'k_per_scene',

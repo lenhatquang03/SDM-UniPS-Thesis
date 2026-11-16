@@ -185,11 +185,20 @@ class Net(nn.Module):
     def __init__(self, pixel_samples, device,
                  wess_tau=wess_mod.DEFAULT_TAU, wess_lam=wess_mod.DEFAULT_LAM,
                  wess_erode_cells=wess_mod.DEFAULT_ERODE_CELLS,
-                 wess_top_k=2, wess_iw=False):
+                 wess_top_k=2, wess_iw=False, decouple_context=False):
         super().__init__()
         self.device = device
         self.pixel_samples = pixel_samples
         self.glc_smoothing = True
+
+        # --- Model Z (decoupled context/query decoder) ---------------------
+        # Training forward only. Off = the B1/B2 coupled decoder, bit-identical.
+        # On = each training step decodes two sets: a uniform context set U
+        # (no replacement) and the sampler's query set Q. Queries attend to U
+        # and to themselves, never to each other, so a query's loss depends
+        # only on its own location and U, which is what removes the
+        # sample-set bias. Evaluation (`sample_ids` given) stays coupled.
+        self.decouple_context = bool(decouple_context)
 
         # --- Model B2 (WESS) sampler configuration -------------------------
         # Hyperparameters of the *sampler*, not of the architecture, so they
@@ -292,6 +301,69 @@ class Net(nn.Module):
         norm = torch.sqrt((x_n * x_n).sum(dim=1, keepdim=True) + 1e-12)
         return x_n / norm
 
+
+    def _light_axis_features(self, glc, I_dec, target, ids, num_imgs, H, W, C):
+        """Per-pixel light-axis features for pixels `ids` of one batch element.
+
+        This is the first half of `_decode_pixels`, verbatim. It is per-pixel:
+        the attention inside GLC_Upsample and GLC_Aggregation runs over the
+        image axis only, so each pixel's features do not depend on which other
+        pixels are in the set. Returns [m, 384].
+        """
+        o_ = I_dec[target, :, :, :].reshape(num_imgs, C, H * W).permute(2, 0, 1)
+        o_ids = o_[ids, :, :]                                                    # [m, N, C]
+        coords = ind2coords(np.array((H, W)), ids).expand(num_imgs, -1, -1, -1).to(self.device)
+        glc_ids = F.grid_sample(glc[target, :, :, :], coords, mode='bilinear', align_corners=False)
+        glc_ids = glc_ids.reshape(num_imgs, -1, len(ids)).permute(2, 0, 1)       # [m, N, F]
+        x = torch.cat([o_ids, glc_ids], dim=2)
+        glc_ids = self.glc_upsample(x)
+        x = torch.cat([o_ids, glc_ids], dim=2)
+        return self.glc_aggregation(x)
+
+    def sample_context_pixels(self, valid_ids, n_sample):
+        """Model Z context set U: `n_sample` pixels uniform over the mask.
+
+        Without replacement, falling back to with replacement only when the
+        mask holds fewer than `n_sample` valid pixels (as `uniform_sample`
+        does). Drawn independently of the query draw, so U carries no
+        information about Q. It gets no loss of its own.
+        """
+        if valid_ids.numel() == 0:
+            return torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
+        if valid_ids.numel() >= n_sample:
+            perm = torch.randperm(valid_ids.numel(), device=valid_ids.device)
+            return valid_ids[perm[:n_sample]]
+        rep = torch.randint(0, valid_ids.numel(), (n_sample,), device=valid_ids.device)
+        return valid_ids[rep]
+
+    def _decode_decoupled(self, glc, I_dec, target, q_ids, c_ids, num_imgs, H, W, C):
+        """Model Z decoder for one batch element. Returns unit normals for the
+        queries `q_ids` only: [m_q, 3].
+
+        Both sets go through the light axis with shared weights. Then the
+        spatial axis runs layer by layer with the SAME blocks as B1's
+        Regressor.comm, with no new parameters:
+            Q_l = MAB_l(Q_{l-1}, U_{l-1})             (queries read the context
+                                                       of the same layer,
+                                                       plus themselves)
+            U_l = SAB_l(U_{l-1})   for l < L only     (context self-attention;
+                                                       U_L is never read)
+        so no query enters U and no query reads another query.
+        """
+        Q = self._light_axis_features(glc, I_dec, target, q_ids, num_imgs, H, W, C).unsqueeze(0)
+        U = self._light_axis_features(glc, I_dec, target, c_ids, num_imgs, H, W, C).unsqueeze(0)
+        # Query layer l reads U_{l-1} (plus each query itself). The context is
+        # updated only when a later query layer reads it: U_L is never read, so
+        # the last context update is skipped (no change to Q, the loss or grads).
+        layers = list(self.regressor.comm.enc)
+        for l, sab in enumerate(layers):
+            Q = sab.mab.forward_cross_self(Q, U)  # queries read U_{l-1} and themselves
+            if l < len(layers) - 1:
+                U = sab(U)                        # SAB(X, X): the B1 block, unchanged
+        x_n = self.regressor.prediction_normal(Q.squeeze(0))
+        # Same gradient-safe unit normalisation as _decode_pixels.
+        norm = torch.sqrt((x_n * x_n).sum(dim=1, keepdim=True) + 1e-12)
+        return x_n / norm
 
     def _wess_saliency(self, nImgArray, canonical_resolution):
         """Per-batch-element 64x64 energy maps, or None if the tap is empty.
@@ -398,8 +470,14 @@ class Net(nn.Module):
         return valid_ids[rep]
 
     def forward(self, I, M, nImgArray, decoder_resolution, canonical_resolution,
-                training=False, sample_ids=None):
-        """`sample_ids`: optional [B, m] long tensor of flat pixel indices at the
+                training=False, sample_ids=None, context_ids=None):
+        """`context_ids`: optional [B, m_u] long tensor, training forward only.
+        When given, the decoupled decoder (Model Z) runs with these pixels as
+        the context set U, whatever `decouple_context` says. Queries are
+        `sample_ids` if given, else the sampler's draw. Evaluation never passes
+        it, so val/test stay coupled.
+
+        `sample_ids`: optional [B, m] long tensor of flat pixel indices at the
         decoder resolution. When supplied (evaluation) it overrides
         `sample_train_pixels` entirely, so every model variant is scored on
         exactly the same pixels; when None (training) the model picks its own.
@@ -476,6 +554,7 @@ class Net(nn.Module):
                 target = range(p, p + num_imgs)
                 p = p + num_imgs
 
+                ctx = None   # Model Z context set; stays None on every B1/B2 path
                 if sample_ids is not None:
                     ids = sample_ids[b].to(device=I.device, dtype=torch.long)
                 else:
@@ -485,8 +564,17 @@ class Net(nn.Module):
                         valid_ids, self.pixel_samples,
                         E=None if E_maps is None else E_maps[b],
                         mask_hw=M_dec[b, 0], H=H, W=W)
+                    if self.decouple_context:
+                        ctx = self.sample_context_pixels(valid_ids, self.pixel_samples)
+                if context_ids is not None:
+                    # Explicit context (variance probe, exact-score presampling):
+                    # the caller owns U, and the decoupled path is taken.
+                    ctx = context_ids[b].to(device=I.device, dtype=torch.long)
 
-                X_n = self._decode_pixels(glc, I_dec, target, ids, num_imgs, H, W, C)
+                if ctx is None:
+                    X_n = self._decode_pixels(glc, I_dec, target, ids, num_imgs, H, W, C)
+                else:
+                    X_n = self._decode_decoupled(glc, I_dec, target, ids, ctx, num_imgs, H, W, C)
                 pred_n_list.append(X_n)
                 idx_list.append(ids)
 
@@ -504,6 +592,9 @@ class Net(nn.Module):
             sample_idx = torch.stack(idx_list, dim=0)        # [B, n_sample]
             return pred_n, sample_idx, (H, W)
 
+        if context_ids is not None:
+            raise ValueError('context_ids is a training-forward argument; '
+                             'inference never takes the decoupled path')
         nout = torch.zeros(B, H * W, 3).to(self.device)
 
         p = 0

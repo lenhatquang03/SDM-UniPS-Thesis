@@ -302,6 +302,7 @@ class Trainer:
                                      wess.DEFAULT_ERODE_CELLS),
             wess_top_k=getattr(args, 'wess_top_k', 2),
             wess_iw=getattr(args, 'wess_iw', False),
+            decouple_context=getattr(args, 'decouple_context', False),
         ).to(device)
         self.net.with_grad()
         # Name the variant in the log: the architecture is fixed by the branch,
