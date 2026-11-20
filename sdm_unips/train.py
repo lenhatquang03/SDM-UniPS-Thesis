@@ -453,6 +453,16 @@ def build_argparser():
                         'Weights are 1 on the rim and at most 1/wess_lam in '
                         'the interior. Off (default) = the unweighted B2 loss. '
                         'Training only: val/test are never weighted.')
+    # Rule C control: shuffled WESS energy (training draw only; off = default).
+    p.add_argument('--energy_shuffle', default=None, choices=['per_step', 'per_run'],
+                   help='Shuffled-energy control. Permutes the 64x64 energy map cells before '
+                        'the WESS draw: per_step = a fresh permutation per scene per draw; '
+                        'per_run = one permutation for the whole run, seeded by --seed. Value '
+                        'distribution unchanged, alignment with the surface broken. Off (default) '
+                        '= the unshuffled WESS draw.')
+    p.add_argument('--energy_shuffle_tau', type=float, default=None,
+                   help='tau for the shuffled draw only (Rule C). Default: --wess_tau. Set it to the '
+                        'value that matches the shuffled draw ESS to the real draw ESS (see the handoff).')
     # Model Z: decode the sampled queries against a uniform context set U
     # (training forward only; evaluation stays coupled). Off = B1/B2 decoder.
     p.add_argument('--decouple_context', action='store_true',
@@ -769,7 +779,7 @@ SPLIT_CRITICAL_ARGS = (
     'seed', 'val_fraction', 'test_fraction', 'max_scenes',
     # Changes the training forward itself (which pixels are decoded and what
     # the loss sees). A run that flips it mid-way is no single model: abort.
-    'decouple_context',
+    'decouple_context', 'energy_shuffle', 'energy_shuffle_tau',
     'hdlong_dir', 'polarps_dir', 'train_dir',
     # K decides which scenes can supply a sample, so it decides the pool.
     'k_per_scene',

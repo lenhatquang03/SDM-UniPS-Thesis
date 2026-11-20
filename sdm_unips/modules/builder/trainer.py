@@ -303,6 +303,9 @@ class Trainer:
             wess_top_k=getattr(args, 'wess_top_k', 2),
             wess_iw=getattr(args, 'wess_iw', False),
             decouple_context=getattr(args, 'decouple_context', False),
+            energy_shuffle=getattr(args, 'energy_shuffle', None),
+            energy_shuffle_seed=getattr(args, 'seed', 0),
+            energy_shuffle_tau=getattr(args, 'energy_shuffle_tau', None),
         ).to(device)
         self.net.with_grad()
         # Name the variant in the log: the architecture is fixed by the branch,

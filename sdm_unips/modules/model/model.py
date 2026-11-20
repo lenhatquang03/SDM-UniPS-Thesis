@@ -185,7 +185,8 @@ class Net(nn.Module):
     def __init__(self, pixel_samples, device,
                  wess_tau=wess_mod.DEFAULT_TAU, wess_lam=wess_mod.DEFAULT_LAM,
                  wess_erode_cells=wess_mod.DEFAULT_ERODE_CELLS,
-                 wess_top_k=2, wess_iw=False, decouple_context=False):
+                 wess_top_k=2, wess_iw=False, decouple_context=False,
+                 energy_shuffle=None, energy_shuffle_seed=0, energy_shuffle_tau=None):
         super().__init__()
         self.device = device
         self.pixel_samples = pixel_samples
@@ -199,6 +200,21 @@ class Net(nn.Module):
         # only on its own location and U, which is what removes the
         # sample-set bias. Evaluation (`sample_ids` given) stays coupled.
         self.decouple_context = bool(decouple_context)
+
+        # --- Shuffled-energy control (Rule C), training draw only --------------
+        # None = off (bit-identical). The 64x64 energy map's cells are permuted,
+        # which keeps its value distribution and peakedness but breaks its
+        # alignment with the surface. 'per_step': a fresh permutation for every
+        # scene at every draw (ambient RNG, so resumable). 'per_run': one
+        # permutation, fixed for the whole run, seeded by `energy_shuffle_seed`
+        # and applied to every scene (cached in memory, re-derived on resume).
+        if energy_shuffle not in (None, 'per_step', 'per_run'):
+            raise ValueError(f'energy_shuffle must be None, per_step or per_run, got {energy_shuffle!r}')
+        self.energy_shuffle = energy_shuffle
+        self.energy_shuffle_seed = int(energy_shuffle_seed)
+        # tau for the shuffled draw only (Rule C: matched to the real draw's ESS).
+        self.energy_shuffle_tau = None if energy_shuffle_tau is None else float(energy_shuffle_tau)
+        self._energy_perm_cache = {}
 
         # --- Model B2 (WESS) sampler configuration -------------------------
         # Hyperparameters of the *sampler*, not of the architecture, so they
@@ -409,6 +425,30 @@ class Net(nn.Module):
             out[k] = (sum(vals) / len(vals)) if vals else float('nan')
         return out
 
+    def _draw_tau(self):
+        """tau for the WESS draw: the shuffled arm may use its own (ESS-matched) tau."""
+        if self.energy_shuffle is not None and self.energy_shuffle_tau is not None:
+            return self.energy_shuffle_tau
+        return self.wess_tau
+
+    def _shuffle_energy(self, E):
+        """Permute the cells of one scene's energy map (Rule C control).
+
+        Keeps the value multiset of E, so ESS and tilt of the draw distribution
+        are unchanged in distribution; only the placement of energy changes.
+        """
+        flat = E.reshape(-1)
+        if self.energy_shuffle == 'per_step':
+            perm = torch.randperm(flat.numel(), device=flat.device)
+        else:  # per_run
+            key = (flat.numel(), str(flat.device))
+            if key not in self._energy_perm_cache:
+                g = torch.Generator()
+                g.manual_seed(self.energy_shuffle_seed)
+                self._energy_perm_cache[key] = torch.randperm(flat.numel(), generator=g).to(flat.device)
+            perm = self._energy_perm_cache[key]
+        return flat[perm].reshape(E.shape)
+
     def sample_train_pixels(self, valid_ids, n_sample,
                             E=None, mask_hw=None, H=None, W=None):
         """Choose which `n_sample` pixels a TRAINING step decodes.
@@ -442,11 +482,13 @@ class Net(nn.Module):
                     torch.ones(n_sample, device=valid_ids.device))
             return torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
 
+        if E is not None and self.energy_shuffle is not None:
+            E = self._shuffle_energy(E)
         if E is not None and mask_hw is not None:
             if self.wess_iw:
                 ids, stats, w = wess_mod.wess_sample_train(
                     E, mask_hw, valid_ids, H, W, n_sample,
-                    tau=self.wess_tau, lam=self.wess_lam,
+                    tau=self._draw_tau(), lam=self.wess_lam,
                     erode_cells=self.wess_erode_cells, return_weights=True)
                 stats['wess_iw_w_mean'] = float(w.mean())
                 stats['wess_iw_w_max'] = float(w.max())
@@ -454,7 +496,7 @@ class Net(nn.Module):
             else:
                 ids, stats = wess_mod.wess_sample_train(
                     E, mask_hw, valid_ids, H, W, n_sample,
-                    tau=self.wess_tau, lam=self.wess_lam,
+                    tau=self._draw_tau(), lam=self.wess_lam,
                     erode_cells=self.wess_erode_cells)
             self._wess_stats_acc.append(stats)
             return ids
