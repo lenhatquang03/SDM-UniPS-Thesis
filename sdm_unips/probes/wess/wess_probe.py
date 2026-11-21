@@ -112,7 +112,7 @@ PROBE_DATA_DEFAULTS = dict(
     hdlong_dir=['/mnt/8TData/Datasets/UniPS/hdlong-complexv1',
                 '/mnt/8TData/Datasets/UniPS/MerlMix'],
     polarps_dir=['/mnt/8TData/Datasets/UniPS/PolarPS'],
-    scene_manifest='/mnt/18TData/ps1/runs/modelB1_wtconv/scene_manifest.json',
+    scene_manifest='/workspace/runs/modelA/logs/scene_manifest.json',
 )
 
 
