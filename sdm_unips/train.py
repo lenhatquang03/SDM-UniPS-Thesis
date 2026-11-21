@@ -463,6 +463,12 @@ def build_argparser():
     p.add_argument('--energy_shuffle_tau', type=float, default=None,
                    help='tau for the shuffled draw only (Rule C). Default: --wess_tau. Set it to the '
                         'value that matches the shuffled draw ESS to the real draw ESS (see the handoff).')
+    p.add_argument('--energy_shuffle_match_ess', action='store_true',
+                   help='Rule C v2: choose the shuffled tau online, per scene and draw, so the '
+                        'shuffled draw ESS equals the ESS of the real (unshuffled) draw at '
+                        '--wess_tau on the same map and weights. Needs --energy_shuffle; '
+                        'excludes --energy_shuffle_tau. Logs wess_ess_target, wess_tau_shuf, '
+                        'wess_match_resid, wess_match_bound. Off (default) = fixed tau.')
     # Model Z: decode the sampled queries against a uniform context set U
     # (training forward only; evaluation stays coupled). Off = B1/B2 decoder.
     p.add_argument('--decouple_context', action='store_true',
@@ -780,6 +786,7 @@ SPLIT_CRITICAL_ARGS = (
     # Changes the training forward itself (which pixels are decoded and what
     # the loss sees). A run that flips it mid-way is no single model: abort.
     'decouple_context', 'energy_shuffle', 'energy_shuffle_tau',
+    'energy_shuffle_match_ess',
     'hdlong_dir', 'polarps_dir', 'train_dir',
     # K decides which scenes can supply a sample, so it decides the pool.
     'k_per_scene',

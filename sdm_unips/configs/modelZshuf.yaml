@@ -1,7 +1,10 @@
-# Rule C, shuffled-energy arm. Identical to modelZ.yaml except session_name and the
+# Rule C v2, shuffled-energy arm. Identical to modelZ.yaml except session_name and the
 # energy_shuffle keys. Each training draw permutes the 64x64 energy cells of every scene
-# (per_step). energy_shuffle_tau MUST be set to the value fixed by the ESS-matching probe
-# (rule_c_real vs rule_c_shuf) before launch; the placeholder makes the launch fail.
+# (per_step), and the shuffled tau is chosen ONLINE per scene and draw
+# (energy_shuffle_match_ess) so the shuffled draw's ESS equals the real draw's ESS at
+# wess_tau=1.0 on the same map and weights. v1 (fixed tau_s=1.35, session modelZshuf)
+# was stopped at ~epoch 17 on 2026-11-21: its ESS drifted below Z's (0.396 vs 0.431),
+# because a fixed tau cannot follow the two arms' energy maps as their stems train.
 # CLAIM SCOPE (decided 2026-11-21): this arm supports only "WESS-IW beats a
 # concentration-matched (ESS-matched) random-placement sampler". It does NOT control
 # cluster morphology: the real draw follows contiguous crease ridges, the shuffled draw
@@ -11,7 +14,7 @@
 # so they do not show the null; only wess_ess is comparable across the two arms.
 # Launch:
 #   NUMPY_MADVISE_HUGEPAGE=0 PYTHONUNBUFFERED=1 nohup python -u sdm_unips/train.py \
-#       --config sdm_unips/configs/modelZshuf.yaml < /dev/null > /workspace/runs/modelZshuf.log 2>&1 &
+#       --config sdm_unips/configs/modelZshuf.yaml < /dev/null > /workspace/runs/modelZshuf_ess.log 2>&1 &
 # Model Z: decoupled context/query decoder on the B2-IW sampler (--decouple_context).
 # Branch modelZ-decoupled (from modelC-wess 51b9668). Identical to modelB2_iw.yaml except
 # session_name and decouple_context. Compare with B2-IW (only the decoder differs) and B1
@@ -46,7 +49,7 @@
 # startup must print fingerprint=dca709407e0adb11.
 
 # I/O and scene pool
-session_name: /workspace/runs/modelZshuf
+session_name: /workspace/runs/modelZshuf_ess   # new session: v1 checkpoints are a different run
 hdlong_dir:
   - /workspace/data/mnt/8TData/Datasets/UniPS/hdlong-complexv1
   - /workspace/data/mnt/8TData/Datasets/UniPS/MerlMix
@@ -76,7 +79,7 @@ wess_top_k: 2
 wess_iw: true          # loss x 1/(n_valid * p): same expected target as Model A
 decouple_context: true   # Model Z: uniform context U, queries Q, loss on Q only
 energy_shuffle: per_step        # Rule C: per scene, fresh permutation at every draw
-energy_shuffle_tau: 1.35  # tau_s from the --shipped_sampler probe (rule_c_real, rule_c_shuf; 2026-11-21): ESS and interior gates pass
+energy_shuffle_match_ess: true  # Rule C v2: tau chosen online per scene/draw (no energy_shuffle_tau)
 
 # Resolution and batch (effective batch = batch_size x accum_steps = 8)
 train_resolution: 512
@@ -130,7 +133,7 @@ resume: auto
 pretrained: null
 allow_config_change: false
 
-# Off-box backup (uploads to <hf_repo>/sdm-ckpt/modelZshuf/)
+# Off-box backup (uploads to <hf_repo>/sdm-ckpt/modelZshuf_ess/)
 hf_backup: true
 hf_backup_every: 5
 hf_repo: culacgiontan0312/UniPS

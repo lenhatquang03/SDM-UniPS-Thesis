@@ -186,7 +186,8 @@ class Net(nn.Module):
                  wess_tau=wess_mod.DEFAULT_TAU, wess_lam=wess_mod.DEFAULT_LAM,
                  wess_erode_cells=wess_mod.DEFAULT_ERODE_CELLS,
                  wess_top_k=2, wess_iw=False, decouple_context=False,
-                 energy_shuffle=None, energy_shuffle_seed=0, energy_shuffle_tau=None):
+                 energy_shuffle=None, energy_shuffle_seed=0, energy_shuffle_tau=None,
+                 energy_shuffle_match_ess=False):
         super().__init__()
         self.device = device
         self.pixel_samples = pixel_samples
@@ -215,6 +216,15 @@ class Net(nn.Module):
         # tau for the shuffled draw only (Rule C: matched to the real draw's ESS).
         self.energy_shuffle_tau = None if energy_shuffle_tau is None else float(energy_shuffle_tau)
         self._energy_perm_cache = {}
+        # Online ESS match (Rule C v2): per scene and draw, the shuffled tau is
+        # chosen so the shuffled draw's ESS equals the real (unshuffled) draw's
+        # ESS at wess_tau on the same map. Replaces the fixed energy_shuffle_tau.
+        self.energy_shuffle_match_ess = bool(energy_shuffle_match_ess)
+        if self.energy_shuffle_match_ess and energy_shuffle is None:
+            raise ValueError('energy_shuffle_match_ess needs energy_shuffle')
+        if self.energy_shuffle_match_ess and self.energy_shuffle_tau is not None:
+            raise ValueError('energy_shuffle_match_ess chooses tau online; '
+                             'do not also set energy_shuffle_tau')
 
         # --- Model B2 (WESS) sampler configuration -------------------------
         # Hyperparameters of the *sampler*, not of the architecture, so they
@@ -482,13 +492,20 @@ class Net(nn.Module):
                     torch.ones(n_sample, device=valid_ids.device))
             return torch.zeros(n_sample, dtype=torch.long, device=valid_ids.device)
 
+        tau = self._draw_tau()
+        match_stats = None
         if E is not None and self.energy_shuffle is not None:
+            E_real = E
             E = self._shuffle_energy(E)
+            if self.energy_shuffle_match_ess and mask_hw is not None:
+                tau, match_stats = wess_mod.match_shuffled_tau(
+                    E_real, E, mask_hw, valid_ids, H, W, ref_tau=self.wess_tau,
+                    lam=self.wess_lam, erode_cells=self.wess_erode_cells)
         if E is not None and mask_hw is not None:
             if self.wess_iw:
                 ids, stats, w = wess_mod.wess_sample_train(
                     E, mask_hw, valid_ids, H, W, n_sample,
-                    tau=self._draw_tau(), lam=self.wess_lam,
+                    tau=tau, lam=self.wess_lam,
                     erode_cells=self.wess_erode_cells, return_weights=True)
                 stats['wess_iw_w_mean'] = float(w.mean())
                 stats['wess_iw_w_max'] = float(w.max())
@@ -496,8 +513,10 @@ class Net(nn.Module):
             else:
                 ids, stats = wess_mod.wess_sample_train(
                     E, mask_hw, valid_ids, H, W, n_sample,
-                    tau=self._draw_tau(), lam=self.wess_lam,
+                    tau=tau, lam=self.wess_lam,
                     erode_cells=self.wess_erode_cells)
+            if match_stats is not None:
+                stats.update(match_stats)
             self._wess_stats_acc.append(stats)
             return ids
 

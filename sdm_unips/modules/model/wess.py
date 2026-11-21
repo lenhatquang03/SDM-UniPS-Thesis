@@ -102,6 +102,8 @@ Everything is `detach()`ed. The draw is an index selection and carries no
 gradient; keeping the live tensor would pin the whole encoder graph.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -526,6 +528,81 @@ def wess_sample_train(E, mask_hw, valid_ids, H, W, n_sample,
         weights = 1.0 / (p.numel() * p[sel].detach().float())
         return valid_ids[sel], train_draw_stats(e, p, sel, is_int), weights
     return valid_ids[sel], train_draw_stats(e, p, sel, is_int)
+
+
+# Online ESS match for the shuffled-energy control (Rule C,
+# --energy_shuffle_match_ess). ESS rises monotonically in tau: with
+# p = mix + (1 - lam) * q over the interior, sum(p^2) = const + (1-lam)^2 sum(q^2)
+# (sum(q) = 1), and sum(softmax(z/tau)^2) falls as tau grows. So one tau
+# matches any target inside [ESS(LO), ESS(HI)]; outside it the bound is used
+# and flagged.
+MATCH_TAU_LO = 0.05
+MATCH_TAU_HI = 50.0
+MATCH_ITERS = 40
+MATCH_TOL = 1e-4
+
+
+def _ess_frac(p):
+    """ESS as a fraction of the support: the formula `train_draw_stats` logs."""
+    p = p.detach().float()
+    return float(1.0 / (p.pow(2).sum() + 1e-12) / p.numel())
+
+
+def match_shuffled_tau(E_real, E_shuf, mask_hw, valid_ids, H, W,
+                       ref_tau=DEFAULT_TAU, lam=DEFAULT_LAM,
+                       erode_cells=DEFAULT_ERODE_CELLS):
+    """tau for the shuffled draw so that its ESS equals the REAL draw's ESS on
+    the same scene, the same weights and the same step.
+
+    Target = ESS of `wess_train_probabilities(E_real, tau=ref_tau)`. The tau is
+    found by bisection on log tau over `wess_train_probabilities(E_shuf, tau)`,
+    i.e. the exact distribution `wess_sample_train` then draws from. No RNG is
+    consumed, so the training RNG stream is the same as with the match off.
+
+    Returns `(tau, stats)`; stats carry `wess_ess_target`, `wess_tau_shuf`,
+    `wess_match_resid` (|ESS_shuf - target|) and `wess_match_bound` (1.0 when
+    the target lies outside the bisection range and a bound was used).
+    """
+    interior = interior_mask(mask_hw, E_real.shape[-2:], erode_cells)
+    p_real, _, is_int = wess_train_probabilities(E_real, valid_ids, interior,
+                                                 H, W, tau=ref_tau, lam=lam)
+    target = _ess_frac(p_real)
+
+    # Uniform fallback (too small an interior, or lam >= 1): both draws are
+    # Model A's uniform draw whatever tau is, so there is nothing to match.
+    if int(is_int.sum()) < MIN_INTERIOR_PIXELS or float(lam) >= 1.0:
+        return float(ref_tau), {'wess_ess_target': target,
+                                'wess_tau_shuf': float('nan'),
+                                'wess_match_resid': 0.0,
+                                'wess_match_bound': 0.0}
+
+    def ess_at(log_tau):
+        p, _, _ = wess_train_probabilities(E_shuf, valid_ids, interior, H, W,
+                                           tau=math.exp(log_tau), lam=lam)
+        return _ess_frac(p)
+
+    lo, hi = math.log(MATCH_TAU_LO), math.log(MATCH_TAU_HI)
+    e_lo, e_hi = ess_at(lo), ess_at(hi)
+    bound = 0.0
+    if target <= e_lo:
+        log_tau, ess, bound = lo, e_lo, 1.0
+    elif target >= e_hi:
+        log_tau, ess, bound = hi, e_hi, 1.0
+    else:
+        for _ in range(MATCH_ITERS):
+            log_tau = 0.5 * (lo + hi)
+            ess = ess_at(log_tau)
+            if abs(ess - target) <= MATCH_TOL:
+                break
+            if ess < target:
+                lo = log_tau
+            else:
+                hi = log_tau
+    tau = math.exp(log_tau)
+    return tau, {'wess_ess_target': target,
+                 'wess_tau_shuf': tau,
+                 'wess_match_resid': abs(ess - target),
+                 'wess_match_bound': bound}
 
 
 def train_draw_stats(e, p, sel, is_int):

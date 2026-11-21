@@ -21,7 +21,22 @@ build the 512-px network. What is checked, in order of importance for the per_st
 6. Shape and dtype are unchanged, so the downstream WESS code is unaffected.
 7. tau selection: with the flag off the draw uses wess_tau; with per_step and a shuffled
    tau set, the draw uses energy_shuffle_tau.
+
+Rule C v2, --energy_shuffle_match_ess (online per-scene ESS match). Synthetic scene: a
+256x256 disk mask and a 64x64 energy map with a smooth interior bump, a high silhouette
+ring and near-zero background, i.e. the three populations the whole-frame shuffle mixes.
+
+8. Flag off = baseline: with match off, sample_train_pixels gives exactly the ids and
+   weights of the pre-change body (shuffle, then wess_sample_train at the fixed tau).
+9. Monotonic: ESS of the shuffled draw is non-decreasing in tau (bisection well posed).
+10. Match: the returned tau gives a shuffled draw whose ESS is within 1e-3 of the real
+    draw's ESS at wess_tau, recomputed independently.
+11. No RNG consumed by the match: the torch RNG state is unchanged across it.
+12. Logging: with match on, every stats record carries the four match keys, and the
+    logged wess_ess equals wess_ess_target within 1e-3.
+13. Uniform fallback (lam = 1): nothing to match; resid 0, tau NaN.
 """
+import math
 import sys
 import types
 
@@ -29,6 +44,7 @@ import torch
 
 sys.path.insert(0, __file__.rsplit('/sdm_unips/', 1)[0])
 from sdm_unips.modules.model.model import Net  # noqa: E402
+from sdm_unips.modules.model import wess as wess_mod  # noqa: E402
 
 H = W = 64
 
@@ -157,6 +173,139 @@ def test_tau_selection():
     print('ok: tau selection for flag off / per_step')
 
 
+# --- Rule C v2: online ESS match (--energy_shuffle_match_ess) ---------------
+
+HD = 256          # decoder grid (training uses 512; 256 keeps the test light)
+G = 64            # energy grid, as in training
+N_SAMPLE = 512
+LAM, ERODE, TAU_REF = 0.25, 2, 1.0
+
+
+def scene(seed=0):
+    yy, xx = torch.meshgrid(torch.arange(HD), torch.arange(HD), indexing='ij')
+    mask = (((yy - 128) ** 2 + (xx - 128) ** 2) <= 100 ** 2).float()
+    gy, gx = torch.meshgrid(torch.arange(G), torch.arange(G), indexing='ij')
+    r = ((gy - 31.5) ** 2 + (gx - 31.5) ** 2).float().sqrt()
+    g = torch.Generator().manual_seed(seed)
+    E = torch.full((G, G), 1e-6)
+    inside = r <= 25
+    E[inside] = 0.3 + 0.1 * torch.rand(int(inside.sum()), generator=g)
+    E += 1.5 * torch.exp(-((gy - 20.0) ** 2 + (gx - 36.0) ** 2) / 18.0) * inside   # crease-like bump
+    ring = (r > 23) & (r <= 26)
+    E[ring] = 4.0 + torch.rand(int(ring.sum()), generator=g)                      # silhouette ring
+    valid = torch.nonzero(mask.reshape(-1) > 0, as_tuple=False)[:, 0]
+    return E, mask, valid
+
+
+def stand_in_match(match, tau=None, iw=True, lam=LAM):
+    o = types.SimpleNamespace()
+    o.energy_shuffle = 'per_step'
+    o.energy_shuffle_seed = 0
+    o.energy_shuffle_tau = tau
+    o.energy_shuffle_match_ess = match
+    o.wess_tau, o.wess_lam, o.wess_erode_cells, o.wess_iw = TAU_REF, lam, ERODE, iw
+    o._energy_perm_cache = {}
+    o._sample_weights_acc, o._wess_stats_acc = [], []
+    o._shuffle_energy = lambda E: Net._shuffle_energy(o, E)
+    o._draw_tau = lambda: Net._draw_tau(o)
+    return o
+
+
+def ess_shuf(E_shuf, mask, valid, tau, lam=LAM):
+    interior = wess_mod.interior_mask(mask, E_shuf.shape[-2:], ERODE)
+    p, _, _ = wess_mod.wess_train_probabilities(E_shuf, valid, interior, HD, HD, tau=tau, lam=lam)
+    return wess_mod._ess_frac(p)
+
+
+def test_flag_off_equals_baseline():
+    E, mask, valid = scene()
+    for iw in (True, False):
+        o = stand_in_match(match=False, tau=1.35, iw=iw)
+        torch.manual_seed(11)
+        ids = Net.sample_train_pixels(o, valid, N_SAMPLE, E=E, mask_hw=mask, H=HD, W=HD)
+        # Pre-change body, written out.
+        ref = stand_in_match(match=False, tau=1.35, iw=iw)
+        torch.manual_seed(11)
+        E2 = Net._shuffle_energy(ref, E)
+        out = wess_mod.wess_sample_train(E2, mask, valid, HD, HD, N_SAMPLE, tau=1.35, lam=LAM,
+                                         erode_cells=ERODE, return_weights=iw)
+        assert torch.equal(ids, out[0]), f'flag-off ids differ from baseline (iw={iw})'
+        if iw:
+            assert torch.equal(o._sample_weights_acc[0], out[2]), 'flag-off weights differ'
+        # sample_train_pixels adds the two iw keys itself (pre-change too); nothing else.
+        extra = set(o._wess_stats_acc[0]) - set(out[1]) - {'wess_iw_w_mean', 'wess_iw_w_max'}
+        assert not extra, f'flag-off added stats keys: {extra}'
+        print(f'ok: flag off == baseline (iw={iw}): max|d ids| = '
+              f'{int((ids - out[0]).abs().max())}')
+
+
+def test_monotonic_in_tau():
+    E, mask, valid = scene()
+    torch.manual_seed(12)
+    S = Net._shuffle_energy(stand_in_match(True), E)
+    taus = [0.05 * (1.25 ** k) for k in range(32)]          # 0.05 .. ~50
+    ess = [ess_shuf(S, mask, valid, t) for t in taus]
+    drops = [(taus[i], ess[i] - ess[i + 1]) for i in range(len(ess) - 1) if ess[i + 1] < ess[i] - 1e-6]
+    assert not drops, f'ESS not monotone in tau: {drops[:3]}'
+    print(f'ok: ESS monotone in tau ({ess[0]:.4f} at tau=0.05 -> {ess[-1]:.4f} at tau={taus[-1]:.1f})')
+
+
+def test_match_hits_target():
+    E, mask, valid = scene()
+    interior = wess_mod.interior_mask(mask, E.shape[-2:], ERODE)
+    p_real, _, _ = wess_mod.wess_train_probabilities(E, valid, interior, HD, HD, tau=TAU_REF, lam=LAM)
+    target = wess_mod._ess_frac(p_real)
+    for seed in range(5):
+        torch.manual_seed(100 + seed)
+        S = Net._shuffle_energy(stand_in_match(True), E)
+        tau, st = wess_mod.match_shuffled_tau(E, S, mask, valid, HD, HD, ref_tau=TAU_REF,
+                                              lam=LAM, erode_cells=ERODE)
+        got = ess_shuf(S, mask, valid, tau)
+        fixed = ess_shuf(S, mask, valid, TAU_REF)
+        assert st['wess_match_bound'] == 0.0, f'bound hit: {st}'
+        assert abs(got - target) < 1e-3, f'ESS {got:.4f} vs target {target:.4f}'
+        assert abs(st['wess_ess_target'] - target) < 1e-9
+        print(f'ok: seed {seed}: target {target:.4f}, shuffled at tau=1 {fixed:.4f}, '
+              f'matched tau {tau:.3f} -> {got:.4f}')
+
+
+def test_match_consumes_no_rng():
+    E, mask, valid = scene()
+    torch.manual_seed(13)
+    S = Net._shuffle_energy(stand_in_match(True), E)
+    before = torch.get_rng_state().clone()
+    wess_mod.match_shuffled_tau(E, S, mask, valid, HD, HD, ref_tau=TAU_REF, lam=LAM, erode_cells=ERODE)
+    assert torch.equal(before, torch.get_rng_state()), 'match_shuffled_tau consumed torch RNG'
+    print('ok: match consumes no RNG')
+
+
+def test_logged_stats():
+    E, mask, valid = scene()
+    o = stand_in_match(match=True)
+    torch.manual_seed(14)
+    for _ in range(3):
+        Net.sample_train_pixels(o, valid, N_SAMPLE, E=E, mask_hw=mask, H=HD, W=HD)
+    keys = {'wess_ess_target', 'wess_tau_shuf', 'wess_match_resid', 'wess_match_bound'}
+    for st in o._wess_stats_acc:
+        assert keys <= set(st), f'missing match keys: {keys - set(st)}'
+        assert abs(st['wess_ess'] - st['wess_ess_target']) < 1e-3, \
+            f"logged wess_ess {st['wess_ess']:.4f} vs target {st['wess_ess_target']:.4f}"
+    assert len(o._sample_weights_acc) == 3
+    print('ok: match keys logged; logged wess_ess == target within 1e-3 '
+          f"(e.g. {o._wess_stats_acc[0]['wess_ess']:.4f} vs {o._wess_stats_acc[0]['wess_ess_target']:.4f})")
+
+
+def test_uniform_fallback():
+    E, mask, valid = scene()
+    torch.manual_seed(15)
+    S = Net._shuffle_energy(stand_in_match(True), E)
+    tau, st = wess_mod.match_shuffled_tau(E, S, mask, valid, HD, HD, ref_tau=TAU_REF,
+                                          lam=1.0, erode_cells=ERODE)
+    assert math.isnan(st['wess_tau_shuf']) and st['wess_match_resid'] == 0.0
+    assert abs(st['wess_ess_target'] - 1.0) < 1e-6
+    print('ok: lam=1 fallback: nothing to match')
+
+
 if __name__ == '__main__':
     test_multiset_preserved()
     test_fresh_placement_each_draw()
@@ -165,4 +314,10 @@ if __name__ == '__main__':
     test_resume_reproducible()
     test_shape_for_batch_of_scenes()
     test_tau_selection()
+    test_flag_off_equals_baseline()
+    test_monotonic_in_tau()
+    test_match_hits_target()
+    test_match_consumes_no_rng()
+    test_logged_stats()
+    test_uniform_fallback()
     print('ALL PASS')

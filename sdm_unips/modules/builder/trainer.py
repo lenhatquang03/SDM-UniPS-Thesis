@@ -306,6 +306,7 @@ class Trainer:
             energy_shuffle=getattr(args, 'energy_shuffle', None),
             energy_shuffle_seed=getattr(args, 'seed', 0),
             energy_shuffle_tau=getattr(args, 'energy_shuffle_tau', None),
+            energy_shuffle_match_ess=getattr(args, 'energy_shuffle_match_ess', False),
         ).to(device)
         self.net.with_grad()
         # Name the variant in the log: the architecture is fixed by the branch,
