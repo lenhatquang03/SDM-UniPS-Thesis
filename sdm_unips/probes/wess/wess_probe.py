@@ -109,9 +109,9 @@ import train as train_mod
 # are the B1/B2 values. Do not pass a training YAML via --config: its roots are
 # the training box's and would override these.
 PROBE_DATA_DEFAULTS = dict(
-    hdlong_dir=['/mnt/8TData/Datasets/UniPS/hdlong-complexv1',
-                '/mnt/8TData/Datasets/UniPS/MerlMix'],
-    polarps_dir=['/mnt/8TData/Datasets/UniPS/PolarPS'],
+    hdlong_dir=['/workspace/data/mnt/8TData/Datasets/UniPS/hdlong-complexv1',
+                '/workspace/data/mnt/8TData/Datasets/UniPS/MerlMix'],
+    polarps_dir=['/workspace/data/mnt/8TData/Datasets/UniPS/PolarPS'],
     scene_manifest='/workspace/runs/modelA/logs/scene_manifest.json',
 )
 
