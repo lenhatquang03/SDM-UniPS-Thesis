@@ -64,8 +64,11 @@ def test_multiset_preserved():
     assert torch.equal(torch.sort(S.reshape(-1)).values, torch.sort(E.reshape(-1)).values), \
         'per_step changed the multiset of energy values'
     # ESS of the cell-level draw distribution p = E / sum(E) is permutation-invariant.
-    ess = lambda X: float(1.0 / ((X / X.sum()) ** 2).sum())
-    assert abs(ess(S) - ess(E)) < 1e-9
+    # float64 and a relative tolerance: a permutation reorders the float sums, so
+    # float32 results differ by rounding alone.
+    ess = lambda X: float(1.0 / (((X.double() / X.double().sum()) ** 2).sum()))
+    e_ess, s_ess = ess(E), ess(S)
+    assert abs(s_ess - e_ess) <= 1e-9 * abs(e_ess), f'ESS changed: {e_ess} -> {s_ess}'
     print('ok: multiset and cell-level ESS preserved')
 
 
